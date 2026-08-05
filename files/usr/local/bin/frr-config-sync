@@ -1,0 +1,69 @@
+#!/usr/bin/bash
+# Sync FRR configuration from the mounted "frr-config" ConfigMap
+# (/run/config/frr, a read-only virtiofs mount) into /etc/frr, then
+# reload or restart FRR as needed. Triggered at boot and by
+# frr-config-sync.path whenever the ConfigMap changes.
+set -euo pipefail
+
+SRC=/run/config/frr
+DST=/etc/frr
+STATE_DIR=/var/lib/frr-bootc
+STAMP="$STATE_DIR/frr-config.sha256"
+LOCK=/run/frr-config-sync.lock
+
+exec {LOCKFD}>"$LOCK"
+if ! flock -n "$LOCKFD"; then
+    echo "frr-config-sync: another run is already in progress, skipping"
+    exit 0
+fi
+
+mkdir -p "$STATE_DIR"
+
+if [ ! -d "$SRC" ] || [ -z "$(ls -A "$SRC" 2>/dev/null)" ]; then
+    echo "frr-config-sync: $SRC is empty or not mounted, nothing to sync"
+    exit 0
+fi
+
+new_sum=$(find "$SRC" -type f -exec sha256sum {} + | sort | sha256sum | awk '{print $1}')
+old_sum=$(cat "$STAMP" 2>/dev/null || true)
+
+if [ "$new_sum" = "$old_sum" ]; then
+    exit 0
+fi
+
+# The set of enabled daemons only takes effect on (re)start of frr.service,
+# a plain reload cannot add/remove daemon processes.
+daemons_changed=0
+if ! cmp -s "$SRC/daemons" "$DST/daemons" 2>/dev/null; then
+    daemons_changed=1
+fi
+
+stage=$(mktemp -d /etc/frr.staged.XXXXXX)
+trap 'rm -rf "$stage"' EXIT
+
+cp -a "$SRC"/. "$stage"/
+
+if [ -f "$stage/frr.conf" ]; then
+    if ! vtysh -f "$stage/frr.conf" -C >/tmp/frr-config-check.log 2>&1; then
+        echo "frr-config-sync: new frr.conf failed validation, keeping the running config:" >&2
+        cat /tmp/frr-config-check.log >&2
+        exit 1
+    fi
+fi
+
+chown -R frr:frr "$stage"
+chmod -R u=rwX,g=rX,o= "$stage"
+
+rsync -a --delete "$stage"/ "$DST"/
+echo "$new_sum" > "$STAMP"
+
+if [ "$daemons_changed" = "1" ]; then
+    echo "frr-config-sync: daemons file changed, restarting frr.service"
+    systemctl --no-block restart frr.service
+else
+    echo "frr-config-sync: reloading frr configuration"
+    if ! /usr/lib/frr/frr-reload.py --reload --stdout "$DST/frr.conf"; then
+        echo "frr-config-sync: frr-reload.py failed, restarting frr.service as fallback" >&2
+        systemctl --no-block restart frr.service
+    fi
+fi

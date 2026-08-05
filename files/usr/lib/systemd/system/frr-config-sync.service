@@ -1,0 +1,10 @@
+[Unit]
+Description=Sync FRR configuration from the mounted frr-config ConfigMap
+RequiresMountsFor=/run/config/frr
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/frr-config-sync
+
+[Install]
+WantedBy=multi-user.target

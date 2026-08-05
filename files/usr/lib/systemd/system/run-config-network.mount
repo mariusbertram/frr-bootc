@@ -1,0 +1,8 @@
+[Unit]
+Description=Mount network configuration ConfigMap (virtiofs)
+
+[Mount]
+What=network-config
+Where=/run/config/network
+Type=virtiofs
+Options=ro

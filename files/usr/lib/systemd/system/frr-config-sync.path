@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch the mounted frr-config ConfigMap for changes
+
+[Path]
+PathModified=/run/config/frr
+
+[Install]
+WantedBy=multi-user.target

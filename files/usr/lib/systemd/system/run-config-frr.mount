@@ -1,0 +1,8 @@
+[Unit]
+Description=Mount FRR configuration ConfigMap (virtiofs)
+
+[Mount]
+What=frr-config
+Where=/run/config/frr
+Type=virtiofs
+Options=ro

@@ -1,0 +1,41 @@
+# Consumed by frr-bootc-ifnaming.service and network-config-sync.service
+# inside the VM (mounted read-only at /run/config/network via virtiofs).
+#
+# - interfaces.yaml pins MAC addresses to interface names so that names stay
+#   stable no matter what order OpenShift/KubeVirt attaches the interfaces
+#   in. Keep this in lockstep with the macAddress/name pairs used in the
+#   VirtualMachine's spec.domain.devices.interfaces (see
+#   20-virtualmachine.yaml and the "Adding a network interface" section of
+#   README.md).
+# - nmstate.yml is an ordinary nmstate desired-state document, applied with
+#   `nmstatectl apply`.
+#
+# NetworkManager keyfiles can be used instead of/alongside nmstate by adding
+# a "*.nmconnection" key here - network-config-sync installs those directly
+# into /etc/NetworkManager/system-connections/.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-config
+  namespace: frr-bootc
+data:
+  interfaces.yaml: |
+    interfaces:
+      - mac: "02:00:00:12:34:01"
+        name: eth-uplink1
+      - mac: "02:00:00:12:34:02"
+        name: eth-uplink2
+
+  nmstate.yml: |
+    interfaces:
+      - name: eth-uplink1
+        type: ethernet
+        state: up
+        ipv4:
+          enabled: true
+          address:
+            - ip: 198.51.100.2
+              prefix-length: 30
+      - name: eth-uplink2
+        type: ethernet
+        state: down
