@@ -26,7 +26,7 @@ data:
     sharpd=no
     pbrd=no
     staticd=yes
-    bfdd=no
+    bfdd=yes
     fabricd=no
     vrrpd=no
     pathd=no
@@ -37,6 +37,7 @@ data:
     mgmtd_options="   -A 127.0.0.1"
     bgpd_options="    -A 127.0.0.1"
     staticd_options=" -A 127.0.0.1"
+    bfdd_options="    -A 127.0.0.1"
 
   frr.conf: |
     frr version 8
@@ -45,24 +46,27 @@ data:
     log syslog informational
     service integrated-vtysh-config
     !
-    ! Each uplink runs its own BGP instance inside its own VRF. The VRF
-    ! itself, the enslavement of eth-uplink1/eth-uplink2 into it, the route
-    ! each VRF needs to have something to advertise, and the PBR that
-    ! steers matching traffic into the right VRF are all configured
-    ! declaratively via network-config's nmstate.yml (interfaces/routes/
-    ! route-rules) - see the "VRF pro Interface und Policy-Based Routing"
-    ! section of README.md.
-    router bgp 65001 vrf vrf-uplink1
+    ! Each tenant runs its own BGP instance inside its own VRF, with BFD
+    ! for fast failure detection. The VRF itself, the tenant's VLAN
+    ! sub-interface and its enslavement into that VRF, the route the VRF
+    ! needs to have something to advertise, and the PBR that steers
+    ! matching traffic into the right VRF are all configured declaratively
+    ! via network-config's nmstate.yml (interfaces/routes/route-rules) -
+    ! see the "VRF pro Interface und Policy-Based Routing" and "Tenants
+    ! ohne VM-Neustart hinzufügen" sections of README.md.
+    router bgp 65001 vrf vrf-tenant1
      bgp router-id 198.51.100.2
      neighbor 198.51.100.1 remote-as 65000
+     neighbor 198.51.100.1 bfd
      !
      address-family ipv4 unicast
       network 10.0.0.0/24
      exit-address-family
     !
-    router bgp 65002 vrf vrf-uplink2
+    router bgp 65002 vrf vrf-tenant2
      bgp router-id 203.0.113.2
      neighbor 203.0.113.1 remote-as 65100
+     neighbor 203.0.113.1 bfd
      !
      address-family ipv4 unicast
       network 10.0.1.0/24

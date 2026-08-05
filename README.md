@@ -74,12 +74,15 @@ Siehe [`manifests/10-configmap-frr-config.yaml`](manifests/10-configmap-frr-conf
 
 ### `network-config` ConfigMap → `/run/config/network`
 
-- `interfaces.yaml` (optional, aber empfohlen) — MAC-Adresse-zu-Name-Mapping:
+- `interfaces.yaml` (optional, aber empfohlen) — MAC-Adresse-zu-Name-Mapping,
+  nur für Interfaces, die KubeVirt der VM tatsächlich als PCI/virtio-Gerät
+  präsentiert (also den physischen Uplink/Trunk und das LAN-Interface, nicht
+  die per nmstate erzeugten VLAN-Sub-Interfaces der einzelnen Tenants):
 
   ```yaml
   interfaces:
     - mac: "02:00:00:12:34:01"
-      name: eth-uplink1
+      name: eth-trunk
   ```
 
 - `*.yml` / `*.yaml` (außer `interfaces.yaml`) — [nmstate](https://nmstate.io/)
@@ -93,43 +96,72 @@ Keys in der ConfigMap haben.
 
 Siehe [`manifests/11-configmap-network-config.yaml`](manifests/11-configmap-network-config.yaml).
 
-## VRF pro Interface und Policy-Based Routing
+## Ein Trunk statt einer NIC pro Tenant
 
-Jedes Interface wird in `nmstate.yml` in ein eigenes VRF gesteckt
-(`vrf-uplink1`, `vrf-uplink2`, …), sodass dessen Routing-Tabelle — und die
-darin laufende BGP-Session — vollständig von den anderen Interfaces und vom
-Default-VRF isoliert ist:
+Eine dedizierte physische/Multus-NIC pro Tenant skaliert nicht: bei z. B.
+150 per BGP gekoppelten Tenants bräuchte die VM 150 zusätzliche
+Interfaces, und jedes neue Interface erfordert einen VM-Neustart (KubeVirt
+hängt Bridge-Interfaces nicht ohne Neustart hot-plug an) — das widerspricht
+dem Ziel, einen Tenant einfach per ConfigMap-Commit hinzufügen zu können.
+
+Deshalb hat die VM nur **zwei** zusätzliche Interfaces, unabhängig von der
+Anzahl der Tenants:
+
+- `eth-trunk` — eine einzelne NIC, angebunden über eine Linux-Bridge-
+  `NetworkAttachmentDefinition` **ohne** `vlan`-Feld: die Bridge-CNI legt
+  das VM-Interface dadurch als Trunk-Port an, statt es auf eine feste VLAN-ID
+  zu taggen/untaggen, und reicht 802.1Q-tagged Frames unverändert durch.
+  Jeder Tenant bekommt sein eigenes VLAN — nicht sein eigenes Interface.
+  Voraussetzung ist eine Node-seitige Bridge mit `vlan_filtering: true`
+  (siehe Kommentar in der `NetworkAttachmentDefinition`).
+- `eth-lan` — das interne, nicht tenant-spezifische Uplink-Interface.
+
+Siehe [`manifests/20-networkattachmentdefinition.yaml`](manifests/20-networkattachmentdefinition.yaml)
+für das Trunk-`NetworkAttachmentDefinition` und
+[`manifests/30-virtualmachine.yaml`](manifests/30-virtualmachine.yaml) für
+die VM-Seite.
+
+## VRF pro Tenant und Policy-Based Routing
+
+Jeder Tenant bekommt in `nmstate.yml` ein eigenes VLAN-Sub-Interface auf
+`eth-trunk` sowie ein eigenes VRF, in das dieses Sub-Interface gesteckt
+wird (`vrf-tenant1`, `vrf-tenant2`, …), sodass dessen Routing-Tabelle — und
+die darin laufende BGP-Session — vollständig von den anderen Tenants und
+vom Default-VRF isoliert ist:
 
 ```yaml
 interfaces:
-  - name: vrf-uplink1
+  - name: vrf-tenant1
     type: vrf
     state: up
     vrf:
       port:
-        - eth-uplink1
+        - tenant1
       route-table-id: 1001
-  - name: eth-uplink1
-    type: ethernet
+  - name: tenant1
+    type: vlan
     state: up
+    vlan:
+      base-iface: eth-trunk
+      id: 100
     ipv4: { ... }
 ```
 
-In `frr.conf` läuft entsprechend pro Uplink eine eigene BGP-Instanz
-(`router bgp <ASN> vrf vrf-uplink1`), die die für dieses VRF vorgesehenen
-Netze per `network`-Statement advertised.
+In `frr.conf` läuft entsprechend pro Tenant eine eigene BGP-Instanz
+(`router bgp <ASN> vrf vrf-tenant1`, mit `neighbor ... bfd` für schnelle
+Ausfallerkennung — siehe `bfdd=yes` in `daemons`), die die für dieses VRF
+vorgesehenen Netze per `network`-Statement advertised.
 
-Damit diese Netze aber tatsächlich über das jeweilige Uplink-Interface
+Damit diese Netze aber tatsächlich über das jeweilige Tenant-VLAN
 verlassen — auch wenn sie physisch an einem anderen Interface hängen (im
 Beispiel: `eth-lan` im Default-VRF) — braucht es zwei weitere, ebenfalls
 per `nmstate.yml` konfigurierte Bausteine (**nicht** FRRs `pbrd`: ein
 `pbr-map` müsste an ein festes Ingress-Interface gebunden werden, ein
 nmstate/Kernel-`route-rule` dagegen matcht rein auf die Quell-Adresse,
-unabhängig vom Interface — das ist der deutlich besser skalierende Ansatz,
-sobald es nicht nur zwei, sondern z. B. ~50 per BGP gekoppelte Tenants
-sind):
+unabhängig vom Interface — das ist der deutlich besser skalierende Ansatz
+bei vielen Tenants):
 
-1. Eine geleakte Route je Uplink-VRF (`routes.config`, mit `table-id` auf
+1. Eine geleakte Route je Tenant-VRF (`routes.config`, mit `table-id` auf
    die passende `route-table-id` des VRF), damit das `network`-Statement
    der jeweiligen BGP-Instanz überhaupt etwas zum Advertisen hat:
 
@@ -157,30 +189,47 @@ sind):
 Kurz gesagt: das VRF sorgt für die Isolation der BGP-Session, die geleakte
 Route sorgt dafür, dass BGP das Netz kennt, und die `route-rule` sorgt
 dafür, dass der tatsächliche Forwarding-Pfad für dieses Netz durch das
-richtige VRF (und damit über das richtige Uplink-Interface) läuft. Siehe
+richtige VRF (und damit über das richtige Tenant-VLAN) läuft. Siehe
 [`manifests/11-configmap-network-config.yaml`](manifests/11-configmap-network-config.yaml)
 für das vollständige Beispiel.
 
-**Skalierung auf viele Tenants:** Jeder weitere per BGP gekoppelte Tenant
-wiederholt exakt dasselbe Muster — ein `vrf-tenantNN`-Interface, ein
-`routes`-Eintrag und ein `route-rules`-Eintrag mit eigener
-`route-table-id`/`priority` — plus die passende
-`router bgp ... vrf vrf-tenantNN`-Instanz in `frr.conf`. Bei der
-Größenordnung von z. B. ~50 Tenants wird man diese ConfigMap-Inhalte
-sinnvollerweise generieren (Helm/Kustomize/eigenes Skript) statt von Hand
-zu pflegen; am Format der beiden ConfigMaps selbst ändert das nichts —
-`network-config-sync.service` wendet einfach das gesamte gemountete
-`nmstate.yml` an, egal wie es entstanden ist.
+## Tenants ohne VM-Neustart hinzufügen
 
-## Netzwerk-Interfaces in OpenShift zielsicher hinzufügen
+Das ist der Regelfall beim Skalieren auf viele (z. B. ~150) Tenants und
+berührt weder die `VirtualMachine` noch die `NetworkAttachmentDefinition` —
+nur die `network-config` und `frr-config` ConfigMaps:
 
-Das Kernproblem beim Hinzufügen zusätzlicher NICs zu einer VM ist, dass die
-Reihenfolge, in der der Gast sie sieht (und damit der vom Kernel vergebene
-Name wie `enp2s0`), nicht garantiert stabil ist — besonders wenn später
-weitere Interfaces dazukommen oder die VM neu gestartet wird. Deshalb pinnt
-dieses Image Interface-Namen an MAC-Adressen (siehe oben), und der Workflow
-zum Hinzufügen einer neuen NIC ist bewusst zweigleisig, damit beide Seiten
-(VM-Spec und Guest-Konfiguration) exakt zusammenpassen:
+1. Freie VLAN-ID innerhalb der in der `trunk`-`NetworkAttachmentDefinition`
+   erlaubten Range wählen (`vlan.trunk`, ggf. dort erweitern, falls
+   ausgeschöpft — das ist der einzige Schritt, der die
+   `NetworkAttachmentDefinition` berührt, und auch dafür ist kein
+   VM-Neustart nötig).
+2. In `network-config`s `nmstate.yml` das Tripel aus VLAN-Sub-Interface
+   (`type: vlan`, `base-iface: eth-trunk`, `vlan.id: <ID>`), VRF-Interface
+   und den passenden `routes`-/`route-rules`-Einträgen ergänzen (siehe
+   oben).
+3. In `frr-config`s `frr.conf` die passende `router bgp ... vrf ...`-Instanz
+   für den neuen Tenant ergänzen.
+
+`frr-config-sync.path` und `network-config-sync.path` übernehmen beide
+Änderungen automatisch und live — `nmstatectl apply` legt das neue
+VLAN-Sub-Interface an, ohne die bestehenden Interfaces oder laufenden
+BGP-Sessions anderer Tenants zu stören. Bei dieser Größenordnung werden die
+ConfigMap-Inhalte sinnvollerweise generiert (Helm/Kustomize/eigenes
+Skript) statt von Hand gepflegt; am Format der ConfigMaps selbst ändert
+das nichts.
+
+## Ein neues physisches Interface zielsicher hinzufügen
+
+Im Unterschied dazu ist das Hinzufügen einer komplett neuen physischen NIC
+(z. B. ein zweiter Trunk für mehr Bandbreite oder eine weitere
+Uplink-Redundanz) selten und erfordert tatsächlich einen VM-Neustart, da
+KubeVirt Bridge-Interfaces nicht hot-plugged. Das Kernproblem dabei ist,
+dass die Reihenfolge, in der der Gast neue NICs sieht (und damit der vom
+Kernel vergebene Name wie `enp2s0`), nicht garantiert stabil ist. Deshalb
+pinnt dieses Image Interface-Namen an MAC-Adressen (siehe oben), und der
+Workflow ist bewusst zweigleisig, damit beide Seiten (VM-Spec und
+Guest-Konfiguration) exakt zusammenpassen:
 
 1. **MAC-Adresse festlegen.** Wählt eine feste, eindeutige MAC-Adresse für
    das neue Interface (z. B. aus dem lokal verwalteten Bereich `02:xx:xx:xx:xx:xx`).
@@ -188,30 +237,44 @@ zum Hinzufügen einer neuen NIC ist bewusst zweigleisig, damit beide Seiten
    `spec.template.spec.domain.devices.interfaces` einen neuen Eintrag mit
    `name` und genau dieser `macAddress` hinzufügen, dazu unter
    `spec.template.spec.networks` das passende `multus.networkName`
-   (siehe [`manifests/20-networkattachmentdefinition.yaml`](manifests/20-networkattachmentdefinition.yaml)
-   für ein Beispiel eines Bridge-`NetworkAttachmentDefinition`).
+   (siehe [`manifests/20-networkattachmentdefinition.yaml`](manifests/20-networkattachmentdefinition.yaml)).
 3. **`network-config` ConfigMap erweitern:** In `interfaces.yaml` einen
    Eintrag mit derselben MAC-Adresse und dem gewünschten Namen ergänzen,
    und in `nmstate.yml` (oder einer `*.nmconnection`-Datei) die
-   Konfiguration für genau diesen Namen hinterlegen — inklusive eines
-   eigenen VRF für das neue Interface sowie des passenden `routes`- und
-   `route-rules`-Eintrags (siehe
-   [oben](#vrf-pro-interface-und-policy-based-routing)). Läuft darüber eine
-   BGP-Session, in `frr-config`s `frr.conf` außerdem eine passende
-   `router bgp ... vrf ...`-Instanz ergänzen.
-4. **VM neu starten.** KubeVirt hängt neue Bridge-Interfaces nicht ohne
-   Neustart der VM an; erst danach greift außerdem
-   `frr-bootc-ifnaming.service`, das vor NetworkManager läuft und das neue
-   Interface umbenennt, bevor es von NetworkManager beansprucht wird.
+   Konfiguration für genau diesen Namen hinterlegen.
+4. **VM neu starten.** Erst danach greift `frr-bootc-ifnaming.service`, das
+   vor NetworkManager läuft und das neue Interface umbenennt, bevor es von
+   NetworkManager beansprucht wird.
 
-Damit ist das Hinzufügen eines Interfaces "zielsicher": Der Name im Gast
-hängt ausschließlich von der MAC-Adresse ab, die im VM-Spec explizit gesetzt
-wurde — nicht von der PCI-Slot-Reihenfolge, in der KubeVirt Interfaces
-anhängt.
+Damit ist das Hinzufügen eines physischen Interfaces "zielsicher": Der Name
+im Gast hängt ausschließlich von der MAC-Adresse ab, die im VM-Spec
+explizit gesetzt wurde — nicht von der PCI-Slot-Reihenfolge, in der
+KubeVirt Interfaces anhängt.
 
-> Änderungen an bereits vorhandenen Interfaces (IP-Adressen, Routing) über
+> Änderungen an bereits vorhandenen Interfaces (IP-Adressen, Routing,
+> neue VLAN-Sub-Interfaces auf einem bestehenden Trunk) über
 > `nmstate.yml`/`*.nmconnection` werden dagegen **ohne Neustart** über
 > `network-config-sync.path` live übernommen.
+
+## Hinweise für Hochdurchsatz und Redundanz
+
+Das Beispiel-Manifest ist bewusst minimal gehalten; für Produktivbetrieb
+mit hohem Durchsatz oder Redundanzanforderungen fehlen ihm absichtlich
+(und daher hier nur als Hinweis, nicht als fertiges Manifest):
+
+- **Durchsatz:** `networkInterfaceMultiqueue: true` ist bereits gesetzt.
+  Für sehr hohen Durchsatz (z. B. im zweistelligen Gbit/s-Bereich) kommen
+  zusätzlich `spec.domain.cpu.dedicatedCpuPlacement`, Hugepages
+  (`spec.domain.memory.hugepages`) und ggf. SR-IOV-`NetworkAttachmentDefinition`s
+  für die Trunk-/LAN-Interfaces statt `bridge: {}` infrage — das braucht
+  passende Node-Ressourcen (isolierte CPUs, Hugepage-Pool, SR-IOV-fähige
+  NICs) und ist daher clusterspezifisch.
+- **Redundanz:** Das Manifest zeigt eine einzelne `VirtualMachine`. Für ein
+  n-Instanzen-Redundanzmodell (z. B. zwei VMs auf unterschiedlichen Nodes,
+  BFD zwischen ihnen bzw. zu den Tenants für schnelles Failover) müsste man
+  mehrere `VirtualMachine`-Objekte mit `podAntiAffinity` (auf
+  `kubevirt.io/domain`) über verschiedene Nodes/Verfügbarkeitszonen
+  verteilen — im Beispiel-Scope bewusst ausgeklammert.
 
 ## Build
 
