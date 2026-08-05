@@ -31,6 +31,13 @@ spec:
         memory:
           guest: 2Gi
         devices:
+          # Recommended whenever cores > 1 and interfaces use the "bridge"
+          # binding - gives each vNIC multiple queues so it can actually
+          # scale with vCPU count instead of pinning all its traffic to a
+          # single one. See README for further high-throughput/production
+          # knobs (dedicatedCpuPlacement, hugepages, SR-IOV) not turned on
+          # by this minimal example.
+          networkInterfaceMultiqueue: true
           disks:
             - name: containerdisk
               disk:
@@ -39,19 +46,19 @@ spec:
             # Default pod network, only used for management access to the VM.
             - name: default
               masquerade: {}
-            # Additional, explicitly-named and MAC-pinned interfaces. Each
-            # MAC here MUST match the corresponding entry in the
-            # network-config ConfigMap's interfaces.yaml so
+            # Only two additional, explicitly-named and MAC-pinned
+            # interfaces total, regardless of tenant count: "eth-trunk"
+            # carries one VLAN per tenant (added/removed entirely via
+            # network-config, no VM change), "eth-lan" is the internal
+            # uplink. Each MAC here MUST match the corresponding entry in
+            # the network-config ConfigMap's interfaces.yaml so
             # frr-bootc-gen-links names it correctly inside the guest
             # regardless of PCI order.
-            - name: eth-uplink1
+            - name: eth-trunk
               macAddress: "02:00:00:12:34:01"
               bridge: {}
-            - name: eth-uplink2
-              macAddress: "02:00:00:12:34:02"
-              bridge: {}
             - name: eth-lan
-              macAddress: "02:00:00:12:34:03"
+              macAddress: "02:00:00:12:34:02"
               bridge: {}
           filesystems:
             - name: frr-config
@@ -61,12 +68,9 @@ spec:
       networks:
         - name: default
           pod: {}
-        - name: eth-uplink1
+        - name: eth-trunk
           multus:
-            networkName: uplink1
-        - name: eth-uplink2
-          multus:
-            networkName: uplink2
+            networkName: trunk
         - name: eth-lan
           multus:
             networkName: lan
