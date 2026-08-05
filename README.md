@@ -149,6 +149,23 @@ Das Skript:
 Anschließend das `containerDisk`-Image in eine für den Cluster erreichbare
 Registry pushen und in der `VirtualMachine` referenzieren.
 
+### CI: bootc-Image automatisch bauen
+
+Das bootc-OCI-Image (`Containerfile`) wird in CI gebaut und veröffentlicht,
+lokal ist `./build.sh` nur für den zusätzlichen `containerDisk`-Schritt
+nötig (der ein privilegiertes `bootc-image-builder`-Setup braucht und daher
+nicht Teil der Pipelines ist):
+
+- **GitHub Actions** ([`.github/workflows/build.yml`](.github/workflows/build.yml)):
+  baut mit `docker/build-push-action` und pusht nach
+  `ghcr.io/<owner>/<repo>` — bei jedem Push auf `main`, bei Tags (`v*.*.*`)
+  und als reiner Build-Check auf Pull Requests (ohne Push).
+- **GitLab CI** ([`.gitlab-ci.yml`](.gitlab-ci.yml)): baut mit
+  [Kaniko](https://github.com/GoogleContainerTools/kaniko) (kein
+  privilegierter Runner nötig) und pusht in die projekteigene Container
+  Registry (`$CI_REGISTRY_IMAGE`) — bei Push auf den Default-Branch und bei
+  Tags, als reiner Build-Check auf Merge Requests (`--no-push`).
+
 ## Deploy
 
 Voraussetzung: OpenShift Virtualization mit aktiviertem virtiofs-Feature-Gate
