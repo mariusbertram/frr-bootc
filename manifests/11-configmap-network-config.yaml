@@ -8,7 +8,10 @@
 #   20-virtualmachine.yaml and the "Adding a network interface" section of
 #   README.md).
 # - nmstate.yml is an ordinary nmstate desired-state document, applied with
-#   `nmstatectl apply`.
+#   `nmstatectl apply`. Every interface is enslaved into its own VRF (see
+#   the "VRF pro Interface und PBR" section of README.md); frr-config's
+#   frr.conf runs a per-VRF BGP instance for each uplink and uses PBR to
+#   steer the networks that instance advertises into that VRF.
 #
 # NetworkManager keyfiles can be used instead of/alongside nmstate by adding
 # a "*.nmconnection" key here - network-config-sync installs those directly
@@ -25,9 +28,21 @@ data:
         name: eth-uplink1
       - mac: "02:00:00:12:34:02"
         name: eth-uplink2
+      - mac: "02:00:00:12:34:03"
+        name: eth-lan
 
   nmstate.yml: |
     interfaces:
+      # Each uplink is enslaved into its own VRF, so its routing table (and
+      # the BGP session running inside it) is fully isolated from the
+      # other uplink and from the default VRF.
+      - name: vrf-uplink1
+        type: vrf
+        state: up
+        vrf:
+          port:
+            - eth-uplink1
+          route-table-id: 1001
       - name: eth-uplink1
         type: ethernet
         state: up
@@ -36,6 +51,26 @@ data:
           address:
             - ip: 198.51.100.2
               prefix-length: 30
+
+      - name: vrf-uplink2
+        type: vrf
+        state: up
+        vrf:
+          port:
+            - eth-uplink2
+          route-table-id: 1002
       - name: eth-uplink2
         type: ethernet
         state: down
+
+      # Internal-facing interface, stays in the default VRF. PBR (see
+      # frr-config's frr.conf) steers traffic sourced from the networks
+      # each uplink advertises via BGP into that uplink's VRF.
+      - name: eth-lan
+        type: ethernet
+        state: up
+        ipv4:
+          enabled: true
+          address:
+            - ip: 10.0.2.1
+              prefix-length: 24

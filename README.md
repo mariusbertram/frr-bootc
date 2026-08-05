@@ -93,6 +93,66 @@ Keys in der ConfigMap haben.
 
 Siehe [`manifests/11-configmap-network-config.yaml`](manifests/11-configmap-network-config.yaml).
 
+## VRF pro Interface und Policy-Based Routing
+
+Jedes Interface wird in `nmstate.yml` in ein eigenes VRF gesteckt
+(`vrf-uplink1`, `vrf-uplink2`, …), sodass dessen Routing-Tabelle — und die
+darin laufende BGP-Session — vollständig von den anderen Interfaces und vom
+Default-VRF isoliert ist:
+
+```yaml
+interfaces:
+  - name: vrf-uplink1
+    type: vrf
+    state: up
+    vrf:
+      port:
+        - eth-uplink1
+      route-table-id: 1001
+  - name: eth-uplink1
+    type: ethernet
+    state: up
+    ipv4: { ... }
+```
+
+In `frr.conf` läuft entsprechend pro Uplink eine eigene BGP-Instanz
+(`router bgp <ASN> vrf vrf-uplink1`), die die für dieses VRF vorgesehenen
+Netze per `network`-Statement advertised.
+
+Damit diese Netze aber tatsächlich über das jeweilige Uplink-Interface
+verlassen — auch wenn sie physisch an einem anderen Interface hängen (im
+Beispiel: `eth-lan` im Default-VRF) — braucht es zwei weitere Bausteine,
+die `pbrd` (daher `pbrd=yes` in `daemons`) bereitstellt:
+
+1. Eine geleakte statische Route je Uplink-VRF, damit das `network`-Statement
+   der jeweiligen BGP-Instanz überhaupt etwas zum Advertisen hat:
+
+   ```
+   vrf vrf-uplink1
+    ip route 10.0.0.0/24 10.0.2.254 nexthop-vrf default
+   exit-vrf
+   ```
+
+2. Eine `pbr-map`, angewendet auf das Interface, an dem der Traffic
+   tatsächlich ankommt (`eth-lan`), die Pakete anhand ihrer Quell-Adresse
+   dem passenden VRF zuweist:
+
+   ```
+   pbr-map PBR-LAN seq 10
+    match src-ip 10.0.0.0/24
+    set vrf vrf-uplink1
+   !
+   interface eth-lan
+    pbr-map PBR-LAN
+   ```
+
+Kurz gesagt: das VRF sorgt für die Isolation der BGP-Session, die geleakte
+Route sorgt dafür, dass BGP das Netz kennt, und PBR sorgt dafür, dass der
+tatsächliche Forwarding-Pfad für dieses Netz durch das richtige VRF (und
+damit über das richtige Uplink-Interface) läuft. Siehe
+[`manifests/10-configmap-frr-config.yaml`](manifests/10-configmap-frr-config.yaml)
+für das vollständige Beispiel.
+
 ## Netzwerk-Interfaces in OpenShift zielsicher hinzufügen
 
 Das Kernproblem beim Hinzufügen zusätzlicher NICs zu einer VM ist, dass die
@@ -114,7 +174,12 @@ zum Hinzufügen einer neuen NIC ist bewusst zweigleisig, damit beide Seiten
 3. **`network-config` ConfigMap erweitern:** In `interfaces.yaml` einen
    Eintrag mit derselben MAC-Adresse und dem gewünschten Namen ergänzen,
    und in `nmstate.yml` (oder einer `*.nmconnection`-Datei) die
-   Konfiguration für genau diesen Namen hinterlegen.
+   Konfiguration für genau diesen Namen hinterlegen — inklusive eines
+   eigenen VRF für das neue Interface (siehe
+   [oben](#vrf-pro-interface-und-policy-based-routing)). Läuft darüber eine
+   BGP-Session, in `frr-config`s `frr.conf` außerdem eine passende
+   `router bgp ... vrf ...`-Instanz, die geleakte Route für die advertisten
+   Netze sowie die zugehörige `pbr-map`-Sequenz ergänzen.
 4. **VM neu starten.** KubeVirt hängt neue Bridge-Interfaces nicht ohne
    Neustart der VM an; erst danach greift außerdem
    `frr-bootc-ifnaming.service`, das vor NetworkManager läuft und das neue
