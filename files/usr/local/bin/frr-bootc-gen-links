@@ -1,0 +1,91 @@
+#!/usr/bin/python3
+"""Pin network interface names to MAC addresses via systemd .link files.
+
+Reads /run/config/network/interfaces.yaml (part of the "network-config"
+ConfigMap), which maps each interface's MAC address to the name it should
+have inside the guest, e.g.:
+
+    interfaces:
+      - mac: "02:00:00:12:34:01"
+        name: eth-uplink1
+      - mac: "02:00:00:12:34:02"
+        name: eth-uplink2
+
+For each entry a /etc/systemd/network/70-frr-bootc-<name>.link file is
+written. This makes interface naming independent of the PCI slot order in
+which OpenShift Virtualization/KubeVirt happens to attach the interfaces,
+which is what lets new interfaces be attached to the VM "zielsicher"
+(deterministically) - as long as the VM spec pins an explicit MAC address for
+each interface, the corresponding name is guaranteed here.
+
+Renaming an interface that is already up is not always possible; newly
+attached or not-yet-claimed interfaces are renamed reliably, already-correct
+names are a no-op. A VM restart after adding an interface guarantees the
+name takes effect.
+"""
+import glob
+import os
+import subprocess
+import sys
+
+import yaml
+
+SRC = "/run/config/network/interfaces.yaml"
+DEST_DIR = "/etc/systemd/network"
+PREFIX = "70-frr-bootc-"
+
+
+def link_path(name):
+    return os.path.join(DEST_DIR, f"{PREFIX}{name}.link")
+
+
+def main():
+    if not os.path.exists(SRC):
+        return 0
+
+    with open(SRC, encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+
+    interfaces = data.get("interfaces") or []
+    managed = set(glob.glob(os.path.join(DEST_DIR, f"{PREFIX}*.link")))
+    wanted = set()
+    changed = False
+
+    os.makedirs(DEST_DIR, exist_ok=True)
+
+    for iface in interfaces:
+        mac = (iface or {}).get("mac")
+        name = (iface or {}).get("name")
+        if not mac or not name:
+            print(f"frr-bootc-gen-links: skipping entry missing mac/name: {iface}", file=sys.stderr)
+            continue
+
+        path = link_path(name)
+        wanted.add(path)
+        content = f"[Match]\nMACAddress={mac}\n\n[Link]\nName={name}\n"
+
+        old_content = None
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                old_content = fh.read()
+
+        if old_content != content:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            changed = True
+            print(f"frr-bootc-gen-links: wrote {path} ({name} -> {mac})")
+
+    for stale in managed - wanted:
+        os.remove(stale)
+        changed = True
+        print(f"frr-bootc-gen-links: removed stale {stale}")
+
+    if changed:
+        subprocess.run(["udevadm", "control", "--reload"], check=False)
+        subprocess.run(["udevadm", "trigger", "--action=add", "--subsystem-match=net"], check=False)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

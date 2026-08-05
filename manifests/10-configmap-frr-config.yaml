@@ -1,0 +1,63 @@
+# Consumed by frr-config-sync.service inside the VM (mounted read-only at
+# /run/config/frr via virtiofs). Edit this ConfigMap and frr-config-sync.path
+# picks up the change automatically - no VM restart needed for frr.conf
+# changes (a change to "daemons" restarts frr.service, everything else is
+# applied with a live "vtysh"/frr-reload.py reload).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frr-config
+  namespace: frr-bootc
+data:
+  daemons: |
+    zebra=yes
+    bgpd=yes
+    ospfd=no
+    ospf6d=no
+    ripd=no
+    ripngd=no
+    isisd=no
+    pimd=no
+    pim6d=no
+    ldpd=no
+    nhrpd=no
+    eigrpd=no
+    babeld=no
+    sharpd=no
+    pbrd=no
+    staticd=yes
+    bfdd=no
+    fabricd=no
+    vrrpd=no
+    pathd=no
+    mgmtd=yes
+
+    vtysh_enable=yes
+    zebra_options="   -A 127.0.0.1 -s 90000000"
+    mgmtd_options="   -A 127.0.0.1"
+    bgpd_options="    -A 127.0.0.1"
+    staticd_options=" -A 127.0.0.1"
+
+  frr.conf: |
+    frr version 8
+    frr defaults traditional
+    hostname frr-bootc-example
+    log syslog informational
+    service integrated-vtysh-config
+    !
+    interface eth-uplink1
+     ip address 198.51.100.2/30
+    !
+    router bgp 65001
+     bgp router-id 198.51.100.2
+     neighbor 198.51.100.1 remote-as 65000
+     !
+     address-family ipv4 unicast
+      network 10.0.0.0/24
+     exit-address-family
+    !
+    line vty
+    !
+
+  vtysh.conf: |
+    service integrated-vtysh-config

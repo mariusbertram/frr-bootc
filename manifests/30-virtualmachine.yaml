@@ -1,0 +1,75 @@
+# Example KubeVirt VirtualMachine running the frr-bootc containerDisk image.
+#
+# Prerequisites:
+#   - OpenShift Virtualization (CNV) with the virtiofs feature gate enabled,
+#     e.g.:
+#       oc patch hyperconverged kubevirt-hyperconverged -n openshift-cnv \
+#         --type=json -p '[{"op":"add","path":"/spec/featureGates/-","value":"ExperimentalVirtiofsSupport"}]'
+#     (the exact feature gate name/CR shape depends on your CNV version -
+#     check the release notes)
+#   - The frr-config and network-config ConfigMaps applied (see
+#     10-configmap-frr-config.yaml, 11-configmap-network-config.yaml)
+#   - The NetworkAttachmentDefinition applied if you use the uplink1 example
+#     interface (see 20-networkattachmentdefinition.yaml)
+#   - <registry>/frr-bootc-containerdisk:latest pushed and reachable from
+#     the cluster (see build.sh)
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: frr-bootc
+  namespace: frr-bootc
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: frr-bootc
+    spec:
+      domain:
+        cpu:
+          cores: 2
+        memory:
+          guest: 2Gi
+        devices:
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+          interfaces:
+            # Default pod network, only used for management access to the VM.
+            - name: default
+              masquerade: {}
+            # Additional, explicitly-named and MAC-pinned interface. The MAC
+            # here MUST match the corresponding entry in the network-config
+            # ConfigMap's interfaces.yaml so frr-bootc-gen-links names it
+            # "eth-uplink1" inside the guest regardless of PCI order.
+            - name: eth-uplink1
+              macAddress: "02:00:00:12:34:01"
+              bridge: {}
+            - name: eth-uplink2
+              macAddress: "02:00:00:12:34:02"
+              bridge: {}
+          filesystems:
+            - name: frr-config
+              virtiofs: {}
+            - name: network-config
+              virtiofs: {}
+      networks:
+        - name: default
+          pod: {}
+        - name: eth-uplink1
+          multus:
+            networkName: uplink1
+        - name: eth-uplink2
+          multus:
+            networkName: uplink1
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: <registry>/frr-bootc-containerdisk:latest
+        - name: frr-config
+          configMap:
+            name: frr-config
+        - name: network-config
+          configMap:
+            name: network-config
