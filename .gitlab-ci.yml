@@ -1,0 +1,47 @@
+stages:
+  - build
+
+# Kaniko builds the OCI image without needing a privileged runner or
+# docker-in-docker, which also makes it work on OpenShift-hosted runners.
+.kaniko-build:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+
+# On merge requests: build to make sure the Containerfile still works, but
+# don't push anything to the registry.
+verify-build:
+  extends: .kaniko-build
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - >
+      /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile "$CI_PROJECT_DIR/Containerfile"
+      --no-push
+
+# On the default branch and on tags: build and push to the project's
+# built-in GitLab Container Registry.
+build-and-push:
+  extends: .kaniko-build
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - |
+      destinations="--destination $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        destinations="$destinations --destination $CI_REGISTRY_IMAGE:latest"
+      fi
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        destinations="$destinations --destination $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
+      fi
+      /kaniko/executor \
+        --context "$CI_PROJECT_DIR" \
+        --dockerfile "$CI_PROJECT_DIR/Containerfile" \
+        $destinations
