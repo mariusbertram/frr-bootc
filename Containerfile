@@ -5,7 +5,7 @@
 # mounted at runtime from Kubernetes ConfigMaps (via virtiofs) and kept in
 # sync by frr-config-sync.{service,path} and network-config-sync.{service,path}.
 # See README.md for the full architecture and deployment manifests.
-ARG BASE_IMAGE=quay.io/fedora/fedora-bootc:42
+ARG BASE_IMAGE=quay.io/fedora/fedora-bootc:44
 FROM ${BASE_IMAGE}
 
 RUN dnf -y install \
