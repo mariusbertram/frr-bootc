@@ -1,8 +1,9 @@
-# Example Multus secondary network for a physical uplink. Adjust
-# "bridge"/NNCP setup to your actual OpenShift node networking; this assumes
-# a Linux bridge named "uplink1-br0" has already been configured on the
-# nodes (e.g. via NMState's NodeNetworkConfigurationPolicy) and attached to
-# a physical NIC.
+# Example Multus secondary networks for the physical uplinks and the LAN
+# interface. Adjust the "bridge"/NNCP setup to your actual OpenShift node
+# networking; this assumes Linux bridges "uplink1-br0", "uplink2-br0" and
+# "lan-br0" have already been configured on the nodes (e.g. via NMState's
+# NodeNetworkConfigurationPolicy) and attached to the corresponding
+# physical NICs.
 apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
 metadata:
@@ -15,6 +16,38 @@ spec:
       "name": "uplink1",
       "type": "bridge",
       "bridge": "uplink1-br0",
+      "macspoofchk": false,
+      "ipam": {}
+    }
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: uplink2
+  namespace: frr-bootc
+spec:
+  config: |
+    {
+      "cniVersion": "0.4.0",
+      "name": "uplink2",
+      "type": "bridge",
+      "bridge": "uplink2-br0",
+      "macspoofchk": false,
+      "ipam": {}
+    }
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: lan
+  namespace: frr-bootc
+spec:
+  config: |
+    {
+      "cniVersion": "0.4.0",
+      "name": "lan",
+      "type": "bridge",
+      "bridge": "lan-br0",
       "macspoofchk": false,
       "ipam": {}
     }

@@ -9,8 +9,8 @@
 #     check the release notes)
 #   - The frr-config and network-config ConfigMaps applied (see
 #     10-configmap-frr-config.yaml, 11-configmap-network-config.yaml)
-#   - The NetworkAttachmentDefinition applied if you use the uplink1 example
-#     interface (see 20-networkattachmentdefinition.yaml)
+#   - The NetworkAttachmentDefinitions applied (see
+#     20-networkattachmentdefinition.yaml)
 #   - <registry>/frr-bootc-containerdisk:latest pushed and reachable from
 #     the cluster (see build.sh)
 apiVersion: kubevirt.io/v1
@@ -39,15 +39,19 @@ spec:
             # Default pod network, only used for management access to the VM.
             - name: default
               masquerade: {}
-            # Additional, explicitly-named and MAC-pinned interface. The MAC
-            # here MUST match the corresponding entry in the network-config
-            # ConfigMap's interfaces.yaml so frr-bootc-gen-links names it
-            # "eth-uplink1" inside the guest regardless of PCI order.
+            # Additional, explicitly-named and MAC-pinned interfaces. Each
+            # MAC here MUST match the corresponding entry in the
+            # network-config ConfigMap's interfaces.yaml so
+            # frr-bootc-gen-links names it correctly inside the guest
+            # regardless of PCI order.
             - name: eth-uplink1
               macAddress: "02:00:00:12:34:01"
               bridge: {}
             - name: eth-uplink2
               macAddress: "02:00:00:12:34:02"
+              bridge: {}
+            - name: eth-lan
+              macAddress: "02:00:00:12:34:03"
               bridge: {}
           filesystems:
             - name: frr-config
@@ -62,7 +66,10 @@ spec:
             networkName: uplink1
         - name: eth-uplink2
           multus:
-            networkName: uplink1
+            networkName: uplink2
+        - name: eth-lan
+          multus:
+            networkName: lan
       volumes:
         - name: containerdisk
           containerDisk:
