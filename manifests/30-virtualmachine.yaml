@@ -11,8 +11,13 @@
 #     10-configmap-frr-config.yaml, 11-configmap-network-config.yaml)
 #   - The NetworkAttachmentDefinition applied if you use the uplink1 example
 #     interface (see 20-networkattachmentdefinition.yaml)
-#   - <registry>/frr-bootc-containerdisk:latest pushed and reachable from
-#     the cluster (see build.sh)
+#   - A containerDisk image pushed and reachable from the cluster. The
+#     GitHub Actions pipeline (.github/workflows/build.yml) publishes one
+#     automatically to ghcr.io/<owner>/<repo>-containerdisk:latest on every
+#     push to the default branch (for this repository:
+#     ghcr.io/mariusbertram/frr-bootc-containerdisk:latest); alternatively
+#     build one locally with build.sh. If the image is private, add a
+#     matching imagePullSecret to this namespace/VM.
 apiVersion: kubevirt.io/v1
 kind: VirtualMachine
 metadata:
@@ -66,7 +71,7 @@ spec:
       volumes:
         - name: containerdisk
           containerDisk:
-            image: <registry>/frr-bootc-containerdisk:latest
+            image: ghcr.io/mariusbertram/frr-bootc-containerdisk:latest
         - name: frr-config
           configMap:
             name: frr-config

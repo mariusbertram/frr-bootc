@@ -18,6 +18,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -45,6 +47,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -54,3 +57,61 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Converts the bootc image just pushed above into a qcow2 disk (via
+  # bootc-image-builder) and publishes it wrapped as a containerDisk image,
+  # the format KubeVirt/OpenShift Virtualization expects for
+  # spec...volumes[].containerDisk.image. Skipped on pull requests, same as
+  # the push step above - see build.sh for the equivalent local workflow.
+  containerdisk:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Log in to ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build qcow2 disk with bootc-image-builder
+        id: bib
+        uses: osbuild/bootc-image-builder-action@v0.1.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
+          types: qcow2
+
+      - name: Stage qcow2 disk for the containerDisk build context
+        run: |
+          mkdir -p /tmp/containerdisk-ctx/qcow2
+          cp "${{ steps.bib.outputs.qcow2-output-path }}" /tmp/containerdisk-ctx/qcow2/disk.qcow2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract containerDisk image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-containerdisk
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push containerDisk image
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/containerdisk-ctx
+          file: containerdisk/Containerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

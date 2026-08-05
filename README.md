@@ -149,22 +149,33 @@ Das Skript:
 Anschließend das `containerDisk`-Image in eine für den Cluster erreichbare
 Registry pushen und in der `VirtualMachine` referenzieren.
 
-### CI: bootc-Image automatisch bauen
+### CI: Images automatisch bauen
 
-Das bootc-OCI-Image (`Containerfile`) wird in CI gebaut und veröffentlicht,
-lokal ist `./build.sh` nur für den zusätzlichen `containerDisk`-Schritt
-nötig (der ein privilegiertes `bootc-image-builder`-Setup braucht und daher
-nicht Teil der Pipelines ist):
+Beide OCI-Artefakte werden in CI gebaut und veröffentlicht; `./build.sh`
+bleibt nur für lokale Ad-hoc-Builds nötig.
 
-- **GitHub Actions** ([`.github/workflows/build.yml`](.github/workflows/build.yml)):
-  baut mit `docker/build-push-action` und pusht nach
-  `ghcr.io/<owner>/<repo>` — bei jedem Push auf `main`, bei Tags (`v*.*.*`)
-  und als reiner Build-Check auf Pull Requests (ohne Push).
-- **GitLab CI** ([`.gitlab-ci.yml`](.gitlab-ci.yml)): baut mit
-  [Kaniko](https://github.com/GoogleContainerTools/kaniko) (kein
-  privilegierter Runner nötig) und pusht in die projekteigene Container
+- **GitHub Actions** ([`.github/workflows/build.yml`](.github/workflows/build.yml)),
+  bei jedem Push auf `main`, bei Tags (`v*.*.*`) und als reiner Build-Check
+  auf Pull Requests (ohne Push):
+  1. Job `build`: baut das bootc-Image (`Containerfile`) mit
+     `docker/build-push-action` und pusht es nach
+     `ghcr.io/<owner>/<repo>`.
+  2. Job `containerdisk` (nur bei tatsächlichem Push): wandelt das gerade
+     gepushte bootc-Image mit
+     [`osbuild/bootc-image-builder-action`](https://github.com/osbuild/bootc-image-builder-action)
+     in ein `qcow2` um, verpackt es mit `containerdisk/Containerfile` und
+     pusht das Ergebnis nach `ghcr.io/<owner>/<repo>-containerdisk` — also
+     z. B. für dieses Repository nach
+     `ghcr.io/mariusbertram/frr-bootc-containerdisk:latest`, direkt
+     einsetzbar in `manifests/30-virtualmachine.yaml`.
+- **GitLab CI** ([`.gitlab-ci.yml`](.gitlab-ci.yml)): baut das bootc-Image
+  mit [Kaniko](https://github.com/GoogleContainerTools/kaniko) (kein
+  privilegierter Runner nötig) und pusht es in die projekteigene Container
   Registry (`$CI_REGISTRY_IMAGE`) — bei Push auf den Default-Branch und bei
-  Tags, als reiner Build-Check auf Merge Requests (`--no-push`).
+  Tags, als reiner Build-Check auf Merge Requests (`--no-push`). Den
+  `containerDisk`-Schritt gibt es hier (noch) nicht, da er einen
+  privilegierten Runner voraussetzt, den GitLab-Shared-Runner nicht bieten
+  — dafür `./build.sh` lokal verwenden.
 
 ## Deploy
 
