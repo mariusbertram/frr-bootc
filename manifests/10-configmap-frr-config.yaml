@@ -52,8 +52,8 @@ data:
     ! needs to have something to advertise, and the PBR that steers
     ! matching traffic into the right VRF are all configured declaratively
     ! via network-config's nmstate.yml (interfaces/routes/route-rules) -
-    ! see the "VRF pro Interface und Policy-Based Routing" and "Tenants
-    ! ohne VM-Neustart hinzufügen" sections of README.md.
+    ! see the "VRF per Tenant and Policy-Based Routing" and "Adding
+    ! Tenants Without a VM Restart" sections of README.md.
     router bgp 65001 vrf vrf-tenant1
      bgp router-id 198.51.100.2
      neighbor 198.51.100.1 remote-as 65000
