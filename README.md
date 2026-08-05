@@ -121,37 +121,56 @@ Netze per `network`-Statement advertised.
 
 Damit diese Netze aber tatsächlich über das jeweilige Uplink-Interface
 verlassen — auch wenn sie physisch an einem anderen Interface hängen (im
-Beispiel: `eth-lan` im Default-VRF) — braucht es zwei weitere Bausteine,
-die `pbrd` (daher `pbrd=yes` in `daemons`) bereitstellt:
+Beispiel: `eth-lan` im Default-VRF) — braucht es zwei weitere, ebenfalls
+per `nmstate.yml` konfigurierte Bausteine (**nicht** FRRs `pbrd`: ein
+`pbr-map` müsste an ein festes Ingress-Interface gebunden werden, ein
+nmstate/Kernel-`route-rule` dagegen matcht rein auf die Quell-Adresse,
+unabhängig vom Interface — das ist der deutlich besser skalierende Ansatz,
+sobald es nicht nur zwei, sondern z. B. ~50 per BGP gekoppelte Tenants
+sind):
 
-1. Eine geleakte statische Route je Uplink-VRF, damit das `network`-Statement
+1. Eine geleakte Route je Uplink-VRF (`routes.config`, mit `table-id` auf
+   die passende `route-table-id` des VRF), damit das `network`-Statement
    der jeweiligen BGP-Instanz überhaupt etwas zum Advertisen hat:
 
-   ```
-   vrf vrf-uplink1
-    ip route 10.0.0.0/24 10.0.2.254 nexthop-vrf default
-   exit-vrf
+   ```yaml
+   routes:
+     config:
+       - destination: 10.0.0.0/24
+         next-hop-address: 10.0.2.254
+         next-hop-interface: eth-lan
+         table-id: 1001
    ```
 
-2. Eine `pbr-map`, angewendet auf das Interface, an dem der Traffic
-   tatsächlich ankommt (`eth-lan`), die Pakete anhand ihrer Quell-Adresse
-   dem passenden VRF zuweist:
+2. Eine Policy-Routing-Regel je Netz (`route-rules.config`), die Pakete
+   anhand ihrer Quell-Adresse der Routing-Tabelle des passenden VRF
+   zuweist:
 
-   ```
-   pbr-map PBR-LAN seq 10
-    match src-ip 10.0.0.0/24
-    set vrf vrf-uplink1
-   !
-   interface eth-lan
-    pbr-map PBR-LAN
+   ```yaml
+   route-rules:
+     config:
+       - ip-from: 10.0.0.0/24
+         priority: 1000
+         route-table: 1001
    ```
 
 Kurz gesagt: das VRF sorgt für die Isolation der BGP-Session, die geleakte
-Route sorgt dafür, dass BGP das Netz kennt, und PBR sorgt dafür, dass der
-tatsächliche Forwarding-Pfad für dieses Netz durch das richtige VRF (und
-damit über das richtige Uplink-Interface) läuft. Siehe
-[`manifests/10-configmap-frr-config.yaml`](manifests/10-configmap-frr-config.yaml)
+Route sorgt dafür, dass BGP das Netz kennt, und die `route-rule` sorgt
+dafür, dass der tatsächliche Forwarding-Pfad für dieses Netz durch das
+richtige VRF (und damit über das richtige Uplink-Interface) läuft. Siehe
+[`manifests/11-configmap-network-config.yaml`](manifests/11-configmap-network-config.yaml)
 für das vollständige Beispiel.
+
+**Skalierung auf viele Tenants:** Jeder weitere per BGP gekoppelte Tenant
+wiederholt exakt dasselbe Muster — ein `vrf-tenantNN`-Interface, ein
+`routes`-Eintrag und ein `route-rules`-Eintrag mit eigener
+`route-table-id`/`priority` — plus die passende
+`router bgp ... vrf vrf-tenantNN`-Instanz in `frr.conf`. Bei der
+Größenordnung von z. B. ~50 Tenants wird man diese ConfigMap-Inhalte
+sinnvollerweise generieren (Helm/Kustomize/eigenes Skript) statt von Hand
+zu pflegen; am Format der beiden ConfigMaps selbst ändert das nichts —
+`network-config-sync.service` wendet einfach das gesamte gemountete
+`nmstate.yml` an, egal wie es entstanden ist.
 
 ## Netzwerk-Interfaces in OpenShift zielsicher hinzufügen
 
@@ -175,11 +194,11 @@ zum Hinzufügen einer neuen NIC ist bewusst zweigleisig, damit beide Seiten
    Eintrag mit derselben MAC-Adresse und dem gewünschten Namen ergänzen,
    und in `nmstate.yml` (oder einer `*.nmconnection`-Datei) die
    Konfiguration für genau diesen Namen hinterlegen — inklusive eines
-   eigenen VRF für das neue Interface (siehe
+   eigenen VRF für das neue Interface sowie des passenden `routes`- und
+   `route-rules`-Eintrags (siehe
    [oben](#vrf-pro-interface-und-policy-based-routing)). Läuft darüber eine
    BGP-Session, in `frr-config`s `frr.conf` außerdem eine passende
-   `router bgp ... vrf ...`-Instanz, die geleakte Route für die advertisten
-   Netze sowie die zugehörige `pbr-map`-Sequenz ergänzen.
+   `router bgp ... vrf ...`-Instanz ergänzen.
 4. **VM neu starten.** KubeVirt hängt neue Bridge-Interfaces nicht ohne
    Neustart der VM an; erst danach greift außerdem
    `frr-bootc-ifnaming.service`, das vor NetworkManager läuft und das neue

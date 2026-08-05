@@ -24,7 +24,7 @@ data:
     eigrpd=no
     babeld=no
     sharpd=no
-    pbrd=yes
+    pbrd=no
     staticd=yes
     bfdd=no
     fabricd=no
@@ -37,7 +37,6 @@ data:
     mgmtd_options="   -A 127.0.0.1"
     bgpd_options="    -A 127.0.0.1"
     staticd_options=" -A 127.0.0.1"
-    pbrd_options="    -A 127.0.0.1"
 
   frr.conf: |
     frr version 8
@@ -46,9 +45,13 @@ data:
     log syslog informational
     service integrated-vtysh-config
     !
-    ! Each uplink runs its own BGP instance inside its own VRF (the VRF
-    ! itself, and the enslavement of eth-uplink1/eth-uplink2 into it, is
-    ! configured via network-config's nmstate.yml).
+    ! Each uplink runs its own BGP instance inside its own VRF. The VRF
+    ! itself, the enslavement of eth-uplink1/eth-uplink2 into it, the route
+    ! each VRF needs to have something to advertise, and the PBR that
+    ! steers matching traffic into the right VRF are all configured
+    ! declaratively via network-config's nmstate.yml (interfaces/routes/
+    ! route-rules) - see the "VRF pro Interface und Policy-Based Routing"
+    ! section of README.md.
     router bgp 65001 vrf vrf-uplink1
      bgp router-id 198.51.100.2
      neighbor 198.51.100.1 remote-as 65000
@@ -64,32 +67,6 @@ data:
      address-family ipv4 unicast
       network 10.0.1.0/24
      exit-address-family
-    !
-    ! Each uplink VRF needs a route to the network it advertises, or the
-    ! "network" statements above have nothing to advertise. The actual next
-    ! hop is further inside the LAN, reachable via eth-lan in the default VRF.
-    vrf vrf-uplink1
-     ip route 10.0.0.0/24 10.0.2.254 nexthop-vrf default
-    exit-vrf
-    !
-    vrf vrf-uplink2
-     ip route 10.0.1.0/24 10.0.2.254 nexthop-vrf default
-    exit-vrf
-    !
-    ! PBR: traffic sourced from a network that is advertised over a given
-    ! uplink's BGP session is forwarded using that uplink's VRF, regardless
-    ! of which VRF it physically arrives in (here: the default VRF, via
-    ! eth-lan).
-    pbr-map PBR-LAN seq 10
-     match src-ip 10.0.0.0/24
-     set vrf vrf-uplink1
-    !
-    pbr-map PBR-LAN seq 20
-     match src-ip 10.0.1.0/24
-     set vrf vrf-uplink2
-    !
-    interface eth-lan
-     pbr-map PBR-LAN
     !
     line vty
     !

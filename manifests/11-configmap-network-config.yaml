@@ -10,8 +10,12 @@
 # - nmstate.yml is an ordinary nmstate desired-state document, applied with
 #   `nmstatectl apply`. Every interface is enslaved into its own VRF (see
 #   the "VRF pro Interface und PBR" section of README.md); frr-config's
-#   frr.conf runs a per-VRF BGP instance for each uplink and uses PBR to
-#   steer the networks that instance advertises into that VRF.
+#   frr.conf runs a per-VRF BGP instance for each uplink, and nmstate's own
+#   route-rules do the PBR that steers the networks each instance
+#   advertises into that VRF - this scales to many tenants far better than
+#   binding an FRR pbr-map to a specific ingress interface, since an
+#   nmstate/kernel route-rule matches by source prefix alone, independent
+#   of which interface the traffic actually arrives on.
 #
 # NetworkManager keyfiles can be used instead of/alongside nmstate by adding
 # a "*.nmconnection" key here - network-config-sync installs those directly
@@ -63,9 +67,10 @@ data:
         type: ethernet
         state: down
 
-      # Internal-facing interface, stays in the default VRF. PBR (see
-      # frr-config's frr.conf) steers traffic sourced from the networks
-      # each uplink advertises via BGP into that uplink's VRF.
+      # Internal-facing interface, stays in the default VRF. This is where
+      # the networks advertised by each uplink's BGP session are actually
+      # reachable from; route-rules below steer traffic for them into the
+      # matching uplink VRF no matter where it originates.
       - name: eth-lan
         type: ethernet
         state: up
@@ -74,3 +79,35 @@ data:
           address:
             - ip: 10.0.2.1
               prefix-length: 24
+
+    routes:
+      config:
+        # Gives each uplink VRF's BGP "network" statement (in frr-config's
+        # frr.conf) a route to actually advertise. One entry per tenant/
+        # uplink, pointing at wherever that tenant's network is reachable
+        # from (here: further inside the LAN, via eth-lan).
+        - destination: 10.0.0.0/24
+          next-hop-address: 10.0.2.254
+          next-hop-interface: eth-lan
+          table-id: 1001
+        - destination: 10.0.1.0/24
+          next-hop-address: 10.0.2.254
+          next-hop-interface: eth-lan
+          table-id: 1002
+
+    route-rules:
+      config:
+        # PBR: traffic sourced from a network that is advertised over a
+        # given uplink's BGP session is forwarded using that uplink's VRF
+        # routing table - regardless of which interface/VRF it physically
+        # arrives on. This is a flat list, so it scales to many tenants:
+        # each one just adds one more vrf interface + routes entry +
+        # route-rules entry with its own route-table id and priority (a
+        # ConfigMap for ~50 tenants would typically be generated rather
+        # than hand-written, but the format itself doesn't change).
+        - ip-from: 10.0.0.0/24
+          priority: 1000
+          route-table: 1001
+        - ip-from: 10.0.1.0/24
+          priority: 1010
+          route-table: 1002
