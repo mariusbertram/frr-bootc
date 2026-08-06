@@ -15,6 +15,7 @@ RUN dnf -y install \
         rsync \
         python3-pyyaml \
         util-linux \
+        policycoreutils \
     && dnf clean all
 
 COPY files/etc/frr/daemons /etc/frr/daemons
@@ -49,6 +50,15 @@ RUN chmod 0755 \
         frr-config-sync.path \
         network-config-sync.service \
         network-config-sync.path
+
+# Images produced via bootc-image-builder from a container build can end up
+# with SELinux file contexts that don't match the target policy (an
+# overlay/container-build-tooling quirk, not specific to this image), which
+# then manifests as AVC denials early in boot - e.g. cloud-init failing to
+# create the initial user. Relabel at build time so the shipped image is
+# already correct, and mark for a fallback relabel on first boot too.
+RUN restorecon -Rv / || true
+RUN touch /etc/selinux/.autorelabel
 
 LABEL org.opencontainers.image.title="frr-bootc" \
       org.opencontainers.image.description="bootc image running FRR as a router appliance for OpenShift Virtualization (KubeVirt), with FRR and network config supplied via mounted ConfigMaps."
