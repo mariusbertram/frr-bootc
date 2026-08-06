@@ -1,0 +1,66 @@
+{#- Rendered into clusters/<cluster>/sites/<site>/generated/network-config/nmstate.yml,
+   one key of the "network-config" ConfigMap (see repo root README.md).
+   One VLAN sub-interface + one VRF + one leaked route + one PBR route-rule
+   per tenant, all keyed by source prefix (not ingress interface) so this
+   file scales to ~150 tenants without ever needing a VM restart -#}
+interfaces:
+  # ACI trunk: no IP of its own, every tenant gets a VLAN sub-interface below.
+  - name: eth-trunk
+    type: ethernet
+    state: up
+
+  # Worker BGP-peering network (Layer2 UDN, persistent IP - see
+  # base/nad/peering.yaml). Networks tenants advertise are reachable from
+  # here; route-rules below steer traffic for them into the right VRF.
+  - name: eth-lan
+    type: ethernet
+    state: up
+    ipv4:
+      enabled: true
+      address:
+        - ip: {{ site.networks.lan.ip }}
+          prefix-length: {{ site.networks.lan.prefix_length }}
+{% for tenant in tenants %}
+  # --- {{ tenant.name }} (VLAN {{ tenant.vlan_id }}, {{ tenant.vrf }}) ---
+  - name: {{ tenant.vrf }}
+    type: vrf
+    state: up
+    vrf:
+      port:
+        - {{ tenant.name }}
+      route-table-id: {{ tenant.route_table_id }}
+  - name: {{ tenant.name }}
+    type: vlan
+    state: up
+    vlan:
+      base-iface: eth-trunk
+      id: {{ tenant.vlan_id }}
+    ipv4:
+      enabled: true
+      address:
+        - ip: {{ tenant.local_ip }}
+          prefix-length: {{ tenant.prefix_length }}
+{% endfor %}
+
+routes:
+  config:
+{% for tenant in tenants %}
+{% for net in tenant.advertised_networks %}
+    - destination: {{ net }}
+      next-hop-address: {{ tenant.next_hop_address | default(site.networks.lan.next_hop_address) }}
+      next-hop-interface: eth-lan
+      table-id: {{ tenant.route_table_id }}
+{% endfor %}
+{% endfor %}
+
+route-rules:
+  config:
+{% for tenant in tenants %}
+{% for net in tenant.advertised_networks %}
+    # priority must be unique per rule, not just per tenant/table, so it's
+    # derived from the table id plus this network's position in the list.
+    - ip-from: {{ net }}
+      priority: {{ tenant.route_table_id * 10 + loop.index0 }}
+      route-table: {{ tenant.route_table_id }}
+{% endfor %}
+{% endfor %}

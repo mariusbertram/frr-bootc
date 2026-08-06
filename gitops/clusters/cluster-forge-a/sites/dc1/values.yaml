@@ -1,0 +1,16 @@
+site:
+  name: dc1
+  node_selector_value: dc1
+  replicas: 2
+  # Primary DC of cluster-forge-a: sized for the full ~100Gbit/s transit
+  # profile, above the cluster default_resources.
+  resources:
+    cores: 16
+    memory: 32Gi
+    hugepage_size: 1Gi
+  mac_base: "02:00:00:a1:01"
+  networks:
+    lan:
+      ip: 10.10.1.1
+      prefix_length: 24
+      next_hop_address: 10.10.1.254

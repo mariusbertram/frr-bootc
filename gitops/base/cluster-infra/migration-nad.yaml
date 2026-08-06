@@ -1,0 +1,30 @@
+# Dedicated live-migration network, kept off the trunk/peering NADs above so
+# a large migration (8-32Gi guest memory, see resource profiles) never
+# competes with ACI or BGP-peering traffic. Lives in "openshift-cnv"
+# (the HyperConverged operator's namespace) by convention, since it is
+# referenced cluster-wide from HyperConverged.spec.liveMigrationConfig.network
+# (see ./hyperconverged-patch.yaml, applied once per cluster - see
+# clusters/<cluster>/cluster-infra/) rather than from any single
+# VirtualMachine's interface list - KubeVirt's virt-handler picks it up
+# automatically for migration traffic, it is intentionally NOT attached
+# under spec.domain.devices.interfaces of the VirtualMachine itself.
+#
+# "migration-br0" is a placeholder - the cluster-infra overlay patches
+# ".spec.config" to the cluster's actual node-side bridge (see
+# ./migration-nncp.yaml). Bridge-only, no IPAM: KubeVirt assigns migration
+# endpoints itself.
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: migration
+  namespace: openshift-cnv
+spec:
+  config: |
+    {
+      "cniVersion": "0.4.0",
+      "name": "migration",
+      "type": "bridge",
+      "bridge": "migration-br0",
+      "macspoofchk": false,
+      "ipam": {}
+    }

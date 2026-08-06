@@ -1,0 +1,25 @@
+# Host-side bridge for the dedicated live-migration network
+# (./migration-nad.yaml). Ideally a high-bandwidth, low-latency link
+# separate from both the ACI trunk and the peering network so a large VM
+# migration never competes with tenant/BGP traffic. "eno4" and the node
+# selector are placeholders patched once per cluster (this NNCP is cluster-
+# wide, not per site - it must reach nodes in every datacenter of the
+# cluster) by clusters/<cluster>/cluster-infra/kustomization.yaml.
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata:
+  name: migration-uplink-policy
+spec:
+  nodeSelector:
+    frr-bootc.io/cluster: REPLACE_WITH_CLUSTER
+  desiredState:
+    interfaces:
+      - name: migration-br0
+        type: linux-bridge
+        state: up
+        bridge:
+          options:
+            stp:
+              enabled: false
+          port:
+            - name: eno4

@@ -1,0 +1,94 @@
+{#- Mirrors base/vm/virtualmachine-example.yaml - see that file for the
+   annotated, human-read version of this exact shape. Stamped out once per
+   "vm" in vms (see generate.py: vms is built from site.replicas), each with
+   a deterministic MAC pair and an instance-numbered name, so
+   "n replicas per site/cluster" is a single number in values.yaml rather
+   than hand-copied manifests. -#}
+{% for vm in vms %}
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: {{ vm.name }}
+  namespace: frr-bootc
+  labels:
+    app.kubernetes.io/name: frr-bootc
+    frr-bootc.io/cluster: {{ cluster.name }}
+    frr-bootc.io/site: {{ site.name }}
+    frr-bootc.io/instance: "{{ vm.index }}"
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: {{ vm.name }}
+        app.kubernetes.io/name: frr-bootc
+        frr-bootc.io/site: {{ site.name }}
+        frr-bootc.io/instance: "{{ vm.index }}"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values: ["frr-bootc"]
+                  - key: frr-bootc.io/site
+                    operator: In
+                    values: ["{{ site.name }}"]
+              topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        frr-bootc.io/site: {{ site.node_selector_value | default(site.name) }}
+      terminationGracePeriodSeconds: {{ site.termination_grace_period_seconds | default(180) }}
+      evictionStrategy: LiveMigrate
+      domain:
+        cpu:
+          cores: {{ site.resources.cores }}
+          dedicatedCpuPlacement: true
+        memory:
+          guest: {{ site.resources.memory }}
+          hugepages:
+            pageSize: {{ site.resources.hugepage_size }}
+        devices:
+          networkInterfaceMultiqueue: true
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+            - name: eth-trunk
+              macAddress: "{{ vm.mac_trunk }}"
+              bridge: {}
+            - name: eth-lan
+              macAddress: "{{ vm.mac_lan }}"
+              bridge: {}
+          filesystems:
+            - name: frr-config
+              virtiofs: {}
+            - name: network-config
+              virtiofs: {}
+      networks:
+        - name: default
+          pod: {}
+        - name: eth-trunk
+          multus:
+            networkName: trunk
+        - name: eth-lan
+          multus:
+            networkName: frr-peering
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: {{ site.image | default(cluster.default_image) }}
+        - name: frr-config
+          configMap:
+            name: frr-config
+        - name: network-config
+          configMap:
+            name: network-config
+{% if not loop.last %}
+---
+{% endif %}
+{% endfor %}

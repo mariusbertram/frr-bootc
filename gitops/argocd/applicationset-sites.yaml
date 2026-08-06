@@ -1,0 +1,69 @@
+# One Application per (cluster, site) - e.g. cluster-forge-a/dc1,
+# cluster-forge-a/dc2, cluster-forge-b/dc1 for the example data in
+# clusters/. Adding a new site to an existing cluster is just a new
+# clusters/<cluster>/sites/<new-site>/ folder (git generator picks it up);
+# adding a new cluster is registering its Secret (cluster generator picks it
+# up) - neither needs this file touched. See docs/runbook-add-cluster.md.
+#
+# Requires the ApplicationSet controller with goTemplate enabled (Argo CD
+# >= 2.6) so the git generator's "path" can reference the cluster
+# generator's own output ({{.values.clusterName}}) inside a matrix - see
+# https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators-Matrix/
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: frr-border-sites
+  namespace: openshift-gitops
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - matrix:
+        generators:
+          # Every cluster registered with this ArgoCD instance and opted in
+          # via the "frr-bootc.io/enabled" label on its cluster Secret (see
+          # cluster-secret-example.yaml) - NOT every cluster ArgoCD knows
+          # about, so unrelated clusters in the same ArgoCD instance are
+          # never touched by this ApplicationSet.
+          - clusters:
+              selector:
+                matchLabels:
+                  frr-bootc.io/enabled: "true"
+              values:
+                clusterName: "{{ .name }}"
+                syncPolicy: '{{ index .metadata.labels "frr-bootc.io/sync-policy" }}'
+          # Every clusters/<clusterName>/sites/<site> directory that has a
+          # kustomization.yaml - this is what makes "n sites per cluster"
+          # data-driven instead of enumerated here.
+          - git:
+              repoURL: https://github.com/mariusbertram/frr-bootc.git
+              revision: HEAD
+              directories:
+                - path: "gitops/clusters/{{ .values.clusterName }}/sites/*"
+  template:
+    metadata:
+      name: "frr-border-{{ .values.clusterName }}-{{ .path.basename }}"
+      labels:
+        frr-bootc.io/cluster: "{{ .values.clusterName }}"
+        frr-bootc.io/site: "{{ .path.basename }}"
+    spec:
+      project: frr-bootc
+      source:
+        repoURL: https://github.com/mariusbertram/frr-bootc.git
+        targetRevision: HEAD
+        path: "{{ .path.path }}"
+      destination:
+        name: "{{ .values.clusterName }}"
+        namespace: frr-bootc
+      syncPolicy:
+        # Production clusters (sync-policy=manual) require an explicit
+        # `argocd app sync` after review; test/staging clusters
+        # (sync-policy=automated) self-heal - see cluster.yaml's
+        # "sync_policy" field, mirrored onto the cluster Secret's label.
+        {{- if eq .values.syncPolicy "automated" }}
+        automated:
+          selfHeal: true
+          prune: true
+        {{- end }}
+        syncOptions:
+          - CreateNamespace=false # base/namespace.yaml already creates it
