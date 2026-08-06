@@ -18,7 +18,9 @@ podman build -t "${IMAGE_NAME}:${IMAGE_TAG}" -f Containerfile .
 
 echo "==> Converting bootc image to a qcow2 disk via bootc-image-builder"
 mkdir -p "${OUTPUT_DIR}"
-podman run --rm -it --privileged \
+# bootc-image-builder needs real root (loop devices, mount namespaces) -
+# rootless podman can't provide that, hence sudo even with --privileged.
+sudo podman run --rm -it --privileged \
     --security-opt label=type:unconfined_t \
     -v "$(pwd)/${OUTPUT_DIR}:/output" \
     -v /var/lib/containers/storage:/var/lib/containers/storage \

@@ -3,5 +3,13 @@
 # to reference a VM disk image. Build context for this file is the
 # bootc-image-builder output directory (see build.sh), which contains
 # qcow2/disk.qcow2.
+#
+# uid/gid 107 is "qemu" in the virt-launcher pod that ultimately reads this
+# disk; ownership/permissions follow Red Hat's own reference pattern from
+# https://developers.redhat.com/articles/2024/11/11/deploy-image-mode-rhel-openshift-virtualization
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS builder
+ADD --chown=107:107 qcow2/disk.qcow2 /disk/
+RUN chmod 0440 /disk/*
+
 FROM scratch
-COPY qcow2/disk.qcow2 /disk/
+COPY --from=builder /disk/* /disk/
