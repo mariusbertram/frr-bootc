@@ -1,9 +1,0 @@
-interfaces:
-  - mac: "02:00:00:a1:01:00"
-    name: eth-trunk
-  - mac: "02:00:00:a1:01:01"
-    name: eth-lan
-  - mac: "02:00:00:a1:01:02"
-    name: eth-trunk
-  - mac: "02:00:00:a1:01:03"
-    name: eth-lan

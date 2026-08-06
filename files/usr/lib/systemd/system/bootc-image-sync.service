@@ -1,0 +1,12 @@
+[Unit]
+Description=Switch/update the bootc-tracked image from the mounted bootc-config ConfigMap
+RequiresMountsFor=/run/config/bootc
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bootc-image-sync
+
+[Install]
+WantedBy=multi-user.target

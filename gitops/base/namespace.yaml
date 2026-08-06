@@ -1,9 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: frr-bootc
-  labels:
-    # Referenced by the peering NetworkAttachmentDefinition's namespaceSelector
-    # (if used) and by NNCP node selectors that some sites key off namespace
-    # labels rather than node labels.
-    frr-bootc.io/managed: "true"
