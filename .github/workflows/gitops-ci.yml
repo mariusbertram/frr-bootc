@@ -11,22 +11,18 @@ on:
 
 jobs:
   validate:
-    # Runs vtysh -C inside the real frrouting/frr image so the syntax check
-    # in gitops/ci/validate.py is against the actual FRR parser, not a
-    # guess - matches gitops/README.md's "same command the frr-bootc image
-    # itself runs on every config change" claim.
     runs-on: ubuntu-latest
-    container:
-      image: quay.io/frrouting/frr:9.1.0
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       - name: Install Python tooling
-        run: |
-          apt-get update -qq
-          apt-get install -y --no-install-recommends python3 python3-pip
-          pip3 install --no-cache-dir -r gitops/ci/requirements.txt
+        run: pip install --no-cache-dir -r gitops/ci/requirements.txt
 
       - name: Regenerate and diff against committed output
         # generator/generate.py's output (clusters/*/sites/*/generated/) is
@@ -41,8 +37,26 @@ jobs:
             exit 1;
           }
 
-      - name: Cross-cluster validation (ASN/prefix overlap, schema, frr.conf syntax)
+      - name: Cross-cluster validation (ASN/prefix overlap, schema)
+        # vtysh isn't on this runner's PATH, so this step's own frr.conf
+        # syntax check no-ops with a warning - the real vtysh -C check runs
+        # against the committed frr.conf files in the next step, inside the
+        # actual frrouting/frr image.
         run: python3 gitops/ci/validate.py
+
+      - name: frr.conf syntax check (vtysh -C, real FRR parser)
+        # Same command frr-config-sync runs inside the frr-bootc image on
+        # every config change (see files/usr/local/bin/frr-config-sync) -
+        # run via `docker run` against the quay.io/frrouting/frr image
+        # rather than as the job's container, since that image isn't
+        # Debian/Ubuntu-based and has no apt-get for the Python step above.
+        run: |
+          set -euo pipefail
+          for f in gitops/clusters/*/sites/*/generated/frr-config/frr.conf; do
+            echo "== $f =="
+            docker run --rm -v "$PWD:/repo:ro" -w /repo \
+              quay.io/frrouting/frr:9.1.0 vtysh -f "$f" -C
+          done
 
       - name: Install kustomize
         run: |
