@@ -57,10 +57,9 @@ spec:
               disk:
                 bus: virtio
           interfaces:
-            - name: default
-              masquerade: {}
+            # The VM's only network device - see manifests/30-virtualmachine.yaml
+            # for why no macAddress is needed here.
             - name: eth-trunk
-              macAddress: "02:00:00:12:34:01"
               bridge: {}
           filesystems:
             - name: frr-config
@@ -70,8 +69,6 @@ spec:
             - name: bootc-config
               virtiofs: {}
       networks:
-        - name: default
-          pod: {}
         - name: eth-trunk
           multus:
             networkName: trunk

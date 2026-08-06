@@ -2,7 +2,7 @@
 Description=Apply network configuration (nmstate/NetworkManager) from the mounted network-config ConfigMap
 RequiresMountsFor=/run/config/network
 Wants=NetworkManager.service
-After=NetworkManager.service frr-bootc-ifnaming.service
+After=NetworkManager.service
 
 [Service]
 Type=oneshot
