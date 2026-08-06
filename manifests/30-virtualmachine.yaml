@@ -50,19 +50,18 @@ spec:
             # Default pod network, only used for management access to the VM.
             - name: default
               masquerade: {}
-            # Only two additional, explicitly-named and MAC-pinned
-            # interfaces total, regardless of tenant count: "eth-trunk"
-            # carries one VLAN per tenant (added/removed entirely via
-            # network-config, no VM change), "eth-lan" is the internal
-            # uplink. Each MAC here MUST match the corresponding entry in
-            # the network-config ConfigMap's interfaces.yaml so
-            # frr-bootc-gen-links names it correctly inside the guest
-            # regardless of PCI order.
+            # Only one additional interface total, regardless of tenant
+            # count: "eth-trunk" carries one VLAN per tenant plus the
+            # internal/default-VRF "eth-lan" VLAN, all added/removed
+            # entirely via network-config, no VM change. Its MAC MUST match
+            # the corresponding entry in the network-config ConfigMap's
+            # interfaces.yaml so frr-bootc-gen-links names it correctly
+            # inside the guest regardless of PCI order - with only one
+            # additional NIC, pinning a MAC here is optional (there's
+            # nothing to disambiguate against), but still recommended for
+            # a name that survives future physical interfaces being added.
             - name: eth-trunk
               macAddress: "02:00:00:12:34:01"
-              bridge: {}
-            - name: eth-lan
-              macAddress: "02:00:00:12:34:02"
               bridge: {}
           filesystems:
             - name: frr-config
@@ -77,9 +76,6 @@ spec:
         - name: eth-trunk
           multus:
             networkName: trunk
-        - name: eth-lan
-          multus:
-            networkName: lan
       volumes:
         - name: containerdisk
           containerDisk:

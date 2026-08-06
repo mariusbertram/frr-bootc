@@ -9,10 +9,11 @@ mounted into the VM at runtime from two Kubernetes `ConfigMaps` and
 watched/applied automatically by systemd services.
 
 For operating a full, multi-cluster fleet of these VMs as an ACI border-leaf
-layer (per-tenant VRFs, BFD, persistent-IP worker peering, dedicated
-migration network, ArgoCD `ApplicationSet`s, generated configs, CI
-validation), see [`gitops/`](gitops/README.md) - this file documents the
-`frr-bootc` image itself, `gitops/` documents how it's deployed at scale.
+layer (per-tenant VRFs, BFD, worker peering, dedicated migration network,
+ArgoCD `ApplicationSet`s, generated configs, CI validation), see the
+separate [`mariusbertram/frr-argo`](https://github.com/mariusbertram/frr-argo)
+repo - this file documents the `frr-bootc` image itself, `frr-argo`
+documents how it's deployed at scale.
 
 ## Architecture
 
@@ -109,17 +110,23 @@ new interface requires a VM restart (KubeVirt can't hot-plug bridge
 interfaces) - which defeats the goal of being able to add a tenant with
 nothing more than a ConfigMap commit.
 
-That's why the VM only has **two** additional interfaces, regardless of
+That's why the VM only has **one** additional interface, regardless of
 tenant count:
 
 - `eth-trunk` — a single NIC, attached via a Linux bridge
   `NetworkAttachmentDefinition` **without** a `vlan` field: this makes the
   bridge CNI plugin set up the VM's interface as a trunk port instead of
   tagging/untagging it to a fixed VLAN ID, so it passes 802.1Q-tagged
-  frames through unchanged. Each tenant gets their own VLAN - not their
-  own interface. Requires a node-side bridge with `vlan_filtering: true`
-  (see the comment in the `NetworkAttachmentDefinition`).
-- `eth-lan` — the internal, non-tenant-specific uplink interface.
+  frames through unchanged. Requires a node-side bridge with
+  `vlan_filtering: true` (see the comment in the
+  `NetworkAttachmentDefinition`).
+
+Every tenant gets their own VLAN sub-interface on top of `eth-trunk` -
+never their own interface - and so does the internal, non-tenant-specific
+`eth-lan` network: it's the same kind of VLAN sub-interface, just left in
+the default VRF instead of being enslaved into a tenant one (see "VRF per
+Tenant" below). Adding tenant #151 never touches the VM spec or the NAD,
+only `nmstate.yml`.
 
 See [`manifests/20-networkattachmentdefinition.yaml`](manifests/20-networkattachmentdefinition.yaml)
 for the trunk `NetworkAttachmentDefinition` and
@@ -158,8 +165,10 @@ failure detection - see `bfdd=yes` in `daemons`), which advertises the
 networks intended for that VRF via a `network` statement.
 
 For those networks to actually leave via the corresponding tenant VLAN -
-even though they're physically attached to a different interface (in the
-example: `eth-lan` in the default VRF) - two more building blocks are
+even though they're physically attached to a different VLAN sub-interface
+(in the example: `eth-lan`, itself a `type: vlan` sub-interface of
+`eth-trunk` like any tenant's, just left in the default VRF) - two more
+building blocks are
 needed, also configured declaratively via `nmstate.yml` (**not** FRR's
 `pbrd`: a `pbr-map` would have to be bound to one fixed ingress interface,
 whereas an nmstate/kernel `route-rule` matches purely on source address,
@@ -229,9 +238,14 @@ more bandwidth or additional uplink redundancy) is rare and does genuinely
 require a VM restart, since KubeVirt doesn't hot-plug bridge interfaces.
 The core problem here is that the order in which the guest sees new NICs
 (and thus the kernel-assigned name, like `enp2s0`) isn't guaranteed to be
-stable. That's why this image pins interface names to MAC addresses (see
-above), and the workflow is deliberately two-pronged so both sides (VM
-spec and guest configuration) match up exactly:
+stable *once there's more than one such NIC to disambiguate between* -
+with the single `eth-trunk` NIC this image normally ships with, there's
+nothing to disambiguate against, so `macAddress`/`interfaces.yaml` are
+optional (KubeVirt will auto-assign and persist a MAC either way). Pinning
+becomes worth doing again the moment you add a second physical interface,
+so this image pins interface names to MAC addresses (see above), and the
+workflow is deliberately two-pronged so both sides (VM spec and guest
+configuration) match up exactly:
 
 1. **Pick a MAC address.** Choose a fixed, unique MAC address for the new
    interface (e.g. from the locally administered range `02:xx:xx:xx:xx:xx`).

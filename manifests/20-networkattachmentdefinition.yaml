@@ -1,18 +1,17 @@
-# Example Multus secondary networks for the shared tenant trunk and the
-# LAN interface, both using the Linux bridge CNI plugin.
+# Example Multus secondary network for the shared VLAN trunk - the VM's
+# only additional interface, using the Linux bridge CNI plugin.
 #
-# "trunk" deliberately has no "vlan" field: the bridge CNI plugin only
-# applies single-VLAN access-port tagging/untagging when "vlan" is set, so
-# leaving it out makes the VM's tap interface a trunk port that passes
-# every 802.1Q-tagged frame through untouched. Per-tenant VLAN
-# sub-interfaces can then be added/removed entirely inside the guest via
-# network-config's nmstate.yml - no NAD or VM change needed to add tenant
-# #151, only to attach an entirely new physical trunk. This requires the
+# Deliberately no "vlan" field: the bridge CNI plugin only applies
+# single-VLAN access-port tagging/untagging when "vlan" is set, so leaving
+# it out makes the VM's tap interface a trunk port that passes every
+# 802.1Q-tagged frame through untouched. Every logical network inside the
+# guest - each tenant's VLAN, and the non-tenant "eth-lan" default-VRF
+# network - is a VLAN sub-interface added/removed entirely via
+# network-config's nmstate.yml, never a NAD or VM change. This requires the
 # node-side bridge "trunk-br0" to actually be a VLAN-aware trunk itself
 # (`vlan_filtering: true`, with the physical uplink NIC configured as a
-# trunk port carrying the tenant VLAN range) - configure that via NMState's
-# NodeNetworkConfigurationPolicy, matching whatever VLAN IDs you plan to
-# hand out to tenants.
+# trunk port carrying every VLAN ID you plan to hand out, tenant or not) -
+# configure that via NMState's NodeNetworkConfigurationPolicy.
 apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
 metadata:
@@ -25,25 +24,6 @@ spec:
       "name": "trunk",
       "type": "bridge",
       "bridge": "trunk-br0",
-      "macspoofchk": false,
-      "ipam": {}
-    }
----
-# The LAN side carries no per-tenant VLAN tagging, so this is a plain
-# access-port bridge. Adjust to your actual node networking; assumes a
-# bridge "lan-br0" already exists on the nodes.
-apiVersion: k8s.cni.cncf.io/v1
-kind: NetworkAttachmentDefinition
-metadata:
-  name: lan
-  namespace: frr-bootc
-spec:
-  config: |
-    {
-      "cniVersion": "0.4.0",
-      "name": "lan",
-      "type": "bridge",
-      "bridge": "lan-br0",
       "macspoofchk": false,
       "ipam": {}
     }

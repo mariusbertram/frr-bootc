@@ -3,11 +3,13 @@
 #
 # - interfaces.yaml pins MAC addresses to interface names, but only for
 #   interfaces KubeVirt actually presents to the guest as PCI/virtio
-#   devices (here: eth-trunk, eth-lan). Keep it in lockstep with the
-#   macAddress/name pairs used in the VirtualMachine's
-#   spec.domain.devices.interfaces (see 30-virtualmachine.yaml). Per-tenant
-#   VLAN sub-interfaces below are pure software constructs created by
-#   nmstate itself (explicit `name:`), so they need no MAC pinning.
+#   devices (here: just eth-trunk, the VM's only additional interface).
+#   Keep it in lockstep with the macAddress/name pair used in the
+#   VirtualMachine's spec.domain.devices.interfaces (see
+#   30-virtualmachine.yaml). Per-tenant VLAN sub-interfaces, and the
+#   non-tenant "eth-lan" default-VRF VLAN, are pure software constructs
+#   created by nmstate itself (explicit `name:`) on top of eth-trunk, so
+#   they need no MAC pinning.
 # - nmstate.yml is an ordinary nmstate desired-state document, applied with
 #   `nmstatectl apply`. Every tenant gets a VLAN sub-interface on the
 #   shared "eth-trunk" NIC, enslaved into its own VRF (see the "Adding
@@ -31,15 +33,15 @@ data:
     interfaces:
       - mac: "02:00:00:12:34:01"
         name: eth-trunk
-      - mac: "02:00:00:12:34:02"
-        name: eth-lan
 
   nmstate.yml: |
     interfaces:
-      # Trunk NIC carrying one 802.1Q-tagged VLAN per tenant (see
+      # Trunk NIC carrying one 802.1Q-tagged VLAN per tenant, plus the
+      # non-tenant "eth-lan" VLAN below (see
       # 20-networkattachmentdefinition.yaml). No IP of its own - every
-      # tenant gets its own VLAN sub-interface below. Adding tenant #151
-      # only ever touches this ConfigMap, never the VM spec or this NIC.
+      # logical network gets its own VLAN sub-interface below. Adding
+      # tenant #151 only ever touches this ConfigMap, never the VM spec or
+      # this NIC.
       - name: eth-trunk
         type: ethernet
         state: up
@@ -84,13 +86,17 @@ data:
             - ip: 203.0.113.2
               prefix-length: 30
 
-      # Internal-facing interface, stays in the default VRF. This is where
-      # the networks advertised by each tenant's BGP session are actually
-      # reachable from; route-rules below steer traffic for them into the
-      # matching tenant VRF no matter where it originates.
+      # Internal-facing VLAN, just like a tenant's but left in the default
+      # VRF (no vrf: interface enslaving it). This is where the networks
+      # advertised by each tenant's BGP session are actually reachable
+      # from; route-rules below steer traffic for them into the matching
+      # tenant VRF no matter where it originates.
       - name: eth-lan
-        type: ethernet
+        type: vlan
         state: up
+        vlan:
+          base-iface: eth-trunk
+          id: 999
         ipv4:
           enabled: true
           address:

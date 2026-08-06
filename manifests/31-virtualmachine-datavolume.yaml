@@ -62,9 +62,6 @@ spec:
             - name: eth-trunk
               macAddress: "02:00:00:12:34:01"
               bridge: {}
-            - name: eth-lan
-              macAddress: "02:00:00:12:34:02"
-              bridge: {}
           filesystems:
             - name: frr-config
               virtiofs: {}
@@ -78,9 +75,6 @@ spec:
         - name: eth-trunk
           multus:
             networkName: trunk
-        - name: eth-lan
-          multus:
-            networkName: lan
       volumes:
         - name: rootdisk
           dataVolume:
