@@ -1,0 +1,34 @@
+# cluster-forge-b only fronts two of the tenants cluster-forge-a serves - not
+# every cluster carries every ACI tenant (staging/test cluster here).
+tenants:
+  - name: acme-staging
+    vlan_id: 100
+    vrf: vrf-acme-staging
+    local_asn: 65101
+    peer_asn: 65100
+    local_ip: 192.0.2.2
+    prefix_length: 30
+    peer_ip: 192.0.2.1
+    advertised_networks:
+      - 10.40.0.0/24
+    bfd:
+      min_rx_ms: 150
+      min_tx_ms: 150
+      multiplier: 3
+    graceful_restart: true
+
+  - name: globex-staging
+    vlan_id: 101
+    vrf: vrf-globex-staging
+    local_asn: 65102
+    peer_asn: 65100
+    local_ip: 192.0.2.6
+    prefix_length: 30
+    peer_ip: 192.0.2.5
+    advertised_networks:
+      - 10.40.1.0/24
+    bfd:
+      min_rx_ms: 100
+      min_tx_ms: 100
+      multiplier: 3
+    graceful_restart: true

@@ -1,0 +1,59 @@
+name: GitOps CI
+
+on:
+  push:
+    branches: [main]
+    paths: ["gitops/**"]
+  pull_request:
+    branches: [main]
+    paths: ["gitops/**"]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    # Runs vtysh -C inside the real frrouting/frr image so the syntax check
+    # in gitops/ci/validate.py is against the actual FRR parser, not a
+    # guess - matches gitops/README.md's "same command the frr-bootc image
+    # itself runs on every config change" claim.
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/frrouting/frr:9.1.0
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Python tooling
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends python3 python3-pip
+          pip3 install --no-cache-dir -r gitops/ci/requirements.txt
+
+      - name: Regenerate and diff against committed output
+        # generator/generate.py's output (clusters/*/sites/*/generated/) is
+        # committed - CI fails if someone edited tenants.yaml/values.yaml
+        # without re-running the generator and committing the result, since
+        # ArgoCD only ever reads the committed generated/ files, never runs
+        # the generator itself.
+        run: |
+          python3 gitops/generator/generate.py --all
+          git diff --exit-code -- gitops/clusters '*/generated/*' || {
+            echo "::error::generated/ is stale - run generator/generate.py --all and commit the result";
+            exit 1;
+          }
+
+      - name: Cross-cluster validation (ASN/prefix overlap, schema, frr.conf syntax)
+        run: python3 gitops/ci/validate.py
+
+      - name: Install kustomize
+        run: |
+          curl -sSL -o /tmp/kustomize.tgz \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz"
+          tar -C /usr/local/bin -xzf /tmp/kustomize.tgz kustomize
+
+      - name: kustomize build every cluster/site
+        run: |
+          set -euo pipefail
+          for d in gitops/clusters/*/sites/* gitops/clusters/*/cluster-infra; do
+            echo "== $d =="
+            kustomize build "$d" > /dev/null
+          done

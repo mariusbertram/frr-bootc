@@ -1,0 +1,12 @@
+site:
+  name: dc2
+  node_selector_value: dc2
+  # dc2 is the redundant secondary DC for the same cluster - fewer tenants
+  # today, so it stays on the cluster's default_resources/default_replicas
+  # (only overridden where it actually differs from dc1).
+  mac_base: "02:00:00:a1:02"
+  networks:
+    lan:
+      ip: 10.10.2.1
+      prefix_length: 24
+      next_hop_address: 10.10.2.254

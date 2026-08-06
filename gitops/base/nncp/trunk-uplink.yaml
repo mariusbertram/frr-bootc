@@ -1,0 +1,31 @@
+# Host-side counterpart of base/nad/trunk.yaml: creates the VLAN-aware Linux
+# bridge that the "trunk" NAD attaches VMs to, on every node that can run an
+# FRR VM for this site. "eno2" (dedicated physical NIC, separate from the
+# br-ex/OVN uplink) and the node selector are placeholders patched per site.
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata:
+  name: trunk-br0-policy
+spec:
+  nodeSelector:
+    frr-bootc.io/site: REPLACE_WITH_SITE
+  desiredState:
+    interfaces:
+      - name: trunk-br0
+        type: linux-bridge
+        state: up
+        bridge:
+          options:
+            stp:
+              enabled: false
+            vlan-filtering: true
+          port:
+            - name: eno2
+              vlan:
+                mode: trunk
+                trunk-tags:
+                  # Widen/patch per site as the tenant VLAN range grows -
+                  # never requires a VM restart (see docs/architecture.md).
+                  - id-range:
+                      min: 100
+                      max: 999

@@ -1,0 +1,116 @@
+interfaces:
+  # ACI trunk: no IP of its own, every tenant gets a VLAN sub-interface below.
+  - name: eth-trunk
+    type: ethernet
+    state: up
+
+  # Worker BGP-peering network (Layer2 UDN, persistent IP - see
+  # base/nad/peering.yaml). Networks tenants advertise are reachable from
+  # here; route-rules below steer traffic for them into the right VRF.
+  - name: eth-lan
+    type: ethernet
+    state: up
+    ipv4:
+      enabled: true
+      address:
+        - ip: 10.10.1.1
+          prefix-length: 24
+  # --- acme (VLAN 100, vrf-acme) ---
+  - name: vrf-acme
+    type: vrf
+    state: up
+    vrf:
+      port:
+        - acme
+      route-table-id: 1100
+  - name: acme
+    type: vlan
+    state: up
+    vlan:
+      base-iface: eth-trunk
+      id: 100
+    ipv4:
+      enabled: true
+      address:
+        - ip: 198.51.100.2
+          prefix-length: 30
+  # --- globex (VLAN 101, vrf-globex) ---
+  - name: vrf-globex
+    type: vrf
+    state: up
+    vrf:
+      port:
+        - globex
+      route-table-id: 1101
+  - name: globex
+    type: vlan
+    state: up
+    vlan:
+      base-iface: eth-trunk
+      id: 101
+    ipv4:
+      enabled: true
+      address:
+        - ip: 198.51.100.6
+          prefix-length: 30
+  # --- initech (VLAN 102, vrf-initech) ---
+  - name: vrf-initech
+    type: vrf
+    state: up
+    vrf:
+      port:
+        - initech
+      route-table-id: 1102
+  - name: initech
+    type: vlan
+    state: up
+    vlan:
+      base-iface: eth-trunk
+      id: 102
+    ipv4:
+      enabled: true
+      address:
+        - ip: 198.51.100.10
+          prefix-length: 30
+
+routes:
+  config:
+    - destination: 10.20.0.0/24
+      next-hop-address: 10.10.1.254
+      next-hop-interface: eth-lan
+      table-id: 1100
+    - destination: 10.20.1.0/24
+      next-hop-address: 10.10.1.254
+      next-hop-interface: eth-lan
+      table-id: 1101
+    - destination: 10.20.2.0/24
+      next-hop-address: 10.10.1.254
+      next-hop-interface: eth-lan
+      table-id: 1102
+    - destination: 10.20.3.0/24
+      next-hop-address: 10.10.1.254
+      next-hop-interface: eth-lan
+      table-id: 1102
+
+route-rules:
+  config:
+    # priority must be unique per rule, not just per tenant/table, so it's
+    # derived from the table id plus this network's position in the list.
+    - ip-from: 10.20.0.0/24
+      priority: 11000
+      route-table: 1100
+    # priority must be unique per rule, not just per tenant/table, so it's
+    # derived from the table id plus this network's position in the list.
+    - ip-from: 10.20.1.0/24
+      priority: 11010
+      route-table: 1101
+    # priority must be unique per rule, not just per tenant/table, so it's
+    # derived from the table id plus this network's position in the list.
+    - ip-from: 10.20.2.0/24
+      priority: 11020
+      route-table: 1102
+    # priority must be unique per rule, not just per tenant/table, so it's
+    # derived from the table id plus this network's position in the list.
+    - ip-from: 10.20.3.0/24
+      priority: 11021
+      route-table: 1102

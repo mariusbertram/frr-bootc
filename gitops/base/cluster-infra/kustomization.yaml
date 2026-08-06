@@ -1,0 +1,11 @@
+# Nested base for the cluster-scoped (not per-site) resources: HyperConverged
+# patch and the dedicated live-migration network. Referenced as a directory
+# (not individual files) from clusters/<cluster>/cluster-infra/kustomization.yaml
+# so it composes as its own Kustomize root - see that file's comments.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - hyperconverged-patch.yaml
+  - migration-nad.yaml
+  - migration-nncp.yaml

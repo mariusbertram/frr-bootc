@@ -1,0 +1,32 @@
+# Worker <-> FRR-VM BGP peering network. Backed by OVN-Kubernetes's native
+# secondary-network Layer2 topology (not a plain Linux bridge) so that
+# - OpenShift workers (as hostNetwork BGP speakers, attached via the
+#   matching NNCP in base/nncp/peering-uplink.yaml) and the FRR VMs share one
+#   flat L2/L3 segment cluster-wide, independent of which node a workload
+#   runs on, and
+# - "allowPersistentIPs: true" keeps each FRR VM's peering IP stable across
+#   live migration and reschedule, which is required for BGP sessions and
+#   Service-IP-Advertisement to survive maintenance without a full session
+#   reset (BFD still detects the brief blip; graceful-restart hides it from
+#   the routing table - see docs/architecture.md).
+#
+# "subnets" is a placeholder - each site overlay patches it to that
+# datacenter's actual peering subnet (kept disjoint across sites/clusters to
+# avoid ambiguity, even though the network itself is L2-scoped per site).
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: frr-peering
+  namespace: frr-bootc
+spec:
+  config: |
+    {
+      "cniVersion": "0.4.0",
+      "name": "frr-peering",
+      "type": "ovn-k8s-cni-overlay",
+      "topology": "layer2",
+      "subnets": "192.0.2.0/24",
+      "mtu": 1500,
+      "netAttachDefName": "frr-bootc/frr-peering",
+      "allowPersistentIPs": true
+    }

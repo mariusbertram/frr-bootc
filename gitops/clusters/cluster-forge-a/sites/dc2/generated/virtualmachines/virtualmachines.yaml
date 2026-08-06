@@ -1,0 +1,167 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: frr-bootc-dc2-0
+  namespace: frr-bootc
+  labels:
+    app.kubernetes.io/name: frr-bootc
+    frr-bootc.io/cluster: cluster-forge-a
+    frr-bootc.io/site: dc2
+    frr-bootc.io/instance: "0"
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: frr-bootc-dc2-0
+        app.kubernetes.io/name: frr-bootc
+        frr-bootc.io/site: dc2
+        frr-bootc.io/instance: "0"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values: ["frr-bootc"]
+                  - key: frr-bootc.io/site
+                    operator: In
+                    values: ["dc2"]
+              topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        frr-bootc.io/site: dc2
+      terminationGracePeriodSeconds: 180
+      evictionStrategy: LiveMigrate
+      domain:
+        cpu:
+          cores: 8
+          dedicatedCpuPlacement: true
+        memory:
+          guest: 16Gi
+          hugepages:
+            pageSize: 1Gi
+        devices:
+          networkInterfaceMultiqueue: true
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+            - name: eth-trunk
+              macAddress: "02:00:00:a1:02:00"
+              bridge: {}
+            - name: eth-lan
+              macAddress: "02:00:00:a1:02:01"
+              bridge: {}
+          filesystems:
+            - name: frr-config
+              virtiofs: {}
+            - name: network-config
+              virtiofs: {}
+      networks:
+        - name: default
+          pod: {}
+        - name: eth-trunk
+          multus:
+            networkName: trunk
+        - name: eth-lan
+          multus:
+            networkName: frr-peering
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: registry.example.com/frr-bootc/frr-bootc-containerdisk:v1.4.0
+        - name: frr-config
+          configMap:
+            name: frr-config
+        - name: network-config
+          configMap:
+            name: network-config
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: frr-bootc-dc2-1
+  namespace: frr-bootc
+  labels:
+    app.kubernetes.io/name: frr-bootc
+    frr-bootc.io/cluster: cluster-forge-a
+    frr-bootc.io/site: dc2
+    frr-bootc.io/instance: "1"
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: frr-bootc-dc2-1
+        app.kubernetes.io/name: frr-bootc
+        frr-bootc.io/site: dc2
+        frr-bootc.io/instance: "1"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values: ["frr-bootc"]
+                  - key: frr-bootc.io/site
+                    operator: In
+                    values: ["dc2"]
+              topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        frr-bootc.io/site: dc2
+      terminationGracePeriodSeconds: 180
+      evictionStrategy: LiveMigrate
+      domain:
+        cpu:
+          cores: 8
+          dedicatedCpuPlacement: true
+        memory:
+          guest: 16Gi
+          hugepages:
+            pageSize: 1Gi
+        devices:
+          networkInterfaceMultiqueue: true
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+            - name: eth-trunk
+              macAddress: "02:00:00:a1:02:02"
+              bridge: {}
+            - name: eth-lan
+              macAddress: "02:00:00:a1:02:03"
+              bridge: {}
+          filesystems:
+            - name: frr-config
+              virtiofs: {}
+            - name: network-config
+              virtiofs: {}
+      networks:
+        - name: default
+          pod: {}
+        - name: eth-trunk
+          multus:
+            networkName: trunk
+        - name: eth-lan
+          multus:
+            networkName: frr-peering
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: registry.example.com/frr-bootc/frr-bootc-containerdisk:v1.4.0
+        - name: frr-config
+          configMap:
+            name: frr-config
+        - name: network-config
+          configMap:
+            name: network-config

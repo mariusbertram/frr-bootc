@@ -1,0 +1,14 @@
+{#- MAC -> interface-name mapping, consumed by frr-bootc-ifnaming.service
+   (see repo root README.md, "Adding a New Physical Interface Reliably").
+   This ConfigMap is shared by every replica of the site, so it lists the
+   trunk/lan MAC pair for ALL replicas - each guest only has its own two
+   MACs present as real NICs and simply ignores the other replicas' entries,
+   which keeps interface naming identical ("eth-trunk"/"eth-lan") across
+   every VM in the site regardless of which replica it is. -#}
+interfaces:
+{% for vm in vms %}
+  - mac: "{{ vm.mac_trunk }}"
+    name: eth-trunk
+  - mac: "{{ vm.mac_lan }}"
+    name: eth-lan
+{% endfor %}

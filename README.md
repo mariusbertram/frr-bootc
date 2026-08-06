@@ -8,6 +8,12 @@ FRR and network configuration are **not** baked into the image; they are
 mounted into the VM at runtime from two Kubernetes `ConfigMaps` and
 watched/applied automatically by systemd services.
 
+For operating a full, multi-cluster fleet of these VMs as an ACI border-leaf
+layer (per-tenant VRFs, BFD, persistent-IP worker peering, dedicated
+migration network, ArgoCD `ApplicationSet`s, generated configs, CI
+validation), see [`gitops/`](gitops/README.md) - this file documents the
+`frr-bootc` image itself, `gitops/` documents how it's deployed at scale.
+
 ## Architecture
 
 ```
