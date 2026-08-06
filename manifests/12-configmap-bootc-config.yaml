@@ -1,0 +1,20 @@
+# Consumed by bootc-image-sync.service inside the VM (mounted read-only at
+# /run/config/bootc via virtiofs). "image" is the OCI image this system
+# tracks for "bootc switch"/upgrades - typically the same bootc image
+# .github/workflows/build.yml publishes, not the wrapped containerDisk
+# image the VM itself boots from (see the "bootc Image Tracking" section
+# of README.md).
+#
+# Edit this ConfigMap to point the fleet at a different tag/digest;
+# bootc-image-sync.path picks up the change automatically, and
+# bootc-image-sync.timer re-checks the current reference periodically in
+# case CI pushed new content to the same tag. Either way this only stages
+# the update - applying it still needs a reboot, done deliberately by the
+# operator/orchestration layer, not automatically.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bootc-config
+  namespace: frr-bootc
+data:
+  image: ghcr.io/mariusbertram/frr-bootc:latest

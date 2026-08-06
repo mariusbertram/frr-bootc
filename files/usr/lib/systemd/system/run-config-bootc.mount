@@ -1,0 +1,8 @@
+[Unit]
+Description=Mount bootc image configuration ConfigMap (virtiofs)
+
+[Mount]
+What=bootc-config
+Where=/run/config/bootc
+Type=virtiofs
+Options=ro

@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch the mounted bootc-config ConfigMap for changes
+
+[Path]
+PathModified=/run/config/bootc
+
+[Install]
+WantedBy=multi-user.target

@@ -257,6 +257,37 @@ the PCI slot order in which KubeVirt attaches interfaces.
 > **without a restart** via `network-config-sync.path`, live, through
 > `nmstate.yml`/`*.nmconnection`.
 
+## bootc Image Tracking
+
+A third ConfigMap, `bootc-config` → `/run/config/bootc`, configures which
+OCI image this system tracks for in-place updates - not the wrapped
+`containerDisk` image the VM boots from, but the plain bootc image
+`.github/workflows/build.yml`'s `build` job publishes
+(`ghcr.io/<owner>/<repo>`):
+
+```yaml
+image: ghcr.io/mariusbertram/frr-bootc:latest
+```
+
+`bootc-image-sync.service` runs `bootc switch "$image"` against it,
+triggered both by `bootc-image-sync.path` (when this ConfigMap changes)
+and by `bootc-image-sync.timer` (every 30 minutes) - unlike the frr/network
+sync services, the interesting case here isn't just "did the config
+change" but also "is there new content behind the same tag" (e.g. a fresh
+build CI just pushed to `:latest`), which only `bootc` itself can
+determine, so it's simplest to just always ask it. Either way, this only
+**stages** the update - applying a staged update still needs a reboot,
+which is deliberately not automated here: rebooting a router is an
+operator/orchestration decision (e.g. a rolling reboot across the
+redundant instances mentioned below), not something to do automatically
+per VM. See [`manifests/12-configmap-bootc-config.yaml`](manifests/12-configmap-bootc-config.yaml).
+
+For a VM booting from a CDI DataVolume
+(`manifests/31-virtualmachine-datavolume.yaml`), this is also the more
+common way to update a *running* instance in place, since (unlike a
+`containerDisk` VM) it doesn't automatically pick up new content from
+`DataImportCron` on restart - see the comment in that manifest.
+
 ## Notes on High Throughput and Redundancy
 
 The example manifest is deliberately kept minimal; for production use with
@@ -336,6 +367,7 @@ see the comment in [`manifests/30-virtualmachine.yaml`](manifests/30-virtualmach
 $ oc apply -f manifests/00-namespace.yaml
 $ oc apply -f manifests/10-configmap-frr-config.yaml
 $ oc apply -f manifests/11-configmap-network-config.yaml
+$ oc apply -f manifests/12-configmap-bootc-config.yaml
 $ oc apply -f manifests/20-networkattachmentdefinition.yaml   # if additional NICs are needed
 $ oc apply -f manifests/30-virtualmachine.yaml                # adjust <registry>/... first
 ```

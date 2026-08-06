@@ -4,6 +4,8 @@
 # FRR and network configuration are not baked into the image; they are
 # mounted at runtime from Kubernetes ConfigMaps (via virtiofs) and kept in
 # sync by frr-config-sync.{service,path} and network-config-sync.{service,path}.
+# bootc-image-sync.{service,path,timer} does the same for which OCI image
+# this system tracks for "bootc switch"/upgrades.
 # See README.md for the full architecture and deployment manifests.
 ARG BASE_IMAGE=quay.io/fedora/fedora-bootc:44
 FROM ${BASE_IMAGE}
@@ -33,20 +35,26 @@ COPY files/etc/cloud/cloud.cfg.d/10-bootc.cfg /etc/cloud/cloud.cfg.d/10-bootc.cf
 COPY files/usr/local/bin/frr-config-sync /usr/local/bin/frr-config-sync
 COPY files/usr/local/bin/network-config-sync /usr/local/bin/network-config-sync
 COPY files/usr/local/bin/frr-bootc-gen-links /usr/local/bin/frr-bootc-gen-links
+COPY files/usr/local/bin/bootc-image-sync /usr/local/bin/bootc-image-sync
 
 COPY files/usr/lib/systemd/system/run-config-frr.mount /usr/lib/systemd/system/run-config-frr.mount
 COPY files/usr/lib/systemd/system/run-config-network.mount /usr/lib/systemd/system/run-config-network.mount
+COPY files/usr/lib/systemd/system/run-config-bootc.mount /usr/lib/systemd/system/run-config-bootc.mount
 COPY files/usr/lib/systemd/system/frr-config-sync.service /usr/lib/systemd/system/frr-config-sync.service
 COPY files/usr/lib/systemd/system/frr-config-sync.path /usr/lib/systemd/system/frr-config-sync.path
 COPY files/usr/lib/systemd/system/frr-bootc-ifnaming.service /usr/lib/systemd/system/frr-bootc-ifnaming.service
 COPY files/usr/lib/systemd/system/network-config-sync.service /usr/lib/systemd/system/network-config-sync.service
 COPY files/usr/lib/systemd/system/network-config-sync.path /usr/lib/systemd/system/network-config-sync.path
+COPY files/usr/lib/systemd/system/bootc-image-sync.service /usr/lib/systemd/system/bootc-image-sync.service
+COPY files/usr/lib/systemd/system/bootc-image-sync.path /usr/lib/systemd/system/bootc-image-sync.path
+COPY files/usr/lib/systemd/system/bootc-image-sync.timer /usr/lib/systemd/system/bootc-image-sync.timer
 
 RUN chmod 0755 \
         /usr/local/bin/frr-config-sync \
         /usr/local/bin/network-config-sync \
         /usr/local/bin/frr-bootc-gen-links \
-    && mkdir -p /run/config/frr /run/config/network /var/lib/frr-bootc \
+        /usr/local/bin/bootc-image-sync \
+    && mkdir -p /run/config/frr /run/config/network /run/config/bootc /var/lib/frr-bootc \
     && chown -R frr:frr /etc/frr \
     && chmod -R u=rwX,g=rX,o= /etc/frr \
     && systemctl enable \
@@ -58,7 +66,10 @@ RUN chmod 0755 \
         frr-config-sync.service \
         frr-config-sync.path \
         network-config-sync.service \
-        network-config-sync.path
+        network-config-sync.path \
+        bootc-image-sync.service \
+        bootc-image-sync.path \
+        bootc-image-sync.timer
 
 # Images produced via bootc-image-builder from a container build can end up
 # with SELinux file contexts that don't match the target policy (an

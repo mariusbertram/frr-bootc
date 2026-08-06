@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodically re-check the configured bootc image for new content
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target

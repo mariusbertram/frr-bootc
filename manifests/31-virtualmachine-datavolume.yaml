@@ -12,7 +12,11 @@
 #     "generation"/using a new DataSource) - it does NOT happen
 #     automatically just because DataImportCron imported a new one,
 #     unlike a containerDisk VM, which always gets the current
-#     ":latest" on every (re)start.
+#     ":latest" on every (re)start. bootc-image-sync (see
+#     12-configmap-bootc-config.yaml) is the more common way to update a
+#     running instance of this variant in place: it stages a "bootc
+#     switch"/upgrade onto this same PVC, applied on the instance's own
+#     next (operator-triggered) reboot - no PVC/DataSource churn needed.
 #
 # Prerequisites: same as manifests/30-virtualmachine.yaml, plus
 # manifests/25-dataimportcron.yaml applied and its first import completed
@@ -66,6 +70,8 @@ spec:
               virtiofs: {}
             - name: network-config
               virtiofs: {}
+            - name: bootc-config
+              virtiofs: {}
       networks:
         - name: default
           pod: {}
@@ -85,3 +91,6 @@ spec:
         - name: network-config
           configMap:
             name: network-config
+        - name: bootc-config
+          configMap:
+            name: bootc-config

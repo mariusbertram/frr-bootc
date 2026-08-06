@@ -1,0 +1,38 @@
+#!/usr/bin/bash
+# Point this system's bootc origin at the image referenced in the
+# "bootc-config" ConfigMap (/run/config/bootc/image, a read-only virtiofs
+# mount) and stage any newer content for it via "bootc switch".
+#
+# Unlike frr-config-sync/network-config-sync, the interesting case here
+# isn't just "did the config change" - it's also "is there new content
+# behind the same reference" (e.g. a fresh build pushed to the ":latest"
+# tag by CI). So this is triggered both by bootc-image-sync.path (when the
+# ConfigMap changes) and by bootc-image-sync.timer (periodically), and
+# always re-runs "bootc switch" rather than short-circuiting on an
+# unchanged config file - bootc itself is the one deciding whether there's
+# actually anything new to pull.
+#
+# This only stages the update; applying it still requires a reboot, which
+# is deliberately not done here - rebooting a router is an
+# operator/orchestration decision (e.g. a rolling reboot across
+# redundant instances), not something to automate per-VM.
+set -euo pipefail
+
+SRC=/run/config/bootc/image
+LOCK=/run/bootc-image-sync.lock
+
+exec {LOCKFD}>"$LOCK"
+if ! flock -n "$LOCKFD"; then
+    echo "bootc-image-sync: another run is already in progress, skipping"
+    exit 0
+fi
+
+if [ ! -f "$SRC" ] || [ -z "$(tr -d '[:space:]' < "$SRC")" ]; then
+    echo "bootc-image-sync: $SRC is empty or not mounted, nothing to do"
+    exit 0
+fi
+
+image=$(tr -d '[:space:]' < "$SRC")
+
+echo "bootc-image-sync: switching to $image"
+bootc switch "$image"
