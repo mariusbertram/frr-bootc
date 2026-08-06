@@ -1,0 +1,39 @@
+# Alternative to referencing the containerDisk image directly from the
+# VirtualMachine (see manifests/30-virtualmachine.yaml): let CDI
+# (Containerized Data Importer, part of OpenShift Virtualization) import it
+# into a PVC once and keep it updated automatically, following the
+# "golden image" pattern described in
+# https://developers.redhat.com/articles/2024/11/11/deploy-image-mode-rhel-openshift-virtualization
+# ("Create the necessary resources for the VM").
+#
+# A DataImportCron polls the given registry tag on a schedule; when the
+# digest behind "ghcr.io/mariusbertram/frr-bootc-containerdisk:latest"
+# changes (i.e. whenever the containerdisk CI job in
+# .github/workflows/build.yml pushes a new build), it imports the new
+# image into a fresh PVC and repoints the managed DataSource at it -
+# without touching any VirtualMachine. Existing VMs keep running against
+# their already-imported disk until they're restarted against the new
+# DataSource (see manifests/31-virtualmachine-datavolume.yaml); this is
+# the "import once, roll out deliberately" counterpart to the ephemeral
+# containerDisk approach, which instead re-pulls the image on every VM
+# (re)start.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataImportCron
+metadata:
+  name: frr-bootc
+  namespace: frr-bootc
+spec:
+  schedule: "*/30 * * * *"
+  managedDataSource: frr-bootc
+  garbageCollect: Outdated
+  importsToKeep: 3
+  template:
+    spec:
+      source:
+        registry:
+          url: "docker://ghcr.io/mariusbertram/frr-bootc-containerdisk:latest"
+          pullMethod: pod
+      storage:
+        resources:
+          requests:
+            storage: 5Gi

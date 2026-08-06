@@ -1,0 +1,87 @@
+# Alternative to manifests/30-virtualmachine.yaml: boots from a PVC that
+# CDI imported via the DataImportCron in manifests/25-dataimportcron.yaml,
+# instead of pulling the containerDisk image directly on every VM start.
+# Apply either this file or 30-virtualmachine.yaml, not both - they define
+# a VirtualMachine with the same name.
+#
+# Trade-off vs. the plain containerDisk approach:
+#   - Faster restarts (no re-pull of the image), and the boot source
+#     survives even if the registry is temporarily unreachable.
+#   - Picking up a new image requires deleting/recreating this
+#     VirtualMachine's dataVolumeTemplates-created PVC (or bumping
+#     "generation"/using a new DataSource) - it does NOT happen
+#     automatically just because DataImportCron imported a new one,
+#     unlike a containerDisk VM, which always gets the current
+#     ":latest" on every (re)start.
+#
+# Prerequisites: same as manifests/30-virtualmachine.yaml, plus
+# manifests/25-dataimportcron.yaml applied and its first import completed
+# (check `oc get dataimportcron,datasource,pvc -n frr-bootc`).
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: frr-bootc
+  namespace: frr-bootc
+spec:
+  running: true
+  dataVolumeTemplates:
+    - metadata:
+        name: frr-bootc-rootdisk
+      spec:
+        sourceRef:
+          kind: DataSource
+          name: frr-bootc
+          namespace: frr-bootc
+        storage:
+          resources:
+            requests:
+              storage: 5Gi
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: frr-bootc
+    spec:
+      domain:
+        cpu:
+          cores: 2
+        memory:
+          guest: 2Gi
+        devices:
+          networkInterfaceMultiqueue: true
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+            - name: eth-trunk
+              macAddress: "02:00:00:12:34:01"
+              bridge: {}
+            - name: eth-lan
+              macAddress: "02:00:00:12:34:02"
+              bridge: {}
+          filesystems:
+            - name: frr-config
+              virtiofs: {}
+            - name: network-config
+              virtiofs: {}
+      networks:
+        - name: default
+          pod: {}
+        - name: eth-trunk
+          multus:
+            networkName: trunk
+        - name: eth-lan
+          multus:
+            networkName: lan
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: frr-bootc-rootdisk
+        - name: frr-config
+          configMap:
+            name: frr-config
+        - name: network-config
+          configMap:
+            name: network-config

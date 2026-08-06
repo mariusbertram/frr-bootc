@@ -1,4 +1,7 @@
-# Example KubeVirt VirtualMachine running the frr-bootc containerDisk image.
+# Example KubeVirt VirtualMachine running the frr-bootc containerDisk image
+# directly (pulled fresh on every start). See
+# manifests/31-virtualmachine-datavolume.yaml for the alternative
+# CDI-DataVolume-backed variant - apply one or the other, not both.
 #
 # Prerequisites:
 #   - OpenShift Virtualization (CNV) with the virtiofs feature gate enabled,
