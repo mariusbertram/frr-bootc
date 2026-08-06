@@ -296,22 +296,32 @@ The script:
 Afterwards, push the `containerDisk` image to a registry reachable from the
 cluster and reference it in the `VirtualMachine`.
 
-### CI: Automatically Building the bootc Image
+### CI: Automatically Building Both Images
 
-The bootc OCI image (`Containerfile`) is built and published in CI;
-locally, `./build.sh` is only needed for the additional `containerDisk`
-step (which requires a privileged `bootc-image-builder` setup and is
-therefore not part of the pipelines):
+Both OCI artifacts are built and published in CI; locally, `./build.sh`
+remains useful for ad-hoc builds outside CI:
 
-- **GitHub Actions** ([`.github/workflows/build.yml`](.github/workflows/build.yml)):
-  builds with `docker/build-push-action` and pushes to
-  `ghcr.io/<owner>/<repo>` - on every push to `main`, on tags (`v*.*.*`),
-  and as a push-less build check on pull requests.
-- **GitLab CI** ([`.gitlab-ci.yml`](.gitlab-ci.yml)): builds with
-  [Kaniko](https://github.com/GoogleContainerTools/kaniko) (no privileged
-  runner needed) and pushes to the project's own container registry
-  (`$CI_REGISTRY_IMAGE`) - on pushes to the default branch and on tags, as
-  a push-less build check on merge requests (`--no-push`).
+- **GitHub Actions** ([`.github/workflows/build.yml`](.github/workflows/build.yml)),
+  on every push to `main`, on tags (`v*.*.*`), and as a push-less build
+  check on pull requests:
+  1. `build`: builds the bootc image (`Containerfile`) with
+     `docker/build-push-action` and pushes it to `ghcr.io/<owner>/<repo>`.
+  2. `containerdisk` (skipped on pull requests): converts the digest-pinned
+     bootc image just pushed into a `qcow2` disk with
+     [`osbuild/bootc-image-builder-action`](https://github.com/osbuild/bootc-image-builder-action),
+     wraps it via `containerdisk/Containerfile`, and pushes it to
+     `ghcr.io/<owner>/<repo>-containerdisk` - the image
+     [`manifests/30-virtualmachine.yaml`](manifests/30-virtualmachine.yaml)
+     and [`manifests/25-dataimportcron.yaml`](manifests/25-dataimportcron.yaml)
+     reference.
+- **GitLab CI** ([`.gitlab-ci.yml`](.gitlab-ci.yml)): builds the bootc
+  image with [Kaniko](https://github.com/GoogleContainerTools/kaniko) (no
+  privileged runner needed) and pushes it to the project's own container
+  registry (`$CI_REGISTRY_IMAGE`) - on pushes to the default branch and on
+  tags, as a push-less build check on merge requests (`--no-push`). No
+  `containerdisk` job here, since `bootc-image-builder` needs a privileged
+  runner that GitLab's shared runners don't provide - use `./build.sh`
+  locally instead.
 
 ## Deploy
 
@@ -326,6 +336,31 @@ $ oc apply -f manifests/11-configmap-network-config.yaml
 $ oc apply -f manifests/20-networkattachmentdefinition.yaml   # if additional NICs are needed
 $ oc apply -f manifests/30-virtualmachine.yaml                # adjust <registry>/... first
 ```
+
+### Alternative: CDI DataVolume Boot Source
+
+Instead of pulling the `containerDisk` image fresh on every VM (re)start
+(`manifests/30-virtualmachine.yaml`), you can let CDI (Containerized Data
+Importer, part of OpenShift Virtualization) import it into a PVC once and
+keep it updated automatically - the "golden image" pattern described in
+Red Hat's
+["Build and deploy image mode for RHEL on OpenShift Virtualization"](https://developers.redhat.com/articles/2024/11/11/deploy-image-mode-rhel-openshift-virtualization):
+
+```console
+$ oc apply -f manifests/25-dataimportcron.yaml         # instead of / in addition to 30-virtualmachine.yaml
+$ oc apply -f manifests/31-virtualmachine-datavolume.yaml   # instead of 30-virtualmachine.yaml
+```
+
+`manifests/25-dataimportcron.yaml`'s `DataImportCron` polls the
+`containerdisk` image's `:latest` tag on a schedule; whenever the CI
+`containerdisk` job above pushes a new digest, it imports it into a fresh
+PVC and repoints the managed `DataSource` at it. `VirtualMachine`s that
+boot from that `DataSource` via `dataVolumeTemplates`
+(`manifests/31-virtualmachine-datavolume.yaml`) restart faster (no re-pull)
+and keep running even if the registry is briefly unreachable, at the cost
+of not picking up a new image automatically on every restart the way the
+plain `containerDisk` approach does - see the comment in that manifest for
+the trade-off.
 
 Make configuration changes afterwards simply via `oc edit configmap/frr-config`
 or `oc edit configmap/network-config -n frr-bootc` - the sync services
