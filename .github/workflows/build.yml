@@ -77,20 +77,32 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # Same invocation Red Hat's own docs use, adapted from podman to
-      # docker (both work - GH-hosted runners don't need sudo for docker):
-      # https://developers.redhat.com/articles/2024/11/11/deploy-image-mode-rhel-openshift-virtualization
+      # Based on Red Hat's own reference invocation
+      # (https://developers.redhat.com/articles/2024/11/11/deploy-image-mode-rhel-openshift-virtualization),
+      # using podman like build.sh does locally: current bootc-image-builder
+      # versions no longer pull the image themselves ("bootc-image-builder
+      # no longer pulls images, make sure to pull it before running
+      # bootc-image-builder") and inspect it from the podman storage
+      # bind-mounted at /var/lib/containers/storage, so it has to already be
+      # there - hence the explicit "podman pull" and "--local" below. Needs
+      # real root (loop devices, mount namespaces), which is why this uses
+      # sudo even with --privileged, same as build.sh.
+      - name: Pull the bootc image into podman's local storage
+        run: |
+          sudo podman pull "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}"
+
       - name: Convert bootc image to a qcow2 disk with bootc-image-builder
         run: |
           mkdir -p output
-          docker run --rm --privileged \
-            --pull=always \
+          sudo podman run --rm --privileged \
             --security-opt label=type:unconfined_t \
             -v "$(pwd)/output:/output" \
             -v /var/lib/containers/storage:/var/lib/containers/storage \
             quay.io/centos-bootc/bootc-image-builder:latest \
             --type qcow2 \
+            --local \
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}"
+          sudo chown -R "$(id -u):$(id -g)" output
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

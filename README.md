@@ -309,8 +309,9 @@ remains useful for ad-hoc builds outside CI:
   2. `containerdisk` (skipped on pull requests): converts the digest-pinned
      bootc image just pushed into a `qcow2` disk with
      [`bootc-image-builder`](https://github.com/osbuild/bootc-image-builder)
-     (the same `docker run --privileged` invocation as `build.sh`, just
-     against the pushed image instead of a local one), wraps it via
+     (the same `podman pull` + `podman run --privileged --local` sequence as
+     `build.sh`, just against the pushed image instead of a local one),
+     wraps it via
      `containerdisk/Containerfile`, and pushes it to
      `ghcr.io/<owner>/<repo>-containerdisk` - the image
      [`manifests/30-virtualmachine.yaml`](manifests/30-virtualmachine.yaml)
