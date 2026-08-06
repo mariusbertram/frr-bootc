@@ -20,13 +20,15 @@ echo "==> Converting bootc image to a qcow2 disk via bootc-image-builder"
 mkdir -p "${OUTPUT_DIR}"
 # bootc-image-builder needs real root (loop devices, mount namespaces) -
 # rootless podman can't provide that, hence sudo even with --privileged.
+# --rootfs is required because Fedora bootc images (unlike RHEL/CentOS
+# Stream bootc) don't declare a default root filesystem type.
 sudo podman run --rm -it --privileged \
     --security-opt label=type:unconfined_t \
     -v "$(pwd)/${OUTPUT_DIR}:/output" \
     -v /var/lib/containers/storage:/var/lib/containers/storage \
     quay.io/centos-bootc/bootc-image-builder:latest \
     --type qcow2 \
-    --local \
+    --rootfs xfs \
     "${IMAGE_NAME}:${IMAGE_TAG}"
 
 echo "==> Building containerDisk image ${CONTAINERDISK_NAME}:${IMAGE_TAG}"
