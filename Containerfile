@@ -16,12 +16,19 @@ RUN dnf -y install \
         python3-pyyaml \
         util-linux \
         policycoreutils \
+        audit \
+        cloud-init \
     && dnf clean all
 
 COPY files/etc/frr/daemons /etc/frr/daemons
 COPY files/etc/frr/frr.conf /etc/frr/frr.conf
 COPY files/etc/frr/vtysh.conf /etc/frr/vtysh.conf
 COPY files/etc/sysctl.d/71-frr-bootc-forwarding.conf /etc/sysctl.d/71-frr-bootc-forwarding.conf
+# fedora-bootc doesn't include cloud-init's own image-mode drop-in (unlike
+# quay.io/centos-bootc): growpart must target /sysroot, not /, since that's
+# where the real root filesystem is mounted in image mode. See
+# https://gitlab.com/fedora/bootc/examples/-/tree/main/cloud-init.
+COPY files/etc/cloud/cloud.cfg.d/10-bootc.cfg /etc/cloud/cloud.cfg.d/10-bootc.cfg
 
 COPY files/usr/local/bin/frr-config-sync /usr/local/bin/frr-config-sync
 COPY files/usr/local/bin/network-config-sync /usr/local/bin/network-config-sync
@@ -45,6 +52,8 @@ RUN chmod 0755 \
     && systemctl enable \
         frr.service \
         NetworkManager.service \
+        auditd.service \
+        cloud-init.target \
         frr-bootc-ifnaming.service \
         frr-config-sync.service \
         frr-config-sync.path \
@@ -54,9 +63,12 @@ RUN chmod 0755 \
 # Images produced via bootc-image-builder from a container build can end up
 # with SELinux file contexts that don't match the target policy (an
 # overlay/container-build-tooling quirk, not specific to this image), which
-# then manifests as AVC denials early in boot - e.g. cloud-init failing to
-# create the initial user. Relabel at build time so the shipped image is
-# already correct, and mark for a fallback relabel on first boot too.
+# can manifest as AVC denials early in boot. Relabel at build time so the
+# shipped image is already correct, and mark for a fallback relabel on
+# first boot too. Separately, auditd is enabled above so audit records
+# (e.g. systemd service start/stop) are consumed and logged normally
+# instead of falling back to being echoed onto the console, where they can
+# look like alarming SELinux errors even when they're not (res=success).
 RUN restorecon -Rv / || true
 RUN touch /etc/selinux/.autorelabel
 
