@@ -340,6 +340,13 @@ $ oc apply -f manifests/20-networkattachmentdefinition.yaml   # if additional NI
 $ oc apply -f manifests/30-virtualmachine.yaml                # adjust <registry>/... first
 ```
 
+`cloud-init` is installed and enabled (with the `growpart`/`/sysroot` drop-in
+image-mode systems need - see `files/etc/cloud/cloud.cfg.d/10-bootc.cfg`),
+so an initial user/SSH key can be provisioned the usual way by adding a
+`cloudInitNoCloud` volume to the `VirtualMachine` - it's not included in
+the example manifests since FRR/network config already come from the two
+ConfigMaps and don't need it.
+
 ### Alternative: CDI DataVolume Boot Source
 
 Instead of pulling the `containerDisk` image fresh on every VM (re)start
