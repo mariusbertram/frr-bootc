@@ -1,24 +1,19 @@
-# Consumed by frr-bootc-ifnaming.service and network-config-sync.service
-# inside the VM (mounted read-only at /run/config/network via virtiofs).
+# Consumed by network-config-sync.service inside the VM (mounted read-only
+# at /run/config/network via virtiofs).
 #
-# - interfaces.yaml pins MAC addresses to interface names, but only for
-#   interfaces KubeVirt actually presents to the guest as PCI/virtio
-#   devices (here: just eth-trunk, the VM's only additional interface).
-#   Keep it in lockstep with the macAddress/name pair used in the
-#   VirtualMachine's spec.domain.devices.interfaces (see
-#   30-virtualmachine.yaml). Per-tenant VLAN sub-interfaces, and the
-#   non-tenant "eth-lan" default-VRF VLAN, are pure software constructs
-#   created by nmstate itself (explicit `name:`) on top of eth-trunk, so
-#   they need no MAC pinning.
-# - nmstate.yml is an ordinary nmstate desired-state document, applied with
-#   `nmstatectl apply`. Every tenant gets a VLAN sub-interface on the
-#   shared "eth-trunk" NIC, enslaved into its own VRF (see the "Adding
-#   Tenants Without a VM Restart" section of README.md); frr-config's
-#   frr.conf runs a per-tenant BGP instance in that VRF, and nmstate's own
-#   route-rules do the PBR that steers the networks each instance
-#   advertises into that VRF - a flat, source-prefix-based rule that scales
-#   to many tenants far better than binding an FRR pbr-map to one fixed
-#   ingress interface.
+# nmstate.yml is an ordinary nmstate desired-state document, applied with
+# `nmstatectl apply`. Every tenant gets a VLAN sub-interface on the shared
+# "eth-trunk" NIC, enslaved into its own VRF (see the "Adding Tenants
+# Without a VM Restart" section of README.md); frr-config's frr.conf runs a
+# per-tenant BGP instance in that VRF, and nmstate's own route-rules do the
+# PBR that steers the networks each instance advertises into that VRF - a
+# flat, source-prefix-based rule that scales to many tenants far better
+# than binding an FRR pbr-map to one fixed ingress interface.
+#
+# "eth-trunk" itself needs no MAC pinning or interfaces.yaml entry: it's
+# the VM's only network device, named by the static
+# /usr/lib/systemd/network/70-eth-trunk.link shipped in the image (matches
+# on driver, not MAC - see that file's comment for why that's safe here).
 #
 # NetworkManager keyfiles can be used instead of/alongside nmstate by adding
 # a "*.nmconnection" key here - network-config-sync installs those directly
@@ -29,11 +24,6 @@ metadata:
   name: network-config
   namespace: frr-bootc
 data:
-  interfaces.yaml: |
-    interfaces:
-      - mac: "02:00:00:12:34:01"
-        name: eth-trunk
-
   nmstate.yml: |
     interfaces:
       # Trunk NIC carrying one 802.1Q-tagged VLAN per tenant, plus the

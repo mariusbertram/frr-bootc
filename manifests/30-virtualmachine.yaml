@@ -17,6 +17,10 @@
 #     20-networkattachmentdefinition.yaml)
 #   - <registry>/frr-bootc-containerdisk:latest pushed and reachable from
 #     the cluster (see build.sh)
+#
+# No pod/masquerade "default" network: this VM has exactly one interface
+# (the trunk). Reach it via `virtctl console`/serial console, or over
+# whichever VLAN's IP is configured for management in network-config.
 apiVersion: kubevirt.io/v1
 kind: VirtualMachine
 metadata:
@@ -47,21 +51,15 @@ spec:
               disk:
                 bus: virtio
           interfaces:
-            # Default pod network, only used for management access to the VM.
-            - name: default
-              masquerade: {}
-            # Only one additional interface total, regardless of tenant
-            # count: "eth-trunk" carries one VLAN per tenant plus the
-            # internal/default-VRF "eth-lan" VLAN, all added/removed
-            # entirely via network-config, no VM change. Its MAC MUST match
-            # the corresponding entry in the network-config ConfigMap's
-            # interfaces.yaml so frr-bootc-gen-links names it correctly
-            # inside the guest regardless of PCI order - with only one
-            # additional NIC, pinning a MAC here is optional (there's
-            # nothing to disambiguate against), but still recommended for
-            # a name that survives future physical interfaces being added.
+            # The VM's only network device. Every logical network - each
+            # tenant's VLAN, the internal/default-VRF VLAN, everything -
+            # is a VLAN sub-interface carved out of this one trunk via
+            # network-config's nmstate.yml, never a separate VM interface.
+            # No macAddress needed: it's named "eth-trunk" by the static
+            # /usr/lib/systemd/network/70-eth-trunk.link shipped in the
+            # image, which matches on driver rather than MAC - safe
+            # because this is the VM's only NIC (see that file's comment).
             - name: eth-trunk
-              macAddress: "02:00:00:12:34:01"
               bridge: {}
           filesystems:
             - name: frr-config
@@ -71,8 +69,6 @@ spec:
             - name: bootc-config
               virtiofs: {}
       networks:
-        - name: default
-          pod: {}
         - name: eth-trunk
           multus:
             networkName: trunk

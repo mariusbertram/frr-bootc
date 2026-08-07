@@ -31,10 +31,10 @@ documents how it's deployed at scale.
  (inotify on directory)      (inotify on directory)
         │                            │
         ▼                            ▼
- frr-config-sync.service     frr-bootc-ifnaming.service (MAC → name)
-   → /etc/frr/*               network-config-sync.service
-   → vtysh -C (validation)      → *.nmconnection to NetworkManager
-   → frr-reload.py (live)       → nmstatectl apply *.yml/*.yaml
+ frr-config-sync.service     network-config-sync.service
+   → /etc/frr/*                 → *.nmconnection to NetworkManager
+   → vtysh -C (validation)      → nmstatectl apply *.yml/*.yaml
+   → frr-reload.py (live)
    → on daemons change:
      systemctl restart frr
 ```
@@ -53,18 +53,13 @@ needing a cloud-init ISO or a reboot.
   that). If `daemons` changes (e.g. `bgpd` gets enabled), restarting
   `frr.service` is unavoidable since that's what determines which daemon
   processes are actually running.
-- **Network configuration** is applied in two steps:
-  1. `frr-bootc-ifnaming.service` runs **before** `NetworkManager.service`
-     and writes `.link` files from `interfaces.yaml`
-     (`/etc/systemd/network/70-frr-bootc-<name>.link`), pinning each
-     interface to a fixed name based on its MAC address.
-  2. `network-config-sync.service` runs **after** `NetworkManager.service`
-     and applies the actual configuration (nmstate or NetworkManager
-     keyfiles).
-
-  This split is necessary because interface renaming has to happen before
-  NetworkManager starts, while `nmstatectl` requires a running
-  NetworkManager.
+- **Network configuration** (`nmstate.yml`/`*.nmconnection`) is applied by
+  `network-config-sync.service`, which runs **after** `NetworkManager.service`
+  since `nmstatectl` requires a running NetworkManager. The VM's single
+  network device is named "eth-trunk" statically at the udev level (see
+  "A Trunk Instead of One NIC per Tenant" below), independent of
+  NetworkManager or this sync path entirely - so unlike the FRR side,
+  there's no separate naming step to sequence around here.
 
 ## Configuration Format
 
@@ -80,19 +75,12 @@ See [`manifests/10-configmap-frr-config.yaml`](manifests/10-configmap-frr-config
 
 ### `network-config` ConfigMap → `/run/config/network`
 
-- `interfaces.yaml` (optional, but recommended) — MAC-address-to-name
-  mapping, only for interfaces KubeVirt actually presents to the VM as a
-  PCI/virtio device (i.e. the physical uplink/trunk and the LAN interface,
-  not the per-tenant VLAN sub-interfaces created via nmstate):
-
-  ```yaml
-  interfaces:
-    - mac: "02:00:00:12:34:01"
-      name: eth-trunk
-  ```
-
-- `*.yml` / `*.yaml` (other than `interfaces.yaml`) — [nmstate](https://nmstate.io/)
-  desired-state documents, applied via `nmstatectl apply`.
+- `*.yml` / `*.yaml` — [nmstate](https://nmstate.io/) desired-state
+  documents, applied via `nmstatectl apply`. No MAC-to-name mapping is
+  needed here: the VM's one and only network device is already named
+  "eth-trunk" by a static `.link` file baked into the image (see "A Trunk
+  Instead of One NIC per Tenant" below), so `nmstate.yml` can just refer to
+  `eth-trunk` directly as `base-iface` for every VLAN sub-interface.
 - `*.nmconnection` — raw NetworkManager keyfiles, installed into
   `/etc/NetworkManager/system-connections/` and activated.
 
@@ -110,10 +98,10 @@ new interface requires a VM restart (KubeVirt can't hot-plug bridge
 interfaces) - which defeats the goal of being able to add a tenant with
 nothing more than a ConfigMap commit.
 
-That's why the VM only has **one** additional interface, regardless of
-tenant count:
+That's why the VM has **exactly one** network device, regardless of
+tenant count, and no separate pod/masquerade "default" network either:
 
-- `eth-trunk` — a single NIC, attached via a Linux bridge
+- `eth-trunk` — the VM's only NIC, attached via a Linux bridge
   `NetworkAttachmentDefinition` **without** a `vlan` field: this makes the
   bridge CNI plugin set up the VM's interface as a trunk port instead of
   tagging/untagging it to a fixed VLAN ID, so it passes 802.1Q-tagged
@@ -121,12 +109,23 @@ tenant count:
   `vlan_filtering: true` (see the comment in the
   `NetworkAttachmentDefinition`).
 
+No `macAddress` is set for it in the `VirtualMachine` either. Instead, a
+static `.link` file baked into the image
+(`files/usr/lib/systemd/network/70-eth-trunk.link`) matches on
+`Driver=virtio_net` and renames whatever it finds to `eth-trunk` - safe
+*only* because this is the VM's sole network device, so there's nothing
+else that match could accidentally catch. (Adding a second physical NIC
+later would require going back to per-MAC `.link` matching for both, since
+two devices obviously can't share one name.)
+
 Every tenant gets their own VLAN sub-interface on top of `eth-trunk` -
 never their own interface - and so does the internal, non-tenant-specific
-`eth-lan` network: it's the same kind of VLAN sub-interface, just left in
-the default VRF instead of being enslaved into a tenant one (see "VRF per
-Tenant" below). Adding tenant #151 never touches the VM spec or the NAD,
-only `nmstate.yml`.
+`eth-lan` network, previously used for management/default-VRF access: it's
+the same kind of VLAN sub-interface, just left in the default VRF instead
+of being enslaved into a tenant one (see "VRF per Tenant" below). Adding
+tenant #151 never touches the VM spec or the NAD, only `nmstate.yml`.
+Reach the VM itself via `virtctl console` (serial, not networked) or
+whichever VLAN's IP you configure for management.
 
 See [`manifests/20-networkattachmentdefinition.yaml`](manifests/20-networkattachmentdefinition.yaml)
 for the trunk `NetworkAttachmentDefinition` and
@@ -231,44 +230,27 @@ tenants' running BGP sessions. At this scale, the ConfigMap contents are
 best generated (Helm/Kustomize/your own script) rather than hand-maintained;
 that changes nothing about the ConfigMaps' format itself.
 
-## Adding a New Physical Interface Reliably
+## Adding a Second Physical Interface (Out of Scope by Default)
 
-By contrast, adding a completely new physical NIC (e.g. a second trunk for
-more bandwidth or additional uplink redundancy) is rare and does genuinely
-require a VM restart, since KubeVirt doesn't hot-plug bridge interfaces.
-The core problem here is that the order in which the guest sees new NICs
-(and thus the kernel-assigned name, like `enp2s0`) isn't guaranteed to be
-stable *once there's more than one such NIC to disambiguate between* -
-with the single `eth-trunk` NIC this image normally ships with, there's
-nothing to disambiguate against, so `macAddress`/`interfaces.yaml` are
-optional (KubeVirt will auto-assign and persist a MAC either way). Pinning
-becomes worth doing again the moment you add a second physical interface,
-so this image pins interface names to MAC addresses (see above), and the
-workflow is deliberately two-pronged so both sides (VM spec and guest
-configuration) match up exactly:
+This image is built around having exactly one network device, so
+`70-eth-trunk.link` can safely match on driver alone (see above) instead of
+a pinned MAC address. That assumption breaks the moment a genuinely second
+physical NIC is added (e.g. a second trunk for redundancy or extra
+bandwidth) - a driver-only match can't tell two virtio-net devices apart,
+and would try to rename both to `eth-trunk`.
 
-1. **Pick a MAC address.** Choose a fixed, unique MAC address for the new
-   interface (e.g. from the locally administered range `02:xx:xx:xx:xx:xx`).
-2. **Extend the VM spec:** In the `VirtualMachine`, add a new entry under
-   `spec.template.spec.domain.devices.interfaces` with `name` and exactly
-   that `macAddress`, plus the matching `multus.networkName` under
-   `spec.template.spec.networks`
-   (see [`manifests/20-networkattachmentdefinition.yaml`](manifests/20-networkattachmentdefinition.yaml)).
-3. **Extend the `network-config` ConfigMap:** Add an entry with the same
-   MAC address and the desired name to `interfaces.yaml`, and add the
-   configuration for exactly that name to `nmstate.yml` (or an
-   `*.nmconnection` file).
-4. **Restart the VM.** Only then does `frr-bootc-ifnaming.service`, which
-   runs before NetworkManager, kick in and rename the new interface before
-   NetworkManager claims it.
-
-This makes adding a physical interface reliable: the name inside the guest
-depends solely on the MAC address explicitly set in the VM spec - not on
-the PCI slot order in which KubeVirt attaches interfaces.
+If you need that, go back to MAC-based naming for *both* interfaces: pin a
+`macAddress` for each in the `VirtualMachine`, and ship one `.link` file
+per interface matching on `MACAddress=` instead of `Driver=` (either baked
+into the image per-deployment, or made ConfigMap-driven again the way an
+earlier version of this image did - check the git history for
+`frr-bootc-ifnaming.service`/`frr-bootc-gen-links` if you want that
+approach back). Either way, adding a new physical interface still needs a
+VM restart, since KubeVirt doesn't hot-plug bridge interfaces.
 
 > Changes to already-existing interfaces (IP addresses, routing, new VLAN
-> sub-interfaces on an existing trunk), on the other hand, are picked up
-> **without a restart** via `network-config-sync.path`, live, through
+> sub-interfaces on the trunk), on the other hand, are picked up **without
+> a restart** via `network-config-sync.path`, live, through
 > `nmstate.yml`/`*.nmconnection`.
 
 ## bootc Image Tracking
@@ -382,7 +364,7 @@ $ oc apply -f manifests/00-namespace.yaml
 $ oc apply -f manifests/10-configmap-frr-config.yaml
 $ oc apply -f manifests/11-configmap-network-config.yaml
 $ oc apply -f manifests/12-configmap-bootc-config.yaml
-$ oc apply -f manifests/20-networkattachmentdefinition.yaml   # if additional NICs are needed
+$ oc apply -f manifests/20-networkattachmentdefinition.yaml
 $ oc apply -f manifests/30-virtualmachine.yaml                # adjust <registry>/... first
 ```
 
@@ -425,7 +407,7 @@ inside the VM take care of the rest.
 ## Troubleshooting
 
 - `oc logs`/console access to the VM, then inside the VM:
-  `journalctl -u frr-config-sync.service -u network-config-sync.service -u frr-bootc-ifnaming.service`
+  `journalctl -u frr-config-sync.service -u network-config-sync.service -u bootc-image-sync.service`
 - Currently applied configuration hash: `/var/lib/frr-bootc/*.sha256`
 - FRR validation failures also end up in `/tmp/frr-config-check.log`
   inside the VM.

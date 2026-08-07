@@ -4,9 +4,6 @@
 # which may be mixed:
 #   - *.nmconnection   NetworkManager keyfiles, installed as-is
 #   - *.yml / *.yaml    nmstate desired-state documents, applied via nmstatectl
-# The special file "interfaces.yaml" is not a config file itself; it is a
-# MAC-address -> interface-name map consumed by frr-bootc-gen-links so that
-# interface names stay stable regardless of PCI enumeration order.
 # Triggered at boot (after NetworkManager.service) and by
 # network-config-sync.path whenever the ConfigMap changes.
 set -euo pipefail
@@ -23,10 +20,6 @@ if ! flock -n "$LOCKFD"; then
 fi
 
 mkdir -p "$STATE_DIR"
-
-# Idempotent: (re-)apply MAC -> name pinning first, so anything below can
-# rely on the interface names it expects.
-/usr/local/bin/frr-bootc-gen-links
 
 if [ ! -d "$SRC" ] || [ -z "$(ls -A "$SRC" 2>/dev/null)" ]; then
     echo "network-config-sync: $SRC is empty or not mounted, nothing to sync"
@@ -59,9 +52,6 @@ fi
 
 statefiles=("$SRC"/*.yml "$SRC"/*.yaml)
 for f in "${statefiles[@]}"; do
-    if [ "$(basename "$f")" = "interfaces.yaml" ]; then
-        continue
-    fi
     echo "network-config-sync: applying nmstate state $(basename "$f")"
     if ! nmstatectl apply "$f"; then
         echo "network-config-sync: failed to apply $(basename "$f")" >&2

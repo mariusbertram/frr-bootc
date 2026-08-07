@@ -15,7 +15,6 @@ RUN dnf -y install \
         NetworkManager \
         nmstate \
         rsync \
-        python3-pyyaml \
         util-linux \
         policycoreutils \
         audit \
@@ -34,7 +33,6 @@ COPY files/etc/cloud/cloud.cfg.d/10-bootc.cfg /etc/cloud/cloud.cfg.d/10-bootc.cf
 
 COPY files/usr/local/bin/frr-config-sync /usr/local/bin/frr-config-sync
 COPY files/usr/local/bin/network-config-sync /usr/local/bin/network-config-sync
-COPY files/usr/local/bin/frr-bootc-gen-links /usr/local/bin/frr-bootc-gen-links
 COPY files/usr/local/bin/bootc-image-sync /usr/local/bin/bootc-image-sync
 
 COPY files/usr/lib/systemd/system/run-config-frr.mount /usr/lib/systemd/system/run-config-frr.mount
@@ -42,17 +40,18 @@ COPY files/usr/lib/systemd/system/run-config-network.mount /usr/lib/systemd/syst
 COPY files/usr/lib/systemd/system/run-config-bootc.mount /usr/lib/systemd/system/run-config-bootc.mount
 COPY files/usr/lib/systemd/system/frr-config-sync.service /usr/lib/systemd/system/frr-config-sync.service
 COPY files/usr/lib/systemd/system/frr-config-sync.path /usr/lib/systemd/system/frr-config-sync.path
-COPY files/usr/lib/systemd/system/frr-bootc-ifnaming.service /usr/lib/systemd/system/frr-bootc-ifnaming.service
 COPY files/usr/lib/systemd/system/network-config-sync.service /usr/lib/systemd/system/network-config-sync.service
 COPY files/usr/lib/systemd/system/network-config-sync.path /usr/lib/systemd/system/network-config-sync.path
 COPY files/usr/lib/systemd/system/bootc-image-sync.service /usr/lib/systemd/system/bootc-image-sync.service
 COPY files/usr/lib/systemd/system/bootc-image-sync.path /usr/lib/systemd/system/bootc-image-sync.path
 COPY files/usr/lib/systemd/system/bootc-image-sync.timer /usr/lib/systemd/system/bootc-image-sync.timer
+# Names the VM's only network device "eth-trunk" without needing a pinned
+# MAC address - see the comment in the file itself for why that's safe here.
+COPY files/usr/lib/systemd/network/70-eth-trunk.link /usr/lib/systemd/network/70-eth-trunk.link
 
 RUN chmod 0755 \
         /usr/local/bin/frr-config-sync \
         /usr/local/bin/network-config-sync \
-        /usr/local/bin/frr-bootc-gen-links \
         /usr/local/bin/bootc-image-sync \
     && mkdir -p /run/config/frr /run/config/network /run/config/bootc /var/lib/frr-bootc \
     && chown -R frr:frr /etc/frr \
@@ -62,7 +61,6 @@ RUN chmod 0755 \
         NetworkManager.service \
         auditd.service \
         cloud-init.target \
-        frr-bootc-ifnaming.service \
         frr-config-sync.service \
         frr-config-sync.path \
         network-config-sync.service \
