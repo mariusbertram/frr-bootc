@@ -206,6 +206,75 @@ tenant VLAN). See
 [`manifests/11-configmap-network-config.yaml`](manifests/11-configmap-network-config.yaml)
 for the full example.
 
+## Optional IPv6 BGP Peering
+
+IPv6 peering is entirely opt-in, per tenant - nothing here is on by
+default, and adding it to one tenant doesn't require it for any other.
+`manifests/10-configmap-frr-config.yaml`/`11-configmap-network-config.yaml`
+show tenant1 peering dual-stack (IPv4 + IPv6) while tenant2 stays
+IPv4-only, so both cases are visible side by side. IPv6 forwarding is
+already enabled unconditionally at the OS level
+(`net.ipv6.conf.all.forwarding = 1` in
+[`files/etc/sysctl.d/71-frr-bootc-forwarding.conf`](files/etc/sysctl.d/71-frr-bootc-forwarding.conf)),
+so turning on IPv6 for a tenant only ever touches the two ConfigMaps, the
+same as any other tenant change (see "Adding Tenants Without a VM Restart"
+below):
+
+1. **`network-config`'s `nmstate.yml`:** add an `ipv6:` block to the
+   tenant's VLAN sub-interface, shaped exactly like its `ipv4:` block:
+
+   ```yaml
+   - name: tenant1
+     type: vlan
+     state: up
+     vlan:
+       base-iface: eth-trunk
+       id: 100
+     ipv6:
+       enabled: true
+       address:
+         - ip: 2001:db8:100::2
+           prefix-length: 127
+   ```
+
+   If the tenant advertises an IPv6 network, add the matching leaked
+   `routes.config`/`route-rules.config` entries too (same shape as the
+   IPv4 ones, just with IPv6 prefixes/addresses - see the file for the
+   full example). IPv4 and IPv6 policy-routing rules live in separate
+   kernel rule databases (`ip rule` vs. `ip -6 rule`), so their
+   `priority` numbers don't need to stay globally unique across both.
+
+2. **`frr-config`'s `frr.conf`:** add an IPv6 `neighbor` line and an
+   `address-family ipv6 unicast` block to the tenant's existing `router
+   bgp ... vrf ...` instance - it does **not** need a separate BGP
+   instance:
+
+   ```
+   router bgp 65001 vrf vrf-tenant1
+    bgp router-id 198.51.100.2
+    neighbor 198.51.100.1 remote-as 65000
+    neighbor 2001:db8:100::1 remote-as 65000
+    !
+    address-family ipv4 unicast
+     network 10.0.0.0/24
+    exit-address-family
+    !
+    address-family ipv6 unicast
+     network 2001:db8:a::/64
+    exit-address-family
+   !
+   ```
+
+   FRR auto-activates a neighbor under the address family matching its
+   own address (IPv6 neighbor → `address-family ipv6 unicast`, IPv4 → v4)
+   without needing an explicit `neighbor ... activate` line. `bgp
+   router-id` stays in IPv4 dotted-quad form either way - that's a BGP
+   protocol requirement, not something IPv6-specific.
+
+Both changes are picked up live via `frr-config-sync.path`/
+`network-config-sync.path`, same as any other tenant change - no VM
+restart either way.
+
 ## Adding Tenants Without a VM Restart
 
 This is the common case when scaling to many (e.g. ~150) tenants, and it

@@ -54,13 +54,29 @@ data:
     ! via network-config's nmstate.yml (interfaces/routes/route-rules) -
     ! see the "VRF per Tenant and Policy-Based Routing" and "Adding
     ! Tenants Without a VM Restart" sections of README.md.
+    ! IPv6 peering is entirely optional per tenant: tenant1 here peers
+    ! dual-stack (IPv4 + IPv6), tenant2 below stays IPv4-only. An IPv6
+    ! neighbor is just another "neighbor <address> remote-as ..." line -
+    ! FRR auto-activates it under "address-family ipv6 unicast" because
+    ! its address is an IPv6 one, exactly like the IPv4 neighbor is
+    ! auto-activated under "address-family ipv4 unicast". "bgp router-id"
+    ! stays an IPv4-form value either way, per the BGP spec. The matching
+    ! IPv6 address (nmstate's "ipv6:" block), leaked route and route-rule
+    ! live in network-config's nmstate.yml - see the "Optional IPv6 BGP
+    ! Peering" section of README.md.
     router bgp 65001 vrf vrf-tenant1
      bgp router-id 198.51.100.2
      neighbor 198.51.100.1 remote-as 65000
      neighbor 198.51.100.1 bfd
+     neighbor 2001:db8:100::1 remote-as 65000
+     neighbor 2001:db8:100::1 bfd
      !
      address-family ipv4 unicast
       network 10.0.0.0/24
+     exit-address-family
+     !
+     address-family ipv6 unicast
+      network 2001:db8:a::/64
      exit-address-family
     !
     router bgp 65002 vrf vrf-tenant2
