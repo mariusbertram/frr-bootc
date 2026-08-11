@@ -1,41 +1,47 @@
 #!/usr/bin/bash
 # Sync FRR configuration from the mounted "frr-config" ConfigMap
 # (/run/config/frr, a read-only virtiofs mount) into /etc/frr, then
-# reload or restart FRR as needed. Triggered at boot and by
-# frr-config-sync.path whenever the ConfigMap changes.
+# reload or restart FRR as needed. Triggered at boot and periodically by
+# frr-config-sync.timer - always re-applies rather than skipping when the
+# ConfigMap content looks unchanged (no more content-hash shortcut): a
+# skip that ran right after a reload/restart failure would otherwise mark
+# that content as "already applied" forever, silently leaving the VM on
+# stale config until something ELSE changes. rsync/vtysh -C/frr-reload.py
+# are all cheap and safe to re-run on an unchanged config, same reasoning
+# as network-config-sync's nmstatectl/nmcli calls.
+#
+# Logs verbosely and at every stage on purpose (journalctl -u
+# frr-config-sync.service): this VM has no dashboard/alerting, console
+# access is the only way in, and a vague "something failed" here used to
+# mean piecing the actual cause back together from /tmp files and guesswork.
 set -euo pipefail
 
 SRC=/run/config/frr
 DST=/etc/frr
-STATE_DIR=/var/lib/frr-bootc
-STAMP="$STATE_DIR/frr-config.sha256"
 LOCK=/run/frr-config-sync.lock
+
+log() { echo "frr-config-sync: $*"; }
+err() { echo "frr-config-sync: ERROR: $*" >&2; }
 
 exec {LOCKFD}>"$LOCK"
 if ! flock -n "$LOCKFD"; then
-    echo "frr-config-sync: another run is already in progress, skipping"
+    log "another run is already in progress, skipping"
     exit 0
 fi
-
-mkdir -p "$STATE_DIR"
 
 if [ ! -d "$SRC" ] || [ -z "$(ls -A "$SRC" 2>/dev/null)" ]; then
-    echo "frr-config-sync: $SRC is empty or not mounted, nothing to sync"
+    log "$SRC is empty or not mounted, nothing to sync"
     exit 0
 fi
 
-new_sum=$(find "$SRC" -type f -exec sha256sum {} + | sort | sha256sum | awk '{print $1}')
-old_sum=$(cat "$STAMP" 2>/dev/null || true)
-
-if [ "$new_sum" = "$old_sum" ]; then
-    exit 0
-fi
+log "starting sync from $SRC (files: $(ls -1 "$SRC" | tr '\n' ' '))"
 
 # The set of enabled daemons only takes effect on (re)start of frr.service,
 # a plain reload cannot add/remove daemon processes.
 daemons_changed=0
 if ! cmp -s "$SRC/daemons" "$DST/daemons" 2>/dev/null; then
     daemons_changed=1
+    log "daemons file differs from the currently running one - will restart frr.service, not reload"
 fi
 
 stage=$(mktemp -d /etc/frr.staged.XXXXXX)
@@ -44,26 +50,57 @@ trap 'rm -rf "$stage"' EXIT
 cp -a "$SRC"/. "$stage"/
 
 if [ -f "$stage/frr.conf" ]; then
+    log "validating staged frr.conf (vtysh -f <staged> -C)"
     if ! vtysh -f "$stage/frr.conf" -C >/tmp/frr-config-check.log 2>&1; then
-        echo "frr-config-sync: new frr.conf failed validation, keeping the running config:" >&2
+        err "staged frr.conf failed validation, keeping the currently running config unchanged."
+        err "full 'vtysh -C' output (also saved to /tmp/frr-config-check.log):"
         cat /tmp/frr-config-check.log >&2
         exit 1
     fi
+    log "validation passed"
 fi
 
 chown -R frr:frr "$stage"
 chmod -R u=rwX,g=rX,o= "$stage"
 
-rsync -a --delete "$stage"/ "$DST"/
-echo "$new_sum" > "$STAMP"
+log "rsyncing staged config into $DST"
+if ! rsync_out=$(rsync -avi --delete "$stage"/ "$DST"/ 2>&1); then
+    err "rsync into $DST failed:"
+    echo "$rsync_out" >&2
+    exit 1
+fi
+changed_count=$(echo "$rsync_out" | grep -c '^[<>ch*]' || true)
+log "rsync complete, $changed_count file(s) changed"
+if [ "$changed_count" != "0" ]; then
+    echo "$rsync_out" | grep '^[<>ch*]' | sed 's/^/frr-config-sync:   /'
+fi
 
 if [ "$daemons_changed" = "1" ]; then
-    echo "frr-config-sync: daemons file changed, restarting frr.service"
-    systemctl --no-block restart frr.service
+    log "restarting frr.service"
+    if systemctl restart frr.service; then
+        log "frr.service restarted successfully"
+    else
+        err "systemctl restart frr.service failed (exit $?). Recent frr.service log:"
+        journalctl -u frr.service -n 50 --no-pager >&2 || true
+        exit 1
+    fi
 else
-    echo "frr-config-sync: reloading frr configuration"
-    if ! /usr/libexec/frr/frr-reload.py --reload --stdout "$DST/frr.conf"; then
-        echo "frr-config-sync: frr-reload.py failed, restarting frr.service as fallback" >&2
-        systemctl --no-block restart frr.service
+    log "reloading frr configuration (frr-reload.py --reload)"
+    if reload_out=$(/usr/libexec/frr/frr-reload.py --reload --stdout "$DST/frr.conf" 2>&1); then
+        log "frr-reload.py succeeded"
+        [ -n "$reload_out" ] && echo "$reload_out" | sed 's/^/frr-config-sync:   /'
+    else
+        err "frr-reload.py failed (exit $?), full output:"
+        echo "$reload_out" | sed 's/^/frr-config-sync:   /' >&2
+        log "falling back to systemctl restart frr.service"
+        if systemctl restart frr.service; then
+            log "frr.service restarted successfully (fallback)"
+        else
+            err "fallback systemctl restart frr.service ALSO failed (exit $?). Recent frr.service log:"
+            journalctl -u frr.service -n 50 --no-pager >&2 || true
+            exit 1
+        fi
     fi
 fi
+
+log "sync complete"

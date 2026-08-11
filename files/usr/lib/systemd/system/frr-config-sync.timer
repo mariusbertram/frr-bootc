@@ -1,5 +1,5 @@
 [Unit]
-Description=Periodic fallback poll of the mounted frr-config ConfigMap, in case frr-config-sync.path misses a virtiofs change notification
+Description=Periodically poll the mounted frr-config ConfigMap for changes
 
 [Timer]
 OnBootSec=2min
