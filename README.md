@@ -477,7 +477,10 @@ inside the VM take care of the rest.
 
 - `oc logs`/console access to the VM, then inside the VM:
   `journalctl -u frr-config-sync.service -u network-config-sync.service -u bootc-image-sync.service`
-- Currently applied configuration hash: `/var/lib/frr-bootc/*.sha256`
+- Currently applied FRR configuration hash: `/var/lib/frr-bootc/frr-config.sha256`
+  (`frr-config-sync` skips a reload when unchanged, to avoid disrupting a
+  running `frr.service` needlessly; `network-config-sync` has no such skip -
+  it always re-applies, since `nmstatectl apply` is idempotent)
 - FRR validation failures also end up in `/tmp/frr-config-check.log`
   inside the VM.
 - `nmstatectl show` or `nmcli connection show` to check the current network
