@@ -3,14 +3,20 @@
 #
 # FRR and network configuration are not baked into the image; they are
 # mounted at runtime from Kubernetes ConfigMaps (via virtiofs) and kept in
-# sync by frr-config-sync.{service,path,timer} and
-# network-config-sync.{service,path,timer} - the .path units react
-# immediately to a ConfigMap change, the .timer units are a periodic
-# fallback poll in case a virtiofs change notification is ever missed
-# (both scripts are cheap/idempotent to re-run: frr-config-sync skips via
-# a content hash, network-config-sync's nmstatectl/nmcli calls are
-# idempotent by design). bootc-image-sync.{service,path,timer} does the
-# same for which OCI image this system tracks for "bootc switch"/upgrades.
+# sync by frr-config-sync.{service,timer} and
+# network-config-sync.{service,timer} - a periodic poll (every 2min) is
+# the ONLY trigger for both, deliberately not inotify (a "*.path" unit
+# watching the virtiofs mount): virtiofs doesn't reliably propagate the
+# host-side atomic symlink swap kubelet uses to update a mounted
+# ConfigMap as an inotify event into the guest, so relying on it left
+# both scripts triggering unreliably in practice. Both scripts always
+# re-apply in full rather than trying to skip unchanged content - cheap
+# and safe to re-run every 2min, and unlike a skip, can't get stuck
+# treating a config change as "already applied" when it wasn't (see each
+# script's own comment). bootc-image-sync.{service,path,timer} still
+# uses the .path+.timer combo (much longer 30min interval, and switching
+# images is comparatively rare/heavyweight, so a missed inotify event
+# there is a smaller/rarer cost than for these two).
 # See README.md for the full architecture and deployment manifests.
 ARG BASE_IMAGE=quay.io/fedora/fedora-bootc:44
 FROM ${BASE_IMAGE}
@@ -45,10 +51,8 @@ COPY files/usr/lib/systemd/system/run-config-frr.mount /usr/lib/systemd/system/r
 COPY files/usr/lib/systemd/system/run-config-network.mount /usr/lib/systemd/system/run-config-network.mount
 COPY files/usr/lib/systemd/system/run-config-bootc.mount /usr/lib/systemd/system/run-config-bootc.mount
 COPY files/usr/lib/systemd/system/frr-config-sync.service /usr/lib/systemd/system/frr-config-sync.service
-COPY files/usr/lib/systemd/system/frr-config-sync.path /usr/lib/systemd/system/frr-config-sync.path
 COPY files/usr/lib/systemd/system/frr-config-sync.timer /usr/lib/systemd/system/frr-config-sync.timer
 COPY files/usr/lib/systemd/system/network-config-sync.service /usr/lib/systemd/system/network-config-sync.service
-COPY files/usr/lib/systemd/system/network-config-sync.path /usr/lib/systemd/system/network-config-sync.path
 COPY files/usr/lib/systemd/system/network-config-sync.timer /usr/lib/systemd/system/network-config-sync.timer
 COPY files/usr/lib/systemd/system/bootc-image-sync.service /usr/lib/systemd/system/bootc-image-sync.service
 COPY files/usr/lib/systemd/system/bootc-image-sync.path /usr/lib/systemd/system/bootc-image-sync.path
@@ -58,7 +62,7 @@ RUN chmod 0755 \
         /usr/local/bin/frr-config-sync \
         /usr/local/bin/network-config-sync \
         /usr/local/bin/bootc-image-sync \
-    && mkdir -p /run/config/frr /run/config/network /run/config/bootc /var/lib/frr-bootc \
+    && mkdir -p /run/config/frr /run/config/network /run/config/bootc \
     && chown -R frr:frr /etc/frr \
     && chmod -R u=rwX,g=rX,o= /etc/frr \
     && systemctl enable \
@@ -67,10 +71,8 @@ RUN chmod 0755 \
         auditd.service \
         cloud-init.target \
         frr-config-sync.service \
-        frr-config-sync.path \
         frr-config-sync.timer \
         network-config-sync.service \
-        network-config-sync.path \
         network-config-sync.timer \
         bootc-image-sync.service \
         bootc-image-sync.path \

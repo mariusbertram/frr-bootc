@@ -1,8 +1,0 @@
-[Unit]
-Description=Watch the mounted network-config ConfigMap for changes
-
-[Path]
-PathModified=/run/config/network
-
-[Install]
-WantedBy=multi-user.target

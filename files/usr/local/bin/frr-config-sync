@@ -1,14 +1,18 @@
 #!/usr/bin/bash
 # Sync FRR configuration from the mounted "frr-config" ConfigMap
 # (/run/config/frr, a read-only virtiofs mount) into /etc/frr, then
-# reload or restart FRR as needed. Triggered at boot and by
-# frr-config-sync.path whenever the ConfigMap changes.
+# reload or restart FRR as needed. Triggered at boot and periodically by
+# frr-config-sync.timer - always re-applies rather than skipping when the
+# ConfigMap content looks unchanged (no more content-hash shortcut): a
+# skip that ran right after a reload/restart failure would otherwise mark
+# that content as "already applied" forever, silently leaving the VM on
+# stale config until something ELSE changes. rsync/vtysh -C/frr-reload.py
+# are all cheap and safe to re-run on an unchanged config, same reasoning
+# as network-config-sync's nmstatectl/nmcli calls.
 set -euo pipefail
 
 SRC=/run/config/frr
 DST=/etc/frr
-STATE_DIR=/var/lib/frr-bootc
-STAMP="$STATE_DIR/frr-config.sha256"
 LOCK=/run/frr-config-sync.lock
 
 exec {LOCKFD}>"$LOCK"
@@ -17,17 +21,8 @@ if ! flock -n "$LOCKFD"; then
     exit 0
 fi
 
-mkdir -p "$STATE_DIR"
-
 if [ ! -d "$SRC" ] || [ -z "$(ls -A "$SRC" 2>/dev/null)" ]; then
     echo "frr-config-sync: $SRC is empty or not mounted, nothing to sync"
-    exit 0
-fi
-
-new_sum=$(find "$SRC" -type f -exec sha256sum {} + | sort | sha256sum | awk '{print $1}')
-old_sum=$(cat "$STAMP" 2>/dev/null || true)
-
-if [ "$new_sum" = "$old_sum" ]; then
     exit 0
 fi
 
@@ -55,7 +50,6 @@ chown -R frr:frr "$stage"
 chmod -R u=rwX,g=rX,o= "$stage"
 
 rsync -a --delete "$stage"/ "$DST"/
-echo "$new_sum" > "$STAMP"
 
 if [ "$daemons_changed" = "1" ]; then
     echo "frr-config-sync: daemons file changed, restarting frr.service"

@@ -4,14 +4,14 @@
 # which may be mixed:
 #   - *.nmconnection   NetworkManager keyfiles, installed as-is
 #   - *.yml / *.yaml    nmstate desired-state documents, applied via nmstatectl
-# Triggered at boot (after NetworkManager.service) and by
-# network-config-sync.path whenever the ConfigMap changes. Always re-applies
-# in full rather than skipping when the ConfigMap content is unchanged since
-# the last run: nmstatectl apply is idempotent, and a checksum-based skip
-# would permanently mask a run that reported success without the interface
-# actually reaching the desired state (e.g. an activation that lost a race
-# against device readiness at boot) - since the ConfigMap itself never
-# changes again in that case, a skip would never get retried.
+# Triggered at boot (after NetworkManager.service) and periodically by
+# network-config-sync.timer. Always re-applies in full rather than skipping
+# when the ConfigMap content is unchanged since the last run: nmstatectl
+# apply is idempotent, and a checksum-based skip would permanently mask a
+# run that reported success without the interface actually reaching the
+# desired state (e.g. an activation that lost a race against device
+# readiness at boot) - since the ConfigMap itself never changes again in
+# that case, a skip would never get retried.
 set -euo pipefail
 
 SRC=/run/config/network
