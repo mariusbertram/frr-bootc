@@ -62,7 +62,7 @@ if [ "$daemons_changed" = "1" ]; then
     systemctl --no-block restart frr.service
 else
     echo "frr-config-sync: reloading frr configuration"
-    if ! /usr/lib/frr/frr-reload.py --reload --stdout "$DST/frr.conf"; then
+    if ! /usr/libexec/frr/frr-reload.py --reload --stdout "$DST/frr.conf"; then
         echo "frr-config-sync: frr-reload.py failed, restarting frr.service as fallback" >&2
         systemctl --no-block restart frr.service
     fi
