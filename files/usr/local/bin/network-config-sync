@@ -5,12 +5,16 @@
 #   - *.nmconnection   NetworkManager keyfiles, installed as-is
 #   - *.yml / *.yaml    nmstate desired-state documents, applied via nmstatectl
 # Triggered at boot (after NetworkManager.service) and by
-# network-config-sync.path whenever the ConfigMap changes.
+# network-config-sync.path whenever the ConfigMap changes. Always re-applies
+# in full rather than skipping when the ConfigMap content is unchanged since
+# the last run: nmstatectl apply is idempotent, and a checksum-based skip
+# would permanently mask a run that reported success without the interface
+# actually reaching the desired state (e.g. an activation that lost a race
+# against device readiness at boot) - since the ConfigMap itself never
+# changes again in that case, a skip would never get retried.
 set -euo pipefail
 
 SRC=/run/config/network
-STATE_DIR=/var/lib/frr-bootc
-STAMP="$STATE_DIR/network-config.sha256"
 LOCK=/run/network-config-sync.lock
 
 exec {LOCKFD}>"$LOCK"
@@ -19,17 +23,8 @@ if ! flock -n "$LOCKFD"; then
     exit 0
 fi
 
-mkdir -p "$STATE_DIR"
-
 if [ ! -d "$SRC" ] || [ -z "$(ls -A "$SRC" 2>/dev/null)" ]; then
     echo "network-config-sync: $SRC is empty or not mounted, nothing to sync"
-    exit 0
-fi
-
-new_sum=$(find "$SRC" -type f -exec sha256sum {} + | sort | sha256sum | awk '{print $1}')
-old_sum=$(cat "$STAMP" 2>/dev/null || true)
-
-if [ "$new_sum" = "$old_sum" ]; then
     exit 0
 fi
 
@@ -58,5 +53,3 @@ for f in "${statefiles[@]}"; do
         exit 1
     fi
 done
-
-echo "$new_sum" > "$STAMP"
