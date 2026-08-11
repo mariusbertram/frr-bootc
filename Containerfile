@@ -3,9 +3,14 @@
 #
 # FRR and network configuration are not baked into the image; they are
 # mounted at runtime from Kubernetes ConfigMaps (via virtiofs) and kept in
-# sync by frr-config-sync.{service,path} and network-config-sync.{service,path}.
-# bootc-image-sync.{service,path,timer} does the same for which OCI image
-# this system tracks for "bootc switch"/upgrades.
+# sync by frr-config-sync.{service,path,timer} and
+# network-config-sync.{service,path,timer} - the .path units react
+# immediately to a ConfigMap change, the .timer units are a periodic
+# fallback poll in case a virtiofs change notification is ever missed
+# (both scripts are cheap/idempotent to re-run: frr-config-sync skips via
+# a content hash, network-config-sync's nmstatectl/nmcli calls are
+# idempotent by design). bootc-image-sync.{service,path,timer} does the
+# same for which OCI image this system tracks for "bootc switch"/upgrades.
 # See README.md for the full architecture and deployment manifests.
 ARG BASE_IMAGE=quay.io/fedora/fedora-bootc:44
 FROM ${BASE_IMAGE}
@@ -19,6 +24,7 @@ RUN dnf -y install \
         policycoreutils \
         audit \
         cloud-init \
+        tcpdump \
     && dnf clean all
 
 COPY files/etc/frr/daemons /etc/frr/daemons
@@ -40,8 +46,10 @@ COPY files/usr/lib/systemd/system/run-config-network.mount /usr/lib/systemd/syst
 COPY files/usr/lib/systemd/system/run-config-bootc.mount /usr/lib/systemd/system/run-config-bootc.mount
 COPY files/usr/lib/systemd/system/frr-config-sync.service /usr/lib/systemd/system/frr-config-sync.service
 COPY files/usr/lib/systemd/system/frr-config-sync.path /usr/lib/systemd/system/frr-config-sync.path
+COPY files/usr/lib/systemd/system/frr-config-sync.timer /usr/lib/systemd/system/frr-config-sync.timer
 COPY files/usr/lib/systemd/system/network-config-sync.service /usr/lib/systemd/system/network-config-sync.service
 COPY files/usr/lib/systemd/system/network-config-sync.path /usr/lib/systemd/system/network-config-sync.path
+COPY files/usr/lib/systemd/system/network-config-sync.timer /usr/lib/systemd/system/network-config-sync.timer
 COPY files/usr/lib/systemd/system/bootc-image-sync.service /usr/lib/systemd/system/bootc-image-sync.service
 COPY files/usr/lib/systemd/system/bootc-image-sync.path /usr/lib/systemd/system/bootc-image-sync.path
 COPY files/usr/lib/systemd/system/bootc-image-sync.timer /usr/lib/systemd/system/bootc-image-sync.timer
@@ -60,8 +68,10 @@ RUN chmod 0755 \
         cloud-init.target \
         frr-config-sync.service \
         frr-config-sync.path \
+        frr-config-sync.timer \
         network-config-sync.service \
         network-config-sync.path \
+        network-config-sync.timer \
         bootc-image-sync.service \
         bootc-image-sync.path \
         bootc-image-sync.timer

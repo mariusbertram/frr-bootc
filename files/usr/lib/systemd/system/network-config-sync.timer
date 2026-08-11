@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodic fallback poll of the mounted network-config ConfigMap, in case network-config-sync.path misses a virtiofs change notification
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

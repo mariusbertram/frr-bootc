@@ -30,6 +30,10 @@ documents how it's deployed at scale.
  frr-config-sync.path        network-config-sync.path
  (inotify on directory)      (inotify on directory)
         │                            │
+ frr-config-sync.timer       network-config-sync.timer
+ (2min fallback poll,        (2min fallback poll,
+  in case inotify is missed)  in case inotify is missed)
+        │                            │
         ▼                            ▼
  frr-config-sync.service     network-config-sync.service
    → /etc/frr/*                 → *.nmconnection to NetworkManager
