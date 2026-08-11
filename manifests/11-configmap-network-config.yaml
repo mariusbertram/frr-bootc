@@ -10,10 +10,10 @@
 # flat, source-prefix-based rule that scales to many tenants far better
 # than binding an FRR pbr-map to one fixed ingress interface.
 #
-# "eth-trunk" itself needs no MAC pinning or interfaces.yaml entry: it's
-# the VM's only network device, named by the static
-# /usr/lib/systemd/network/70-eth-trunk.link shipped in the image (matches
-# on driver, not MAC - see that file's comment for why that's safe here).
+# "eth-trunk" is identified below by the same fixed macAddress set on it
+# in the VirtualMachine spec (30-virtualmachine.yaml) - nmstate renames it
+# to "eth-trunk" itself as part of this apply, no udev/.link file/
+# initramfs involved.
 #
 # NetworkManager keyfiles can be used instead of/alongside nmstate by adding
 # a "*.nmconnection" key here - network-config-sync installs those directly
@@ -31,8 +31,10 @@ data:
       # 20-networkattachmentdefinition.yaml). No IP of its own - every
       # logical network gets its own VLAN sub-interface below. Adding
       # tenant #151 only ever touches this ConfigMap, never the VM spec or
-      # this NIC.
+      # this NIC. Must match the macAddress set in the VirtualMachine spec.
       - name: eth-trunk
+        identifier: mac-address
+        mac-address: "02:00:00:00:00:01"
         type: ethernet
         state: up
 

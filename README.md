@@ -56,10 +56,10 @@ needing a cloud-init ISO or a reboot.
 - **Network configuration** (`nmstate.yml`/`*.nmconnection`) is applied by
   `network-config-sync.service`, which runs **after** `NetworkManager.service`
   since `nmstatectl` requires a running NetworkManager. The VM's single
-  network device is named "eth-trunk" statically at the udev level (see
-  "A Trunk Instead of One NIC per Tenant" below), independent of
-  NetworkManager or this sync path entirely - so unlike the FRR side,
-  there's no separate naming step to sequence around here.
+  network device is identified by its fixed `macAddress` and named
+  "eth-trunk" by `nmstatectl apply` itself, as part of this same sync step
+  (see "A Trunk Instead of One NIC per Tenant" below) - no separate naming
+  step to sequence around.
 
 ## Configuration Format
 
@@ -76,11 +76,13 @@ See [`manifests/10-configmap-frr-config.yaml`](manifests/10-configmap-frr-config
 ### `network-config` ConfigMap → `/run/config/network`
 
 - `*.yml` / `*.yaml` — [nmstate](https://nmstate.io/) desired-state
-  documents, applied via `nmstatectl apply`. No MAC-to-name mapping is
-  needed here: the VM's one and only network device is already named
-  "eth-trunk" by a static `.link` file baked into the image (see "A Trunk
-  Instead of One NIC per Tenant" below), so `nmstate.yml` can just refer to
-  `eth-trunk` directly as `base-iface` for every VLAN sub-interface.
+  documents, applied via `nmstatectl apply`. The VM's one and only network
+  device is identified by `identifier: mac-address`/`mac-address:` against
+  its fixed `macAddress` (set in the `VirtualMachine` spec) and named
+  "eth-trunk" by nmstate itself as part of the same apply (see "A Trunk
+  Instead of One NIC per Tenant" below), so every other VLAN sub-interface
+  in the same document can just refer to `eth-trunk` directly as
+  `base-iface`.
 - `*.nmconnection` — raw NetworkManager keyfiles, installed into
   `/etc/NetworkManager/system-connections/` and activated.
 
@@ -109,14 +111,18 @@ tenant count, and no separate pod/masquerade "default" network either:
   `vlan_filtering: true` (see the comment in the
   `NetworkAttachmentDefinition`).
 
-No `macAddress` is set for it in the `VirtualMachine` either. Instead, a
-static `.link` file baked into the image
-(`files/usr/lib/systemd/network/70-eth-trunk.link`) matches on
-`Driver=virtio_net` and renames whatever it finds to `eth-trunk` - safe
-*only* because this is the VM's sole network device, so there's nothing
-else that match could accidentally catch. (Adding a second physical NIC
-later would require going back to per-MAC `.link` matching for both, since
-two devices obviously can't share one name.)
+A fixed, deterministic `macAddress` is set for it in the `VirtualMachine`
+spec, and `network-config`'s `nmstate.yml` identifies the device by that
+same MAC (`identifier: mac-address`, `mac-address: <...>`) and names it
+"eth-trunk" as part of the normal `nmstatectl apply` done by
+`network-config-sync.service` at boot - no udev `.link` file, no
+initramfs rebuild step, nothing that has to run before the real root
+filesystem is even mounted. Whoever generates the `VirtualMachine`
+manifest and `nmstate.yml` (in this repo's examples that's
+`mariusbertram/frr-argo`'s `generator/generate.py`) just needs to put the
+*same* MAC in both places - see its `replica_mac()` for a scheme that
+derives one deterministically per replica instead of hand-picking/pinning
+one.
 
 Every tenant gets their own VLAN sub-interface on top of `eth-trunk` -
 never their own interface - and so does the internal, non-tenant-specific
@@ -301,21 +307,14 @@ that changes nothing about the ConfigMaps' format itself.
 
 ## Adding a Second Physical Interface (Out of Scope by Default)
 
-This image is built around having exactly one network device, so
-`70-eth-trunk.link` can safely match on driver alone (see above) instead of
-a pinned MAC address. That assumption breaks the moment a genuinely second
-physical NIC is added (e.g. a second trunk for redundancy or extra
-bandwidth) - a driver-only match can't tell two virtio-net devices apart,
-and would try to rename both to `eth-trunk`.
-
-If you need that, go back to MAC-based naming for *both* interfaces: pin a
-`macAddress` for each in the `VirtualMachine`, and ship one `.link` file
-per interface matching on `MACAddress=` instead of `Driver=` (either baked
-into the image per-deployment, or made ConfigMap-driven again the way an
-earlier version of this image did - check the git history for
-`frr-bootc-ifnaming.service`/`frr-bootc-gen-links` if you want that
-approach back). Either way, adding a new physical interface still needs a
-VM restart, since KubeVirt doesn't hot-plug bridge interfaces.
+This image is built around having exactly one network device. Since
+`eth-trunk` is already identified by its own fixed `macAddress` rather than
+by an assumed kernel-given name (see above), adding a genuinely second
+physical NIC (e.g. a second trunk for redundancy or extra bandwidth) isn't
+a special case: pin a second `macAddress` in the `VirtualMachine` spec and
+add a matching second `identifier: mac-address` interface entry to
+`nmstate.yml` with its own name. Still needs a VM restart either way, since
+KubeVirt doesn't hot-plug bridge interfaces.
 
 > Changes to already-existing interfaces (IP addresses, routing, new VLAN
 > sub-interfaces on the trunk), on the other hand, are picked up **without
@@ -485,3 +484,10 @@ inside the VM take care of the rest.
   inside the VM.
 - `nmstatectl show` or `nmcli connection show` to check the current network
   state.
+- If the trunk NIC shows up as `enp3s0` (or another kernel-assigned name)
+  instead of `eth-trunk`, check that the `macAddress` in the
+  `VirtualMachine` spec actually matches the `mac-address:` nmstate
+  identifies `eth-trunk` by in `network-config`'s `nmstate.yml` - see "A
+  Trunk Instead of One NIC per Tenant" above. A mismatch there (e.g. one
+  side regenerated without the other) means nmstate can't find the device
+  it's supposed to rename.

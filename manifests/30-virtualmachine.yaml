@@ -55,11 +55,13 @@ spec:
             # tenant's VLAN, the internal/default-VRF VLAN, everything -
             # is a VLAN sub-interface carved out of this one trunk via
             # network-config's nmstate.yml, never a separate VM interface.
-            # No macAddress needed: it's named "eth-trunk" by the static
-            # /usr/lib/systemd/network/70-eth-trunk.link shipped in the
-            # image, which matches on driver rather than MAC - safe
-            # because this is the VM's only NIC (see that file's comment).
+            # macAddress is fixed here so nmstate.yml can identify this
+            # device (`identifier: mac-address`) and name it "eth-trunk"
+            # itself - pick any unique, locally-administered MAC ("02:"
+            # prefix) and use the *same* value in nmstate.yml's
+            # mac-address: field (see 11-configmap-network-config.yaml).
             - name: eth-trunk
+              macAddress: "02:00:00:00:00:01"
               bridge: {}
           filesystems:
             - name: frr-config

@@ -45,9 +45,6 @@ COPY files/usr/lib/systemd/system/network-config-sync.path /usr/lib/systemd/syst
 COPY files/usr/lib/systemd/system/bootc-image-sync.service /usr/lib/systemd/system/bootc-image-sync.service
 COPY files/usr/lib/systemd/system/bootc-image-sync.path /usr/lib/systemd/system/bootc-image-sync.path
 COPY files/usr/lib/systemd/system/bootc-image-sync.timer /usr/lib/systemd/system/bootc-image-sync.timer
-# Names the VM's only network device "eth-trunk" without needing a pinned
-# MAC address - see the comment in the file itself for why that's safe here.
-COPY files/usr/lib/systemd/network/70-eth-trunk.link /usr/lib/systemd/network/70-eth-trunk.link
 
 RUN chmod 0755 \
         /usr/local/bin/frr-config-sync \

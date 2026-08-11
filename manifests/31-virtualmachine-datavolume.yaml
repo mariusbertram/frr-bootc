@@ -58,8 +58,10 @@ spec:
                 bus: virtio
           interfaces:
             # The VM's only network device - see manifests/30-virtualmachine.yaml
-            # for why no macAddress is needed here.
+            # for why macAddress is fixed here (must match nmstate.yml's
+            # mac-address: for eth-trunk).
             - name: eth-trunk
+              macAddress: "02:00:00:00:00:01"
               bridge: {}
           filesystems:
             - name: frr-config
