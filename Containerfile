@@ -19,6 +19,7 @@ RUN dnf -y install \
         policycoreutils \
         audit \
         cloud-init \
+        tcpdump \
     && dnf clean all
 
 COPY files/etc/frr/daemons /etc/frr/daemons
