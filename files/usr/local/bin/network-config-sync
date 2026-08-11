@@ -12,44 +12,72 @@
 # desired state (e.g. an activation that lost a race against device
 # readiness at boot) - since the ConfigMap itself never changes again in
 # that case, a skip would never get retried.
+#
+# Logs verbosely and at every stage on purpose (journalctl -u
+# network-config-sync.service): this VM has no dashboard/alerting, console
+# access is the only way in, and a vague "something failed" here used to
+# mean piecing the actual cause back together with no error detail at all
+# (nmcli's own error output used to be thrown away outright, see below).
 set -euo pipefail
 
 SRC=/run/config/network
 LOCK=/run/network-config-sync.lock
 
+log() { echo "network-config-sync: $*"; }
+err() { echo "network-config-sync: ERROR: $*" >&2; }
+
 exec {LOCKFD}>"$LOCK"
 if ! flock -n "$LOCKFD"; then
-    echo "network-config-sync: another run is already in progress, skipping"
+    log "another run is already in progress, skipping"
     exit 0
 fi
 
 if [ ! -d "$SRC" ] || [ -z "$(ls -A "$SRC" 2>/dev/null)" ]; then
-    echo "network-config-sync: $SRC is empty or not mounted, nothing to sync"
+    log "$SRC is empty or not mounted, nothing to sync"
     exit 0
 fi
 
 shopt -s nullglob
+
+log "starting sync from $SRC (files: $(ls -1 "$SRC" | tr '\n' ' '))"
 
 nmconnections=("$SRC"/*.nmconnection)
 if [ "${#nmconnections[@]}" -gt 0 ]; then
     for f in "${nmconnections[@]}"; do
         name=$(basename "$f")
         install -m 600 -o root -g root "$f" "/etc/NetworkManager/system-connections/$name"
-        echo "network-config-sync: installed NetworkManager connection $name"
+        log "installed NetworkManager connection $name"
     done
-    nmcli connection reload
+    log "reloading NetworkManager connections"
+    if ! reload_out=$(nmcli connection reload 2>&1); then
+        err "nmcli connection reload failed:"
+        echo "$reload_out" >&2
+        exit 1
+    fi
     for f in "${nmconnections[@]}"; do
         conn_name=$(basename "$f" .nmconnection)
-        nmcli connection up "$conn_name" 2>/dev/null \
-            || echo "network-config-sync: warning: could not activate connection $conn_name" >&2
+        log "activating connection $conn_name"
+        if up_out=$(nmcli connection up "$conn_name" 2>&1); then
+            log "connection $conn_name is up"
+        else
+            err "could not activate connection $conn_name:"
+            echo "$up_out" >&2
+        fi
     done
 fi
 
 statefiles=("$SRC"/*.yml "$SRC"/*.yaml)
 for f in "${statefiles[@]}"; do
-    echo "network-config-sync: applying nmstate state $(basename "$f")"
-    if ! nmstatectl apply "$f"; then
-        echo "network-config-sync: failed to apply $(basename "$f")" >&2
+    name=$(basename "$f")
+    log "applying nmstate state $name"
+    if apply_out=$(nmstatectl apply "$f" 2>&1); then
+        log "applied $name successfully"
+        [ -n "$apply_out" ] && echo "$apply_out" | sed 's/^/network-config-sync:   /'
+    else
+        err "failed to apply $name, full nmstatectl output:"
+        echo "$apply_out" | sed 's/^/network-config-sync:   /' >&2
         exit 1
     fi
 done
+
+log "sync complete"
