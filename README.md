@@ -483,10 +483,72 @@ Make configuration changes afterwards simply via `oc edit configmap/frr-config`
 or `oc edit configmap/network-config -n frr-bootc` - the sync services
 inside the VM take care of the rest.
 
+## Console Dashboard
+
+This VM has no external dashboard/alerting (see the comment at the top of
+`frr-config-sync`) - console access is the only way in. So rather than a
+plain login prompt, the VM's two consoles each run a persistent status
+dashboard (`/usr/local/bin/frr-console`), Talos-Linux style: it's there
+before, without, and regardless of anyone logging in, and it comes right
+back the moment they log back out.
+
+- `frr-console-tty1.service` - the graphical/VNC console (`virtctl vnc`)
+- `frr-console-ttyS0.service` - the serial console (`virtctl console`)
+
+Both replace `getty@tty1.service`/`serial-getty@ttyS0.service` outright -
+masked in the Containerfile so nothing (not the getty generator, not a
+manual `systemctl start`) can bring the plain login prompt back on either
+tty - rather than sitting in front of them. **SSH is unaffected**: SSH
+sessions use their own pty, never `/dev/tty1`/`/dev/ttyS0`, so they still
+land in a plain shell exactly as before; this only changes the two
+consoles KubeVirt exposes directly.
+
+The dashboard auto-refreshes every 5s, showing:
+
+- uptime, load, memory, disk
+- network interfaces (`ip -brief addr`) with up/down state and live
+  rx/tx throughput (a delta between two `/sys/class/net/*/statistics`
+  samples, so it needs one redraw to warm up - "throughput: -" the first
+  time an interface is seen)
+- `frr.service` state, active daemons, and the IPv4 RIB route count
+- established-vs-configured BGP peer counts **per VRF** (each tenant gets
+  its own VRF and its own BGP instance - see "VRF per Tenant" above - so
+  one tenant's session being down doesn't hide behind another's being
+  fine), when `bgpd` is running
+- health of the three sync services (`frr-config-sync`,
+  `network-config-sync`, `bootc-image-sync`) - FAILED if a unit's last run
+  failed, a warning if its timer isn't active, so a silently-broken sync
+  is visible right on the console instead of only in `journalctl`
+- the current `bootc status` (booted/staged image)
+
+Viewing it needs no authentication - whoever already has console access to
+the VM (via `virtctl`/`oc` RBAC) is already privileged enough that this
+isn't new exposure. `b` execs a real `/bin/login` (the normal
+"login:"/password prompt), so an actual shell is still gated on real
+credentials; `r` redraws immediately instead of waiting out the refresh
+interval. Exiting that shell ends the `login` process, which the owning
+unit's `Restart=always` immediately answers by relaunching the dashboard
+on the same tty - there's no separate "log out of the dashboard" step,
+the shell exiting *is* that step.
+
+To get a plain login prompt back on a given tty instead (e.g. while
+debugging this mechanism itself), on the VM:
+
+```console
+$ systemctl disable --now frr-console-tty1.service
+$ systemctl unmask getty@tty1.service
+$ systemctl start getty@tty1.service
+```
+
+(swap in `frr-console-ttyS0.service`/`serial-getty@ttyS0.service` for the
+serial console).
+
 ## Troubleshooting
 
 - `oc logs`/console access to the VM, then inside the VM:
   `journalctl -u frr-config-sync.service -u network-config-sync.service -u bootc-image-sync.service`
+  (or just look at the "Sync Services" section of the console dashboard -
+  see "Console Dashboard" above)
 - Both `frr-config-sync` and `network-config-sync` run on a 2min timer only
   (no inotify) and always re-apply, whether or not the ConfigMap actually
   changed - `vtysh -C`/`rsync`/`frr-reload.py`/`nmstatectl apply`/`nmcli`

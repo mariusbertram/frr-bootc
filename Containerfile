@@ -46,6 +46,7 @@ COPY files/etc/cloud/cloud.cfg.d/10-bootc.cfg /etc/cloud/cloud.cfg.d/10-bootc.cf
 COPY files/usr/local/bin/frr-config-sync /usr/local/bin/frr-config-sync
 COPY files/usr/local/bin/network-config-sync /usr/local/bin/network-config-sync
 COPY files/usr/local/bin/bootc-image-sync /usr/local/bin/bootc-image-sync
+COPY files/usr/local/bin/frr-console /usr/local/bin/frr-console
 
 COPY files/usr/lib/systemd/system/run-config-frr.mount /usr/lib/systemd/system/run-config-frr.mount
 COPY files/usr/lib/systemd/system/run-config-network.mount /usr/lib/systemd/system/run-config-network.mount
@@ -57,14 +58,26 @@ COPY files/usr/lib/systemd/system/network-config-sync.timer /usr/lib/systemd/sys
 COPY files/usr/lib/systemd/system/bootc-image-sync.service /usr/lib/systemd/system/bootc-image-sync.service
 COPY files/usr/lib/systemd/system/bootc-image-sync.path /usr/lib/systemd/system/bootc-image-sync.path
 COPY files/usr/lib/systemd/system/bootc-image-sync.timer /usr/lib/systemd/system/bootc-image-sync.timer
+COPY files/usr/lib/systemd/system/frr-console-tty1.service /usr/lib/systemd/system/frr-console-tty1.service
+COPY files/usr/lib/systemd/system/frr-console-ttyS0.service /usr/lib/systemd/system/frr-console-ttyS0.service
 
+# frr-console-tty1.service/frr-console-ttyS0.service (enabled below) take
+# over the console outright, Talos-Linux style - mask the getty units they
+# replace so nothing (not the generator that would otherwise recreate
+# serial-getty@ttyS0.service from the kernel's "console=ttyS0" argument,
+# not a manual `systemctl start`) can bring the plain login prompt back on
+# either tty. See the comment in each of those two unit files for the
+# full picture, including how a real shell is still reachable (the 'b'
+# key, via /bin/login).
 RUN chmod 0755 \
         /usr/local/bin/frr-config-sync \
         /usr/local/bin/network-config-sync \
         /usr/local/bin/bootc-image-sync \
+        /usr/local/bin/frr-console \
     && mkdir -p /run/config/frr /run/config/network /run/config/bootc \
     && chown -R frr:frr /etc/frr \
     && chmod -R u=rwX,g=rX,o= /etc/frr \
+    && systemctl mask getty@tty1.service serial-getty@ttyS0.service \
     && systemctl enable \
         frr.service \
         NetworkManager.service \
@@ -76,7 +89,9 @@ RUN chmod 0755 \
         network-config-sync.timer \
         bootc-image-sync.service \
         bootc-image-sync.path \
-        bootc-image-sync.timer
+        bootc-image-sync.timer \
+        frr-console-tty1.service \
+        frr-console-ttyS0.service
 
 # Images produced via bootc-image-builder from a container build can end up
 # with SELinux file contexts that don't match the target policy (an
