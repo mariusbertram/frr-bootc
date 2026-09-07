@@ -1,0 +1,182 @@
+#!/usr/bin/bash
+# Router status dashboard shown on interactive console logins (see
+# /etc/profile.d/91-frr-console.sh, which execs into this script instead of
+# just calling it - see the comment there for why). Works identically on a
+# serial console (virtctl console), a graphical/VNC console (virtctl vnc)
+# and plain SSH: all three just land in a normal login shell, and this
+# script only depends on being attached to an interactive tty, never on
+# which console it is - no ANSI beyond "clear"/"bold"/basic 8-color setaf,
+# which every terminal a login shell can realistically show up on supports.
+#
+# This exists because there is no dashboard/alerting for this VM (see the
+# comment at the top of frr-config-sync) - console access is the only way
+# in, so the console login itself should surface the same "is everything
+# actually working" information a human would otherwise have to piece
+# together by hand from several journalctl/vtysh/ip/systemctl calls.
+#
+# Keys: 'b' drops into a real interactive bash (FRR_CONSOLE_ACTIVE guards
+# /etc/profile.d/91-frr-console.sh against relaunching the dashboard for
+# that shell; exiting bash returns here). 'r' redraws immediately. 'q'
+# quits the dashboard - since profile.d execs into this script rather than
+# forking it, that ends the login session, same as 'exit' at a plain shell
+# prompt would.
+#
+# Run with stdin not a tty (piped, redirected, cron, etc.) it just prints
+# one plain-text snapshot and exits - useful for a quick manual check
+# without taking over the session.
+set -uo pipefail
+
+REFRESH_SECS=5
+
+interactive=0
+[ -t 0 ] && [ -t 1 ] && interactive=1
+
+use_color=0
+if [ "$interactive" = "1" ] && command -v tput >/dev/null 2>&1; then
+    ncolors=$(tput colors 2>/dev/null || echo 0)
+    [ "${ncolors:-0}" -ge 8 ] 2>/dev/null && use_color=1
+fi
+
+if [ "$use_color" = "1" ]; then
+    c_bold=$(tput bold); c_reset=$(tput sgr0)
+    c_green=$(tput setaf 2); c_red=$(tput setaf 1); c_yellow=$(tput setaf 3)
+else
+    c_bold=""; c_reset=""; c_green=""; c_red=""; c_yellow=""
+fi
+
+hr() { printf '%s\n' "--------------------------------------------------------------------------------"; }
+
+# $1: ok|warn|bad -> $2 wrapped in the matching color (or plain, if colors
+# aren't available/wanted).
+color() {
+    case "$1" in
+        ok)   printf '%s%s%s' "$c_green" "$2" "$c_reset" ;;
+        warn) printf '%s%s%s' "$c_yellow" "$2" "$c_reset" ;;
+        bad)  printf '%s%s%s' "$c_red" "$2" "$c_reset" ;;
+        *)    printf '%s' "$2" ;;
+    esac
+}
+
+heading() { printf '%s%s%s\n' "$c_bold" "$1" "$c_reset"; hr; }
+
+fmt_uptime() {
+    local secs days hours mins
+    secs=$(awk '{print int($1)}' /proc/uptime 2>/dev/null) || secs=0
+    days=$((secs / 86400)); hours=$((secs % 86400 / 3600)); mins=$((secs % 3600 / 60))
+    printf '%dd %dh %dm' "$days" "$hours" "$mins"
+}
+
+# One line per systemd unit pair (a periodic sync .service + the .timer
+# driving it): FAILED if the service's last run failed, warn if the timer
+# itself isn't active (so it'll never run again until that's fixed), ok
+# otherwise. This is the main "is this VM actually being kept in sync"
+# signal - frr-config-sync/network-config-sync/bootc-image-sync all fail
+# silently otherwise (journalctl only, no alerting).
+sync_health_line() {
+    local svc=$1 timer=$2 label=$3 svc_state timer_state
+    svc_state=$(systemctl is-failed "$svc" 2>/dev/null); svc_state=${svc_state:-unknown}
+    timer_state=$(systemctl is-active "$timer" 2>/dev/null); timer_state=${timer_state:-unknown}
+    if [ "$svc_state" = "failed" ]; then
+        printf '  %-24s %s  (see: journalctl -u %s)\n' "$label" "$(color bad "FAILED")" "$svc"
+    elif [ "$timer_state" != "active" ]; then
+        printf '  %-24s %s  (timer state: %s)\n' "$label" "$(color warn "timer not active")" "$timer_state"
+    else
+        printf '  %-24s %s\n' "$label" "$(color ok "ok")"
+    fi
+}
+
+render() {
+    local frr_state load cpus mem_line disk_line
+
+    heading "frr-bootc - $(hostname) - $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    printf '  Uptime: %s\n' "$(fmt_uptime)"
+    echo
+
+    heading "System"
+    load=$(awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null) || load="unknown"
+    cpus=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo "?")
+    mem_line=$(free -h 2>/dev/null | awk '/^Mem:/ {printf "%s used / %s total (%s available)", $3, $2, $7}')
+    disk_line=$(df -h / 2>/dev/null | awk 'NR==2 {printf "%s used / %s total (%s used)", $3, $2, $5}')
+    printf '  Load average (1/5/15m): %s   (%s CPUs)\n' "$load" "$cpus"
+    printf '  Memory: %s\n' "${mem_line:-unknown}"
+    printf '  Disk (/): %s\n' "${disk_line:-unknown}"
+    echo
+
+    heading "Network Interfaces"
+    if command -v ip >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            local name state addrs
+            name=$(awk '{print $1}' <<<"$line")
+            [ "$name" = "lo" ] && continue
+            state=$(awk '{print $2}' <<<"$line")
+            addrs=$(awk '{$1="";$2="";sub(/^  */,"");print}' <<<"$line")
+            if [ "$state" = "UP" ]; then
+                printf '  %-16s %-24s %s\n' "$name" "$(color ok "$state")" "$addrs"
+            else
+                printf '  %-16s %-24s %s\n' "$name" "$(color bad "$state")" "$addrs"
+            fi
+        done < <(ip -brief addr show 2>/dev/null)
+    else
+        echo "  ip: not available"
+    fi
+    echo
+
+    heading "FRR"
+    frr_state=$(systemctl is-active frr.service 2>/dev/null); frr_state=${frr_state:-unknown}
+    if [ "$frr_state" = "active" ]; then
+        printf '  frr.service: %s\n' "$(color ok "$frr_state")"
+    else
+        printf '  frr.service: %s\n' "$(color bad "$frr_state")"
+    fi
+    if [ "$frr_state" = "active" ] && command -v vtysh >/dev/null 2>&1; then
+        local daemons routes
+        daemons=$(vtysh -c 'show daemons' 2>/dev/null)
+        [ -n "$daemons" ] && printf '  Active daemons: %s\n' "$daemons"
+        routes=$(vtysh -c 'show ip route summary' 2>/dev/null | awk '/^Totals/ {print $2 " routes, " $NF " FIB"}')
+        [ -n "$routes" ] && printf '  IPv4 RIB: %s\n' "$routes"
+    fi
+    echo
+
+    heading "Sync Services"
+    sync_health_line frr-config-sync.service frr-config-sync.timer "FRR config sync"
+    sync_health_line network-config-sync.service network-config-sync.timer "Network config sync"
+    sync_health_line bootc-image-sync.service bootc-image-sync.timer "bootc image sync"
+    echo
+
+    if command -v bootc >/dev/null 2>&1; then
+        heading "System Image (bootc)"
+        bootc status 2>/dev/null | sed -n '1,8p' | sed 's/^/  /'
+        echo
+    fi
+}
+
+if [ "$interactive" != "1" ]; then
+    render
+    exit 0
+fi
+
+trap '' INT
+
+while true; do
+    clear
+    render
+    hr
+    printf 'Refreshing every %ss - [b] bash shell   [r] refresh now   [q] quit/logout\n' "$REFRESH_SECS"
+    key=""
+    read -rsn1 -t "$REFRESH_SECS" key || true
+    case "$key" in
+        b|B)
+            clear
+            echo "Starting bash. Type 'exit' to return to the dashboard."
+            echo
+            FRR_CONSOLE_ACTIVE=1 bash --login
+            ;;
+        q|Q)
+            clear
+            echo "Logging out."
+            exit 0
+            ;;
+        *)
+            ;;
+    esac
+done

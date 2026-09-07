@@ -46,6 +46,8 @@ COPY files/etc/cloud/cloud.cfg.d/10-bootc.cfg /etc/cloud/cloud.cfg.d/10-bootc.cf
 COPY files/usr/local/bin/frr-config-sync /usr/local/bin/frr-config-sync
 COPY files/usr/local/bin/network-config-sync /usr/local/bin/network-config-sync
 COPY files/usr/local/bin/bootc-image-sync /usr/local/bin/bootc-image-sync
+COPY files/usr/local/bin/frr-console /usr/local/bin/frr-console
+COPY files/etc/profile.d/91-frr-console.sh /etc/profile.d/91-frr-console.sh
 
 COPY files/usr/lib/systemd/system/run-config-frr.mount /usr/lib/systemd/system/run-config-frr.mount
 COPY files/usr/lib/systemd/system/run-config-network.mount /usr/lib/systemd/system/run-config-network.mount
@@ -62,6 +64,8 @@ RUN chmod 0755 \
         /usr/local/bin/frr-config-sync \
         /usr/local/bin/network-config-sync \
         /usr/local/bin/bootc-image-sync \
+        /usr/local/bin/frr-console \
+    && chmod 0644 /etc/profile.d/91-frr-console.sh \
     && mkdir -p /run/config/frr /run/config/network /run/config/bootc \
     && chown -R frr:frr /etc/frr \
     && chmod -R u=rwX,g=rX,o= /etc/frr \

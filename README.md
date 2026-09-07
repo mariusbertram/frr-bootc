@@ -483,10 +483,42 @@ Make configuration changes afterwards simply via `oc edit configmap/frr-config`
 or `oc edit configmap/network-config -n frr-bootc` - the sync services
 inside the VM take care of the rest.
 
+## Console Login Dashboard
+
+Since this VM has no external dashboard/alerting (see the comment at the
+top of `frr-config-sync`), console access is the only way in - so any
+interactive login (serial via `virtctl console`, graphical/VNC via
+`virtctl vnc`, or plain SSH) drops straight into a status dashboard
+(`/usr/local/bin/frr-console`, wired up via `/etc/profile.d/91-frr-console.sh`)
+instead of a plain shell prompt. It shows, and auto-refreshes every 5s:
+
+- uptime, load, memory, disk
+- network interfaces (`ip -brief addr`) with up/down state
+- `frr.service` state, active daemons, and the IPv4 RIB route count
+- health of the three sync services (`frr-config-sync`,
+  `network-config-sync`, `bootc-image-sync`) - FAILED if a unit's last run
+  failed, a warning if its timer isn't active, so a silently-broken sync
+  is visible right at login instead of only in `journalctl`
+- the current `bootc status` (booted/staged image)
+
+Keys: `b` drops into a real interactive `bash` (`exit` returns to the
+dashboard), `r` redraws immediately, `q` quits the dashboard - which ends
+the login session, the same as `exit` would at a plain shell prompt.
+
+This only depends on the session being an interactive tty, not on which
+console it is, so it behaves identically everywhere. It's skipped
+automatically for non-interactive sessions (`scp`/`rsync`/Ansible/CI over
+SSH never source `/etc/profile` in the first place). To disable it
+entirely (e.g. if it gets in the way of some automation), create
+`/etc/frr-console.disabled` in the VM - or just press `b` once and work
+from the resulting `bash` for the rest of that session.
+
 ## Troubleshooting
 
 - `oc logs`/console access to the VM, then inside the VM:
   `journalctl -u frr-config-sync.service -u network-config-sync.service -u bootc-image-sync.service`
+  (or just look at the "Sync Services" section of the console dashboard -
+  see "Console Login Dashboard" above)
 - Both `frr-config-sync` and `network-config-sync` run on a 2min timer only
   (no inotify) and always re-apply, whether or not the ConfigMap actually
   changed - `vtysh -C`/`rsync`/`frr-reload.py`/`nmstatectl apply`/`nmcli`
