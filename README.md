@@ -506,8 +506,15 @@ consoles KubeVirt exposes directly.
 The dashboard auto-refreshes every 5s, showing:
 
 - uptime, load, memory, disk
-- network interfaces (`ip -brief addr`) with up/down state
+- network interfaces (`ip -brief addr`) with up/down state and live
+  rx/tx throughput (a delta between two `/sys/class/net/*/statistics`
+  samples, so it needs one redraw to warm up - "throughput: -" the first
+  time an interface is seen)
 - `frr.service` state, active daemons, and the IPv4 RIB route count
+- established-vs-configured BGP peer counts **per VRF** (each tenant gets
+  its own VRF and its own BGP instance - see "VRF per Tenant" above - so
+  one tenant's session being down doesn't hide behind another's being
+  fine), when `bgpd` is running
 - health of the three sync services (`frr-config-sync`,
   `network-config-sync`, `bootc-image-sync`) - FAILED if a unit's last run
   failed, a warning if its timer isn't active, so a silently-broken sync
