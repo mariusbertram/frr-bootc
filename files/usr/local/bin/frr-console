@@ -1,29 +1,33 @@
 #!/usr/bin/bash
-# Router status dashboard shown on interactive console logins (see
-# /etc/profile.d/91-frr-console.sh, which execs into this script instead of
-# just calling it - see the comment there for why). Works identically on a
-# serial console (virtctl console), a graphical/VNC console (virtctl vnc)
-# and plain SSH: all three just land in a normal login shell, and this
-# script only depends on being attached to an interactive tty, never on
-# which console it is - no ANSI beyond "clear"/"bold"/basic 8-color setaf,
-# which every terminal a login shell can realistically show up on supports.
+# Router status dashboard - runs permanently on the console (Talos-Linux
+# style), not something a login lands in. It's launched directly as the
+# console handler by frr-console-tty1.service (graphical/VNC,
+# virtctl vnc) and frr-console-ttyS0.service (serial, virtctl console),
+# which replace getty@tty1.service/serial-getty@ttyS0.service outright
+# (masked in the Containerfile) - see the comment in each of those two
+# unit files for the full boot-time picture. No ANSI beyond
+# "clear"/"bold"/basic 8-color setaf, which every terminal either console
+# can realistically show up on supports.
 #
 # This exists because there is no dashboard/alerting for this VM (see the
 # comment at the top of frr-config-sync) - console access is the only way
-# in, so the console login itself should surface the same "is everything
-# actually working" information a human would otherwise have to piece
-# together by hand from several journalctl/vtysh/ip/systemctl calls.
+# in, so the console itself should always be showing the same "is
+# everything actually working" information a human would otherwise have
+# to piece together by hand from several journalctl/vtysh/ip/systemctl
+# calls.
 #
-# Keys: 'b' drops into a real interactive bash (FRR_CONSOLE_ACTIVE guards
-# /etc/profile.d/91-frr-console.sh against relaunching the dashboard for
-# that shell; exiting bash returns here). 'r' redraws immediately. 'q'
-# quits the dashboard - since profile.d execs into this script rather than
-# forking it, that ends the login session, same as 'exit' at a plain shell
-# prompt would.
+# Viewing the dashboard needs no authentication - whoever already has
+# console access to this VM is already a privileged operator. 'b' drops
+# into a real, authenticated shell by exec'ing /bin/login (a normal
+# "login:"/password prompt); when that shell eventually exits, so does
+# this process (login replaced it via exec), and the owning unit's
+# Restart=always relaunches the dashboard on the same tty - so the
+# console always lands back here. 'r' redraws immediately instead of
+# waiting out the refresh interval.
 #
-# Run with stdin not a tty (piped, redirected, cron, etc.) it just prints
-# one plain-text snapshot and exits - useful for a quick manual check
-# without taking over the session.
+# Run with stdin not a tty (piped, redirected, manual invocation, etc.)
+# it just prints one plain-text snapshot and exits - useful for a quick
+# manual check without taking over a console.
 set -uo pipefail
 
 REFRESH_SECS=5
@@ -161,20 +165,24 @@ while true; do
     clear
     render
     hr
-    printf 'Refreshing every %ss - [b] bash shell   [r] refresh now   [q] quit/logout\n' "$REFRESH_SECS"
+    printf 'Refreshing every %ss - [b] log in for a shell   [r] refresh now\n' "$REFRESH_SECS"
     key=""
     read -rsn1 -t "$REFRESH_SECS" key || true
     case "$key" in
         b|B)
             clear
-            echo "Starting bash. Type 'exit' to return to the dashboard."
-            echo
-            FRR_CONSOLE_ACTIVE=1 bash --login
-            ;;
-        q|Q)
-            clear
-            echo "Logging out."
-            exit 0
+            if [ -x /bin/login ]; then
+                # exec, not a subshell call: this process (the main PID
+                # of frr-console-tty1.service/frr-console-ttyS0.service)
+                # IS login now. Once the shell login starts eventually
+                # exits, login exits too, systemd sees the unit exit, and
+                # Restart=always brings the dashboard straight back on
+                # this same tty.
+                exec /bin/login
+            else
+                echo "/bin/login not found - cannot open a shell."
+                sleep 2
+            fi
             ;;
         *)
             ;;

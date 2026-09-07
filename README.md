@@ -483,14 +483,27 @@ Make configuration changes afterwards simply via `oc edit configmap/frr-config`
 or `oc edit configmap/network-config -n frr-bootc` - the sync services
 inside the VM take care of the rest.
 
-## Console Login Dashboard
+## Console Dashboard
 
-Since this VM has no external dashboard/alerting (see the comment at the
-top of `frr-config-sync`), console access is the only way in - so any
-interactive login (serial via `virtctl console`, graphical/VNC via
-`virtctl vnc`, or plain SSH) drops straight into a status dashboard
-(`/usr/local/bin/frr-console`, wired up via `/etc/profile.d/91-frr-console.sh`)
-instead of a plain shell prompt. It shows, and auto-refreshes every 5s:
+This VM has no external dashboard/alerting (see the comment at the top of
+`frr-config-sync`) - console access is the only way in. So rather than a
+plain login prompt, the VM's two consoles each run a persistent status
+dashboard (`/usr/local/bin/frr-console`), Talos-Linux style: it's there
+before, without, and regardless of anyone logging in, and it comes right
+back the moment they log back out.
+
+- `frr-console-tty1.service` - the graphical/VNC console (`virtctl vnc`)
+- `frr-console-ttyS0.service` - the serial console (`virtctl console`)
+
+Both replace `getty@tty1.service`/`serial-getty@ttyS0.service` outright -
+masked in the Containerfile so nothing (not the getty generator, not a
+manual `systemctl start`) can bring the plain login prompt back on either
+tty - rather than sitting in front of them. **SSH is unaffected**: SSH
+sessions use their own pty, never `/dev/tty1`/`/dev/ttyS0`, so they still
+land in a plain shell exactly as before; this only changes the two
+consoles KubeVirt exposes directly.
+
+The dashboard auto-refreshes every 5s, showing:
 
 - uptime, load, memory, disk
 - network interfaces (`ip -brief addr`) with up/down state
@@ -498,27 +511,37 @@ instead of a plain shell prompt. It shows, and auto-refreshes every 5s:
 - health of the three sync services (`frr-config-sync`,
   `network-config-sync`, `bootc-image-sync`) - FAILED if a unit's last run
   failed, a warning if its timer isn't active, so a silently-broken sync
-  is visible right at login instead of only in `journalctl`
+  is visible right on the console instead of only in `journalctl`
 - the current `bootc status` (booted/staged image)
 
-Keys: `b` drops into a real interactive `bash` (`exit` returns to the
-dashboard), `r` redraws immediately, `q` quits the dashboard - which ends
-the login session, the same as `exit` would at a plain shell prompt.
+Viewing it needs no authentication - whoever already has console access to
+the VM (via `virtctl`/`oc` RBAC) is already privileged enough that this
+isn't new exposure. `b` execs a real `/bin/login` (the normal
+"login:"/password prompt), so an actual shell is still gated on real
+credentials; `r` redraws immediately instead of waiting out the refresh
+interval. Exiting that shell ends the `login` process, which the owning
+unit's `Restart=always` immediately answers by relaunching the dashboard
+on the same tty - there's no separate "log out of the dashboard" step,
+the shell exiting *is* that step.
 
-This only depends on the session being an interactive tty, not on which
-console it is, so it behaves identically everywhere. It's skipped
-automatically for non-interactive sessions (`scp`/`rsync`/Ansible/CI over
-SSH never source `/etc/profile` in the first place). To disable it
-entirely (e.g. if it gets in the way of some automation), create
-`/etc/frr-console.disabled` in the VM - or just press `b` once and work
-from the resulting `bash` for the rest of that session.
+To get a plain login prompt back on a given tty instead (e.g. while
+debugging this mechanism itself), on the VM:
+
+```console
+$ systemctl disable --now frr-console-tty1.service
+$ systemctl unmask getty@tty1.service
+$ systemctl start getty@tty1.service
+```
+
+(swap in `frr-console-ttyS0.service`/`serial-getty@ttyS0.service` for the
+serial console).
 
 ## Troubleshooting
 
 - `oc logs`/console access to the VM, then inside the VM:
   `journalctl -u frr-config-sync.service -u network-config-sync.service -u bootc-image-sync.service`
   (or just look at the "Sync Services" section of the console dashboard -
-  see "Console Login Dashboard" above)
+  see "Console Dashboard" above)
 - Both `frr-config-sync` and `network-config-sync` run on a 2min timer only
   (no inotify) and always re-apply, whether or not the ConfigMap actually
   changed - `vtysh -C`/`rsync`/`frr-reload.py`/`nmstatectl apply`/`nmcli`

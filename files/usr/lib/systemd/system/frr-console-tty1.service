@@ -1,0 +1,44 @@
+[Unit]
+Description=FRR router status dashboard on tty1
+Documentation=https://github.com/mariusbertram/frr-bootc
+# Talos-Linux-style: this dashboard IS the console on tty1 (what
+# `virtctl vnc` shows), not something a login lands in - it runs
+# continuously from boot, replacing getty@tty1.service (masked in the
+# Containerfile) outright rather than running alongside/after it, so
+# there's no separate login prompt to get past just to see status.
+# Viewing it needs no authentication - whoever already has console access
+# to this VM (virtctl/oc RBAC) is already a privileged operator, so
+# nothing new is exposed - but the 'b' key in /usr/local/bin/frr-console
+# execs a real /bin/login, so getting an actual shell still goes through
+# normal credential checks. When that shell exits, /bin/login exits too
+# (it replaced this unit's main process via exec), systemd sees the unit
+# as exited and, via Restart=always below, immediately relaunches the
+# dashboard on tty1 - so the console always ends up back on the
+# dashboard, the same way exiting Talos's shell (were there one) would.
+# Mirrors the shape of the getty@.service it replaces (see
+# /usr/lib/systemd/system/getty@.service).
+Conflicts=getty@tty1.service
+After=systemd-user-sessions.service plymouth-quit-wait.service getty-pre.target
+After=rc-local.service
+Before=getty.target
+IgnoreOnIsolate=yes
+ConditionPathExists=/dev/tty0
+
+[Service]
+ExecStart=-/usr/local/bin/frr-console
+Type=idle
+Restart=always
+RestartSec=0
+UtmpIdentifier=tty1
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+KillMode=process
+IgnoreSIGPIPE=no
+SendSIGHUP=yes
+StandardInput=tty
+StandardOutput=tty
+
+[Install]
+WantedBy=getty.target

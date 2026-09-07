@@ -1,0 +1,47 @@
+[Unit]
+Description=FRR router status dashboard on ttyS0
+Documentation=https://github.com/mariusbertram/frr-bootc
+# Talos-Linux-style: this dashboard IS the console on ttyS0 (what
+# `virtctl console` attaches to), not something a login lands in - it
+# runs continuously from boot, replacing serial-getty@ttyS0.service
+# (masked in the Containerfile) outright rather than running
+# alongside/after it, so there's no separate login prompt to get past
+# just to see status. Viewing it needs no authentication - whoever
+# already has console access to this VM (virtctl/oc RBAC) is already a
+# privileged operator, so nothing new is exposed - but the 'b' key in
+# /usr/local/bin/frr-console execs a real /bin/login, so getting an
+# actual shell still goes through normal credential checks. When that
+# shell exits, /bin/login exits too (it replaced this unit's main process
+# via exec), systemd sees the unit as exited and, via Restart=always
+# below, immediately relaunches the dashboard on ttyS0 - so the console
+# always ends up back on the dashboard, the same way exiting Talos's
+# shell (were there one) would.
+# Mirrors the shape of the serial-getty@.service it replaces (see
+# /usr/lib/systemd/system/serial-getty@.service), including binding to
+# the device unit (not just ConditionPathExists) since - unlike tty1 -
+# ttyS0 is a real device node that can show up after this unit is
+# evaluated.
+BindsTo=dev-ttyS0.device
+Conflicts=serial-getty@ttyS0.service
+After=dev-ttyS0.device systemd-user-sessions.service plymouth-quit-wait.service getty-pre.target
+After=rc-local.service
+Before=getty.target
+IgnoreOnIsolate=yes
+
+[Service]
+ExecStart=-/usr/local/bin/frr-console
+Type=idle
+Restart=always
+RestartSec=0
+UtmpIdentifier=ttyS0
+TTYPath=/dev/ttyS0
+TTYReset=yes
+TTYVHangup=yes
+KillMode=process
+IgnoreSIGPIPE=no
+SendSIGHUP=yes
+StandardInput=tty
+StandardOutput=tty
+
+[Install]
+WantedBy=getty.target
