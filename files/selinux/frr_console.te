@@ -1,0 +1,39 @@
+policy_module(frr_console, 1.0)
+
+require {
+    type unconfined_service_t;
+    type login_exec_t;
+    type local_login_t;
+}
+
+# frr-console-tty1.service/frr-console-ttyS0.service exec frr-console
+# directly as the console handler, in agetty's traditional role - it runs
+# as unconfined_service_t, the domain any plain systemd service binary
+# gets, and execs /bin/login itself to hand off into a real, authenticated
+# shell when the operator presses 'b' (see console/src/main.rs's
+# exec_login). Only getty_t has a policy-provided transition into
+# local_login_t on exec'ing login_exec_t; without it, `login` just keeps
+# running as unconfined_service_t, and the *final* exec into the
+# operator's own shell is what SELinux denies instead - confirmed live
+# via an AVC on comm="login" path="/usr/bin/bash", scontext
+# unconfined_service_t, tclass process, denied "transition".
+#
+# The obvious-looking fix - labeling frr-console itself as getty_exec_t,
+# so it goes through the exact chain agetty does - was tried first and
+# reverted: that puts the *entire* frr-console process, not just the
+# brief moment of the 'b' handoff, into getty_t for its whole lifetime.
+# getty_t's policy is scoped for what agetty actually does (open a tty,
+# wait, exec login) - it has no allowance for what frr-console spends
+# almost all its time doing (spawning systemctl/ip/vtysh/bootc, reading
+# /proc, ...), so every one of those got denied instead, and the
+# dashboard silently went blank (confirmed live via AVCs denying
+# comm="frr-console" execute on systemctl/ip/bootc, all scontext
+# getty_t).
+#
+# domtrans_pattern grants only the one missing transition (plus the file
+# exec/read/entrypoint permissions needed to reach it) - frr-console's
+# own steady-state domain stays unconfined_service_t the entire time it's
+# just being a dashboard, unaffected by this; only the exec of
+# login_exec_t itself transitions into local_login_t, exactly like the
+# getty_t case does.
+domtrans_pattern(unconfined_service_t, login_exec_t, local_login_t)

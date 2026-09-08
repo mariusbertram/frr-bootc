@@ -42,7 +42,7 @@ mod ui;
 use std::io::{self, IsTerminal, Stdout};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{
@@ -54,8 +54,10 @@ use ratatui::Terminal;
 
 use net::ThroughputSampler;
 use snapshot::Snapshot;
+use ui::{AppState, Tab};
 
 const REFRESH_SECS: u64 = 5;
+const REFRESH: Duration = Duration::from_secs(REFRESH_SECS);
 
 fn main() {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
@@ -68,28 +70,66 @@ fn main() {
 
     let mut terminal = setup_terminal().expect("failed to set up terminal");
     let mut net = ThroughputSampler::new();
+    let mut state = AppState::default();
+
+    let mut snap = snapshot::gather(&mut net);
+    let mut last_refresh = Instant::now();
 
     loop {
-        let snap = snapshot::gather(&mut net);
         terminal
-            .draw(|frame| ui::render(frame, &snap, REFRESH_SECS))
+            .draw(|frame| ui::render(frame, &snap, &mut state, REFRESH_SECS))
             .expect("failed to draw frame");
 
+        // Redraws happen immediately on any key (switching tabs/scrolling
+        // shouldn't wait for the next data refresh), but the data itself
+        // still only refreshes on its own REFRESH_SECS cadence - this
+        // waits only as long as there's time left until that, not the
+        // full interval every time, so a key press right before a
+        // refresh was due doesn't delay it.
+        //
         // Ctrl-C arrives here as a plain KeyEvent (raw mode disables the
         // terminal driver's SIGINT translation), so it just falls through
         // the match below unhandled - same as the bash version's
         // `trap '' INT`, without needing to say so explicitly.
-        if event::poll(Duration::from_secs(REFRESH_SECS)).unwrap_or(false) {
+        let timeout = REFRESH.saturating_sub(last_refresh.elapsed());
+        if event::poll(timeout).unwrap_or(false) {
             if let Ok(Event::Key(key)) = event::read() {
-                if matches!(key.code, KeyCode::Char('b') | KeyCode::Char('B')) {
-                    restore_terminal(&mut terminal).ok();
-                    // exec_login only returns on failure - success
-                    // replaces this process entirely.
-                    eprintln!("/bin/login: {}", exec_login());
-                    std::thread::sleep(Duration::from_secs(2));
-                    terminal = setup_terminal().expect("failed to re-enter terminal");
+                match key.code {
+                    KeyCode::Char('b') | KeyCode::Char('B') => {
+                        restore_terminal(&mut terminal).ok();
+                        // exec_login only returns on failure - success
+                        // replaces this process entirely.
+                        eprintln!("/bin/login: {}", exec_login());
+                        std::thread::sleep(Duration::from_secs(2));
+                        terminal = setup_terminal().expect("failed to re-enter terminal");
+                    }
+                    // Number keys jump straight to a tab (btop's own way
+                    // of switching its boxes) - Tab/Shift+Tab and Left/
+                    // Right cycle, for anyone who'd rather not look down
+                    // at the number row. Scrolling is plain arrow keys/
+                    // PageUp/PageDown/Home/End throughout, the same as
+                    // htop's process list - no vi bindings, to keep this
+                    // one consistent, recognizable control scheme rather
+                    // than two overlapping ones.
+                    KeyCode::Char('1') => state.set_tab(Tab::Overview),
+                    KeyCode::Char('2') => state.set_tab(Tab::Interfaces),
+                    KeyCode::Char('3') => state.set_tab(Tab::Frr),
+                    KeyCode::Tab | KeyCode::Right => state.next_tab(),
+                    KeyCode::BackTab | KeyCode::Left => state.prev_tab(),
+                    KeyCode::Down => state.scroll_by(1),
+                    KeyCode::Up => state.scroll_by(-1),
+                    KeyCode::PageDown => state.scroll_by(10),
+                    KeyCode::PageUp => state.scroll_by(-10),
+                    KeyCode::Home => state.scroll_to_top(),
+                    KeyCode::End => state.scroll_to_bottom(),
+                    _ => {}
                 }
             }
+        }
+
+        if last_refresh.elapsed() >= REFRESH {
+            snap = snapshot::gather(&mut net);
+            last_refresh = Instant::now();
         }
     }
 }
