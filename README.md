@@ -27,12 +27,10 @@ documents how it's deployed at scale.
  /run/config/frr (ro)        /run/config/network (ro)
         │                            │
         ▼                            ▼
- frr-config-sync.timer       network-config-sync.timer
- (2min poll - the only       (2min poll - the only
-  trigger; see below)         trigger; see below)
-        │                            │
-        ▼                            ▼
  frr-config-sync.service     network-config-sync.service
+ (persistent daemon,         (persistent daemon,
+  polls internally, no        polls internally, no
+  .timer; see below)          .timer; see below)
    → /etc/frr/*                 → nmstate crate .apply() on *.yml/*.yaml
    → vty socket (validation)
    → frr-reload.py (live)
@@ -56,15 +54,21 @@ image). That's the way KubeVirt intends `ConfigMap`, `Secret` and
 `ServiceAccount` contents to be handed to a VM as plain files 1:1, without
 needing a cloud-init ISO or a reboot.
 
-Both sync services are triggered purely by a 2-minute `systemd` timer, not
-by an inotify `*.path` unit watching the mount for changes - an earlier
-version used both, but the `*.path` trigger proved unreliable in practice:
-virtiofs doesn't reliably propagate the host-side atomic symlink swap
-kubelet uses to update a mounted `ConfigMap` as an inotify event into the
-guest, so it would sometimes just never fire. A plain periodic poll is
-simpler and, empirically, more reliable - the cost is that a change can
-take up to ~2 minutes to land instead of being near-instant, which is a
-non-issue for planned changes like onboarding a new tenant.
+Both sync binaries are persistent daemons (`Type=simple`, `Restart=always`,
+started once at boot) that poll on their own internal ~2-minute interval
+(`config_sync::POLL_INTERVAL`) - not a `systemd` `.timer` re-spawning a
+oneshot, and not an inotify `*.path` unit watching the mount for changes
+either: an earlier version used a `.path` unit, but that trigger proved
+unreliable in practice - virtiofs doesn't reliably propagate the host-side
+atomic symlink swap kubelet uses to update a mounted `ConfigMap` as an
+inotify event into the guest, so it would sometimes just never fire. A
+plain periodic poll is simpler and, empirically, more reliable - the cost
+is that a change can take up to ~2 minutes to land instead of being
+near-instant, which is a non-issue for planned changes like onboarding a
+new tenant. A single failed sync attempt doesn't stop the daemon - it logs
+the error, writes it to a status file
+(`/run/{frr,network}-config-sync.status`) the console dashboard reads, and
+tries again next tick.
 
 ### Why Two Separate Sync Paths?
 
@@ -300,9 +304,9 @@ below):
    router-id` stays in IPv4 dotted-quad form either way - that's a BGP
    protocol requirement, not something IPv6-specific.
 
-Both changes are picked up live via `frr-config-sync.timer`/
-`network-config-sync.timer` (up to ~2min), same as any other tenant
-change - no VM restart either way.
+Both changes are picked up live by `frr-config-sync`/`network-config-sync`'s
+own internal poll (up to ~2min), same as any other tenant change - no VM
+restart either way.
 
 ## Adding Tenants Without a VM Restart
 
@@ -321,9 +325,10 @@ touches neither the `VirtualMachine` nor the `NetworkAttachmentDefinition`
 3. In `frr-config`'s `frr.conf`, add the matching
    `router bgp ... vrf ...` instance for the new tenant.
 
-`frr-config-sync.timer` and `network-config-sync.timer` pick up both
-changes automatically (up to ~2min) - the nmstate apply creates the new
-VLAN sub-interface without disturbing the existing interfaces or other
+`frr-config-sync` and `network-config-sync` pick up both changes
+automatically on their own next poll (up to ~2min) - the nmstate apply
+creates the new VLAN sub-interface without disturbing the existing
+interfaces or other
 tenants' running BGP sessions. At this scale, the ConfigMap contents are
 best generated (Helm/Kustomize/your own script) rather than hand-maintained;
 that changes nothing about the ConfigMaps' format itself.
@@ -341,8 +346,8 @@ KubeVirt doesn't hot-plug bridge interfaces.
 
 > Changes to already-existing interfaces (IP addresses, routing, new VLAN
 > sub-interfaces on the trunk), on the other hand, are picked up **without
-> a restart** via `network-config-sync.timer` (up to ~2min), live, through
-> `nmstate.yml`.
+> a restart** by `network-config-sync`'s own poll (up to ~2min), live,
+> through `nmstate.yml`.
 
 ## bootc Image Tracking
 
@@ -696,11 +701,16 @@ serial console).
   `journalctl -u frr-config-sync.service -u network-config-sync.service -u bootc-image-sync.service`
   (or just look at the "Sync Services" section of the console dashboard -
   see "Console Dashboard" above)
-- Both `frr-config-sync` and `network-config-sync` run on a 2min timer only
-  (no inotify) and always re-apply, whether or not the ConfigMap actually
-  changed - the FRR vty validation, `rsync`, `frr-reload.py`, and the
-  nmstate apply are all cheap and safe to re-run, so expect a change to
-  take up to ~2min to land, not immediately.
+- Both `frr-config-sync` and `network-config-sync` are persistent daemons
+  that poll internally on a ~2min interval only (no inotify, no `.timer`)
+  and always re-apply, whether or not the ConfigMap actually changed - the
+  FRR vty validation, `rsync`, `frr-reload.py`, and the nmstate apply are
+  all cheap and safe to re-run, so expect a change to take up to ~2min to
+  land, not immediately. `systemctl status frr-config-sync.service` shows
+  the daemon itself is running - whether its *last sync attempt* succeeded
+  is in `/run/frr-config-sync.status` (and the console dashboard's "Sync
+  Services" panel), not the service's own state, since a single failed
+  attempt no longer stops the process.
 - FRR validation failures are logged in full via
   `journalctl -u frr-config-sync.service` (passwords redacted).
 - `nmstatectl show` or `nmcli connection show` to check the current network

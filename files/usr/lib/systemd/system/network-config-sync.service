@@ -1,12 +1,14 @@
 [Unit]
-Description=Apply network configuration (nmstate/NetworkManager) from the mounted network-config ConfigMap
+Description=Apply network configuration (nmstate) from the mounted network-config ConfigMap
 RequiresMountsFor=/run/config/network
 Wants=NetworkManager.service
 After=NetworkManager.service
 
 [Service]
-Type=oneshot
+Type=simple
 ExecStart=/usr/local/bin/network-config-sync
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

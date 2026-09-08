@@ -3,20 +3,26 @@
 #
 # FRR and network configuration are not baked into the image; they are
 # mounted at runtime from Kubernetes ConfigMaps (via virtiofs) and kept in
-# sync by frr-config-sync.{service,timer} and
-# network-config-sync.{service,timer} - a periodic poll (every 2min) is
-# the ONLY trigger for both, deliberately not inotify (a "*.path" unit
-# watching the virtiofs mount): virtiofs doesn't reliably propagate the
-# host-side atomic symlink swap kubelet uses to update a mounted
-# ConfigMap as an inotify event into the guest, so relying on it left
-# both binaries triggering unreliably in practice. Both always re-apply
-# in full rather than trying to skip unchanged content - cheap and safe
-# to re-run every 2min, and unlike a skip, can't get stuck treating a
-# config change as "already applied" when it wasn't (see config-sync/src
-# for the full control flow). bootc-image-sync.{service,path,timer} still
-# uses the .path+.timer combo (much longer 30min interval, and switching
-# images is comparatively rare/heavyweight, so a missed inotify event
-# there is a smaller/rarer cost than for these two).
+# sync by frr-config-sync.service and network-config-sync.service - each
+# a persistent daemon (Type=simple, Restart=always, started once at boot)
+# that polls its ConfigMap on its own internal ~2min interval
+# (config_sync::POLL_INTERVAL), not a systemd .timer anymore. Still a
+# plain poll, deliberately not inotify (a "*.path" unit watching the
+# virtiofs mount): virtiofs doesn't reliably propagate the host-side
+# atomic symlink swap kubelet uses to update a mounted ConfigMap as an
+# inotify event into the guest, so relying on it left both triggering
+# unreliably in practice. Both always re-apply in full rather than trying
+# to skip unchanged content - cheap and safe to re-run every ~2min, and
+# unlike a skip, can't get stuck treating a config change as "already
+# applied" when it wasn't (see config-sync/src for the full control
+# flow). Each writes a one-line status file after every attempt
+# (/run/{frr,network}-config-sync.status) that the console dashboard
+# reads for "did the last sync succeed" - the daemon's own exit code no
+# longer means that, since a single failed attempt just logs and retries
+# next tick instead of exiting. bootc-image-sync.{service,path,timer}
+# still uses the oneshot+.path+.timer combo (much longer 30min interval,
+# and switching images is comparatively rare/heavyweight, so a missed
+# inotify event there is a smaller/rarer cost than for these two).
 # See README.md for the full architecture and deployment manifests.
 
 # BASE_IMAGE has to stay declared here, before ANY "FROM" - an ARG's value
@@ -100,9 +106,7 @@ COPY files/usr/lib/systemd/system/run-config-frr.mount /usr/lib/systemd/system/r
 COPY files/usr/lib/systemd/system/run-config-network.mount /usr/lib/systemd/system/run-config-network.mount
 COPY files/usr/lib/systemd/system/run-config-bootc.mount /usr/lib/systemd/system/run-config-bootc.mount
 COPY files/usr/lib/systemd/system/frr-config-sync.service /usr/lib/systemd/system/frr-config-sync.service
-COPY files/usr/lib/systemd/system/frr-config-sync.timer /usr/lib/systemd/system/frr-config-sync.timer
 COPY files/usr/lib/systemd/system/network-config-sync.service /usr/lib/systemd/system/network-config-sync.service
-COPY files/usr/lib/systemd/system/network-config-sync.timer /usr/lib/systemd/system/network-config-sync.timer
 COPY files/usr/lib/systemd/system/bootc-image-sync.service /usr/lib/systemd/system/bootc-image-sync.service
 COPY files/usr/lib/systemd/system/bootc-image-sync.path /usr/lib/systemd/system/bootc-image-sync.path
 COPY files/usr/lib/systemd/system/bootc-image-sync.timer /usr/lib/systemd/system/bootc-image-sync.timer
@@ -135,9 +139,7 @@ RUN chmod 0755 \
         cloud-init.target \
         qemu-guest-agent.service \
         frr-config-sync.service \
-        frr-config-sync.timer \
         network-config-sync.service \
-        network-config-sync.timer \
         bootc-image-sync.service \
         bootc-image-sync.path \
         bootc-image-sync.timer \
