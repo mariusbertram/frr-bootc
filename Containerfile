@@ -51,6 +51,7 @@ RUN dnf -y install \
         rsync \
         util-linux \
         policycoreutils \
+        policycoreutils-python-utils \
         audit \
         cloud-init \
         tcpdump \
@@ -120,6 +121,21 @@ RUN chmod 0755 \
         frr-console-reset-faillock.service \
         frr-console-tty1.service \
         frr-console-ttyS0.service
+
+# frr-console-tty1.service/frr-console-ttyS0.service exec frr-console
+# directly as the console handler, in the role /sbin/agetty normally has -
+# but without agetty's own getty_exec_t file context, systemd has no policy
+# rule to transition it (or anything it execs) out of the generic
+# unconfined_service_t every plain service gets, so the chain never reaches
+# local_login_t and the final exec into the operator's shell after 'b' gets
+# denied by SELinux ({ transition } from unconfined_service_t to
+# unconfined_t) regardless of how correctly that account's own shell field
+# is set - confirmed live via `journalctl`'s AVC denial on
+# comm="login" path="/usr/bin/bash". Labeling frr-console itself as
+# getty_exec_t puts it through the exact same already-correct transition
+# chain agetty uses (init_t -> getty_t -> local_login_t -> the user's own
+# context), rather than needing any new policy.
+RUN semanage fcontext -a -t getty_exec_t /usr/local/bin/frr-console
 
 # Images produced via bootc-image-builder from a container build can end up
 # with SELinux file contexts that don't match the target policy (an

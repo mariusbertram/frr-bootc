@@ -587,40 +587,42 @@ users:
     lock_passwd: false        # cloud-init locks the account otherwise,
                                # even with hashed_passwd set below
     hashed_passwd: $6$...
-    shell: /bin/bash          # see below - not reliable on its own
-runcmd:
-  - usermod -s /bin/bash admin   # see below - belt-and-suspenders for shell:
+    shell: /bin/bash
 ```
 
 `lock_passwd: false` is easy to miss and silently leaves the account
 locked despite a password being set - `passwd -S <user>` on the VM shows
 `P` (usable) vs `L` (locked) either way.
 
-`shell:` only takes effect the *first* time cloud-init creates that
-account - never again after that, even with the right value sitting right
-there in the user-data. cloud-init's `users:` module only calls `useradd`
-(where `--shell` gets applied) when the account doesn't exist yet; find it
-already present in `/etc/passwd` and it skips straight to updating
-password/`lock_passwd`/SSH keys, leaving shell and every other
-useradd-only option untouched - so `/bin/login` still authenticates the
-password fine, then has nothing to exec into, and `b` drops the operator
-right back out with `login`'s own "no shell: Permission denied". `fedora`
-hits this on the very first boot, since fedora-bootc's own
-`/etc/cloud/cloud.cfg` defines it as cloud-init's `default_user` and
-creates it before this `#cloud-config`'s own `users:` list is even
-processed - but any account can end up in the same state on a later boot:
-redeploying a VM typically means a new VM object, not necessarily a fresh
-root disk, and if the disk (and its `/etc/passwd`) survives the redeploy,
-an account created by an earlier boot's user-data already "exists" by the
-time this boot's `shell:` gets processed, no matter what it now says.
-`getent passwd <user>` on the VM shows the account's actual shell field if
-this needs confirming.
+A correctly-set `shell:` on a freshly-created account can *still* end in
+`login`'s "no shell: Permission denied" after a correct password -
+`getent passwd <user>` shows a perfectly good `/bin/bash` and even
+forcing it again via `runcmd: usermod -s /bin/bash <user>` changes
+nothing. That symptom isn't the passwd entry at all: it's SELinux denying
+the final `execve()` into the shell, confirmed live via
+`journalctl`'s AVC record:
 
-The `runcmd:` line above is the reliable fix, independent of username and
-of whether a given redeploy happens to reuse the disk: it runs
-unconditionally, regardless of which path cloud-init's own user-creation
-code took - a no-op on an account that's genuinely new (`shell:` already
-got it right), the actual fix on one that already existed.
+```
+AVC avc:  denied  { transition } for  pid=... comm="login" path="/usr/bin/bash"
+    scontext=system_u:system_r:unconfined_service_t:s0
+    tcontext=unconfined_u:unconfined_r:unconfined_t:s0 tclass=process
+```
+
+`frr-console-tty1.service`/`frr-console-ttyS0.service` exec `frr-console`
+directly in the role `/sbin/agetty` normally has - but without agetty's
+own `getty_exec_t` file context, there's no policy rule to transition it
+(or anything it execs) out of the generic `unconfined_service_t` every
+plain service gets. That breaks the whole chain SELinux otherwise handles
+for a normal console login (`init_t` → `getty_t` on exec'ing agetty →
+`local_login_t` on exec'ing `/bin/login` → the operator's own context on
+exec'ing their shell): `login` keeps running as `unconfined_service_t`,
+and the final transition into the shell's context is exactly what gets
+denied - independent of what the account's password, `lock_passwd`, or
+`shell:` say, which is why none of those ever touched this. Labeling
+`frr-console` itself as `getty_exec_t` (in the `Containerfile`) puts it
+through that same already-correct chain instead of needing any new
+policy, and is the actual fix - nothing to add on the cloud-init side for
+this one.
 
 Even with that right, a real password can still get rejected: typing it
 wrong a couple of times trips `pam_faillock`'s default lockout (3
