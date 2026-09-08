@@ -543,6 +543,17 @@ unit's `Restart=always` immediately answers by relaunching the dashboard
 on the same tty - there's no separate "log out of the dashboard" step,
 the shell exiting *is* that step.
 
+**`/bin/login` needs an actual password - an SSH-key-only account can't use
+it.** If the only account provisioned is the usual cloud-init
+default (e.g. `fedora`, key-only via `cloudInitNoCloud`), its password is
+locked, so every attempt at `b` fails with "Permission denied" and drops
+back to the dashboard, on both consoles, regardless of credentials typed -
+that's expected, not a bug in the dashboard: SSH keys authenticate the SSH
+protocol, not a local console prompt, and there's no way to bridge the
+two. Set an actual password for at least one account before relying on
+`b` - either via cloud-init's `chpasswd`/`password` user-data fields, or
+by running `sudo passwd <user>` once over SSH.
+
 To get a plain login prompt back on a given tty instead (e.g. while
 debugging this mechanism itself), on the VM:
 
