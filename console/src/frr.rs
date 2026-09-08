@@ -95,16 +95,21 @@ fn parse_bgp_vrf_summary(out: &str) -> Vec<(String, u32, u32)> {
             continue;
         }
 
-        if fields[0] == "VRF" {
+        // A VRF section boundary. This has to scan for a "VRF" token
+        // anywhere in the line rather than assuming it's fields[0]: real
+        // FRR (unlike the older "VRF <name> (VRF id N):" header this
+        // used to assume) reports it mid-line instead, e.g. "BGP router
+        // identifier ..., local AS number ... VRF vrf-bdbos vrf-id 3" -
+        // every VRF including the default one, so there's no separate
+        // "Default"-prefixed line to special-case either. Assuming
+        // fields[0] here silently left every VRF's peers folded into
+        // "default" (never finding a section boundary at all) - the
+        // exact bug this scan fixes.
+        if let Some(pos) = fields.iter().position(|f| *f == "VRF") {
             vrf = fields
-                .get(1)
+                .get(pos + 1)
                 .map(|s| s.split('(').next().unwrap_or(s).to_string())
                 .unwrap_or_else(|| "default".to_string());
-            state_col = None;
-            continue;
-        }
-        if fields[0] == "Default" {
-            vrf = "default".to_string();
             state_col = None;
             continue;
         }
@@ -217,5 +222,70 @@ Total number of neighbors 2
     #[test]
     fn bgp_vrf_summary_empty_when_no_daemons_output() {
         assert!(parse_bgp_vrf_summary("").is_empty());
+    }
+
+    // Real FRR (confirmed live, not the fabricated "VRF <name> (VRF id
+    // N):" header format the other tests use) never puts "VRF" as
+    // fields[0] at all - it's embedded mid-line in the "BGP router
+    // identifier" line, for the default VRF too, and each VRF appears
+    // once per AFI (IPv4 and IPv6 each get their own header+neighbor
+    // table). Assuming fields[0] == "VRF" never found a section
+    // boundary here, so every peer - across both VRFs and both AFIs -
+    // silently landed under "default" instead of vrf-bdbos getting its
+    // own entry.
+    #[test]
+    fn bgp_vrf_summary_finds_vrf_name_embedded_mid_line() {
+        let out = "\
+IPv4 Unicast Summary:
+BGP router identifier 25.120.26.244, local AS number 65060 VRF default vrf-id 0
+BGP table version 1
+Peers 8, using 240 KiB of memory
+
+Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt Desc
+*25.120.26.142  4 4200113170        10        10        1    0    0 00:06:32            0        0 N/A
+*25.120.26.161  4 4200113170        10        10        1    0    0 00:06:32            0        0 N/A
+
+Total number of neighbors 2
+* - dynamic neighbor
+2 dynamic neighbor(s), limit 100
+
+IPv6 Unicast Summary:
+BGP router identifier 25.120.26.244, local AS number 65060 VRF default vrf-id 0
+BGP table version 0
+Peers 8, using 240 KiB of memory
+
+Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt Desc
+*25.120.26.142  4 4200113170        10        10        0    0    0 00:06:32            0        0 N/A
+*25.120.26.161  4 4200113170        10        10        0    0    0 00:06:32            0        0 N/A
+
+Total number of neighbors 2
+
+IPv4 Unicast Summary:
+BGP router identifier 28.172.192.183, local AS number 4200113182 VRF vrf-bdbos vrf-id 3
+BGP table version 20
+Peers 2, using 60 KiB of memory
+
+Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt Desc
+28.172.192.177  4      65002        27        22       20    0    0 00:00:23            1        0 N/A
+
+Total number of neighbors 1
+
+IPv6 Unicast Summary:
+BGP router identifier 28.172.192.183, local AS number 4200113182 VRF vrf-bdbos vrf-id 3
+BGP table version 5
+Peers 2, using 60 KiB of memory
+
+Neighbor               V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt Desc
+2a02:110d:9020:1055::1 4      65002        18        13        5    0    0 00:00:23            1        0 N/A
+
+Total number of neighbors 1
+";
+        assert_eq!(
+            parse_bgp_vrf_summary(out),
+            vec![
+                ("default".to_string(), 4, 4),
+                ("vrf-bdbos".to_string(), 2, 2),
+            ]
+        );
     }
 }
