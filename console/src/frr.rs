@@ -148,41 +148,42 @@ mod tests {
     }
 
     // Built from real `vtysh -c "show bgp vrf all summary json"` output
-    // captured on a live VM - two VRFs (default, vrf-bdbos), each with a
-    // dual-stack session per neighbor (so each neighbor appears under
-    // both ipv4Unicast and ipv6Unicast), trimmed to 2 neighbors for
-    // default and 1 for vrf-bdbos. This is exactly the case the old
-    // text-table parser got wrong: it never found vrf-bdbos as a
-    // separate section and folded its peers into "default" instead (see
-    // this file's own git history) - the JSON schema removes the whole
-    // class of "does this FRR version's header line match what the
-    // parser assumed" bug that came from.
+    // captured on a live VM (addresses/VRF name genericized here) - two
+    // VRFs (default, vrf-tenant1), each with a dual-stack session per
+    // neighbor (so each neighbor appears under both ipv4Unicast and
+    // ipv6Unicast), trimmed to 2 neighbors for default and 1 for
+    // vrf-tenant1. This is exactly the case the old text-table parser
+    // got wrong: it never found vrf-tenant1 as a separate section and
+    // folded its peers into "default" instead (see this file's own git
+    // history) - the JSON schema removes the whole class of "does this
+    // FRR version's header line match what the parser assumed" bug that
+    // came from.
     #[test]
     fn bgp_vrf_summary_sums_established_peers_per_vrf_across_afis() {
         let json = r#"{
             "default": {
                 "ipv4Unicast": {
                     "peers": {
-                        "25.120.26.142": {"state": "Established"},
-                        "25.120.26.161": {"state": "Established"}
+                        "192.0.2.10": {"state": "Established"},
+                        "192.0.2.11": {"state": "Established"}
                     }
                 },
                 "ipv6Unicast": {
                     "peers": {
-                        "25.120.26.142": {"state": "Established"},
-                        "25.120.26.161": {"state": "Established"}
+                        "192.0.2.10": {"state": "Established"},
+                        "192.0.2.11": {"state": "Established"}
                     }
                 }
             },
-            "vrf-bdbos": {
+            "vrf-tenant1": {
                 "ipv4Unicast": {
                     "peers": {
-                        "28.172.192.177": {"state": "Established"}
+                        "198.51.100.10": {"state": "Established"}
                     }
                 },
                 "ipv6Unicast": {
                     "peers": {
-                        "2a02:110d:9020:1055::1": {"state": "Idle"}
+                        "2001:db8::1": {"state": "Idle"}
                     }
                 }
             }
@@ -191,7 +192,7 @@ mod tests {
             parse_bgp_vrf_summary(json),
             vec![
                 ("default".to_string(), 4, 4),
-                ("vrf-bdbos".to_string(), 1, 2),
+                ("vrf-tenant1".to_string(), 1, 2),
             ]
         );
     }
