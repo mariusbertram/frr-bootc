@@ -1,0 +1,15 @@
+[Unit]
+Description=Reset pam_faillock tallies for all interactive-shell accounts
+Documentation=https://github.com/mariusbertram/frr-bootc
+# Ordered before the console units so a stale lockout from a previous
+# boot can never affect the very first login attempt on this one - see
+# frr-console-reset-faillock's own comment for the full reasoning.
+Before=frr-console-tty1.service frr-console-ttyS0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/frr-console-reset-faillock
+
+[Install]
+WantedBy=multi-user.target

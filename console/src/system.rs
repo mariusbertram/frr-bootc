@@ -136,18 +136,6 @@ pub fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
-const INITIAL_PASSWORD_FILE: &str = "/etc/frr-console-initial-password";
-
-/// The root password frr-console-init-password.service generated at boot,
-/// if that file is still there - it stays root-only-readable and is
-/// simply removed by whoever reads it off the dashboard once, so its mere
-/// presence is exactly "has anyone acknowledged this yet".
-pub fn initial_root_password() -> Option<String> {
-    let content = fs::read_to_string(INITIAL_PASSWORD_FILE).ok()?;
-    let trimmed = content.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
 pub fn now_local() -> String {
     std::process::Command::new("date")
         .arg("+%Y-%m-%d %H:%M:%S %Z")
