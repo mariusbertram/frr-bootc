@@ -558,7 +558,14 @@ fields, and never regenerates one on a later plain reboot), generates a
 random one and sets it. The dashboard shows it in a banner at the very
 top for as long as `/etc/frr-console-initial-password` (root-only
 readable) exists - `rm` it once you've noted the password down or changed
-it with `passwd`, to stop the banner.
+it with `passwd`, to stop the banner. The same service also
+unconditionally resets `pam_faillock`'s tally for root on every boot -
+mistyping a freshly generated password (or one set via cloud-init) a
+couple of times trips Fedora's default lockout (3 attempts/10min)
+regardless of the password being correct on a later attempt; if `b`
+still refuses a password you're sure is right, `sudo faillock --user
+root --reset` (or `faillock --user <user> --reset` for a different
+account) clears it immediately without waiting it out or rebooting.
 
 To get a plain login prompt back on a given tty instead (e.g. while
 debugging this mechanism itself), on the VM:
