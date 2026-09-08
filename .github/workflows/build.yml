@@ -13,11 +13,12 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # Fast feedback on the frr-console (console dashboard) Rust crate, ahead
-  # of and independent from the full container build below: `cargo build`
-  # inside the Containerfile's console-builder stage only proves it
-  # compiles, not that it's linted or its tests pass, and waiting on a full
-  # image build just to see a clippy warning is a bad loop.
+  # Fast feedback on this repo's Rust crates, ahead of and independent
+  # from the full container build below: `cargo build` inside the
+  # Containerfile's builder stages only proves each crate compiles, not
+  # that it's linted or its tests pass, and waiting on a full image build
+  # just to see a clippy warning is a bad loop. One job per crate (not a
+  # matrix) so each keeps its own stable check name.
   console-check:
     runs-on: ubuntu-latest
     defaults:
@@ -36,6 +37,67 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: console
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+  # frr-vty is a path dependency of both config-sync and console (see its
+  # own Cargo.toml comments) - checked out out here.
+  frr-vty-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frr-vty
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry/build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frr-vty
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+  config-sync-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: config-sync
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry/build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: config-sync
 
       - name: cargo fmt --check
         run: cargo fmt --check

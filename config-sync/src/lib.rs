@@ -54,12 +54,27 @@ fn run_one_and_report(
             format!("error: {}\n", e.to_string().replace('\n', "; "))
         }
     };
-    if let Err(e) = fs::write(status_path, status) {
+    if let Err(e) = write_status_atomically(status_path, &status) {
         log.err(format!(
             "failed to write status file {}: {e}",
             status_path.display()
         ));
     }
+}
+
+/// Writes `status` to `status_path` via write-to-temp-file-then-rename,
+/// rather than a direct `fs::write` (which truncates in place) - the
+/// console dashboard polls this file every 1-2s, and a direct write
+/// leaves a brief window where it's zero bytes, which `read_recent_ok`
+/// would read as a failed sync and flash the dashboard red for a frame.
+/// `rename(2)` within the same directory is atomic, so readers only ever
+/// see the old content or the new content, never a half-written state.
+fn write_status_atomically(status_path: &Path, status: &str) -> io::Result<()> {
+    let mut tmp_path = status_path.as_os_str().to_os_string();
+    tmp_path.push(".tmp");
+    let tmp_path = Path::new(&tmp_path);
+    fs::write(tmp_path, status)?;
+    fs::rename(tmp_path, status_path)
 }
 
 /// Abstracts subprocess execution so the parts of config-sync that still
@@ -154,11 +169,16 @@ pub(crate) fn is_empty_source(path: &Path) -> bool {
 }
 
 /// Sorted file names directly inside `path`, for the "files: a b c"
-/// startup log line both scripts print.
+/// startup log line both scripts print - excludes hidden entries
+/// (Kubernetes ConfigMap mounts include a `..data`/`..<timestamp>`
+/// indirection alongside the visible convenience symlinks, see
+/// `frr::copy_dir_contents`'s doc comment; listing those in the "files:"
+/// log line would just be noise, not anything actually being synced).
 pub(crate) fn list_names(path: &Path) -> io::Result<Vec<String>> {
     let mut names: Vec<String> = fs::read_dir(path)?
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.'))
         .collect();
     names.sort();
     Ok(names)

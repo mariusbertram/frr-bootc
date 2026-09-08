@@ -3,30 +3,19 @@ use std::io;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use frr_vty::VtyClient;
 
 use crate::{is_empty_source, list_names, redact_passwords, Logger, Runner};
 
-/// mgmtd's vty socket - frr-bootc runs with `mgmtd=yes` and `service
-/// integrated-vtysh-config`, so mgmtd owns the whole integrated
-/// frr.conf, not a per-daemon split config.
-const MGMTD_SOCKET: &str = "/var/run/frr/mgmtd.vty";
 const FRR_RELOAD: &str = "/usr/libexec/frr/frr-reload.py";
 
 /// Syncs FRR configuration from `src` (the mounted ConfigMap) into `dst`
 /// (`/etc/frr`), then reloads or restarts FRR as needed. A faithful port
 /// of the former `frr-config-sync` bash script's control flow.
 pub fn sync(src: &Path, dst: &Path, runner: &impl Runner, log: &Logger) -> Result<()> {
-    sync_inner(src, dst, Path::new(MGMTD_SOCKET), runner, log)
+    sync_inner(src, dst, runner, log)
 }
 
-fn sync_inner(
-    src: &Path,
-    dst: &Path,
-    socket_path: &Path,
-    runner: &impl Runner,
-    log: &Logger,
-) -> Result<()> {
+fn sync_inner(src: &Path, dst: &Path, runner: &impl Runner, log: &Logger) -> Result<()> {
     if is_empty_source(src) {
         log.log(format!(
             "{} is empty or not mounted, nothing to sync",
@@ -59,10 +48,10 @@ fn sync_inner(
 
     let staged_conf = stage.path().join("frr.conf");
     if staged_conf.is_file() {
-        log.log("validating staged frr.conf (vty socket, mgmtd -C style check)");
-        if let Err(e) = validate(&staged_conf, socket_path) {
+        log.log("validating staged frr.conf (vtysh -f <staged> -C)");
+        if let Err(e) = validate(&staged_conf, runner) {
             log.err("staged frr.conf failed validation, keeping the currently running config unchanged.");
-            log.err("validation output:");
+            log.err("full 'vtysh -C' output:");
             log.err_block(&redact_passwords(&e.to_string()));
             bail!("frr.conf validation failed");
         }
@@ -102,65 +91,35 @@ fn sync_inner(
     Ok(())
 }
 
-/// Validates a staged `frr.conf` over mgmtd's vty socket, replacing
-/// `vtysh -f <file> -C`. Enters config mode, feeds every line, and
-/// always issues `abort` afterward so nothing is committed to the
-/// running configuration regardless of outcome - that `abort` is what
-/// makes this a validation rather than a live apply.
+/// Validates a staged `frr.conf` via `vtysh -f <file> -C` (dry-run: check
+/// syntax only, apply nothing).
 ///
-/// NOTE: this replicates vtysh's "-C, check syntax only, don't commit"
-/// behavior on a best-effort basis, reasoned from mgmtd's candidate/
-/// running datastore split. The exact wire-level semantics have not been
-/// verified against a real running FRR/mgmtd instance yet (no FRR
-/// available in this sandbox) - treat this as needing live-VM
-/// confirmation before being fully trusted, same as any change that
-/// can't be exercised locally.
-fn validate(conf_path: &Path, socket_path: &Path) -> Result<()> {
-    let content = fs::read_to_string(conf_path)
-        .with_context(|| format!("failed to read {}", conf_path.display()))?;
-
-    let mut client = VtyClient::connect(socket_path)
-        .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
-
-    let enable = client.execute("enable").context("vty: enable")?;
-    if !enable.success() {
-        bail!("vty: enable failed: {}", enable.output);
+/// An earlier version of this function validated directly over a vty
+/// Unix socket instead (`configure terminal`, feed every line, always
+/// `abort` at the end) to avoid the `vtysh` subprocess entirely. That
+/// was wrong and has been reverted: FRR's real candidate/commit/abort
+/// transactional datastore is exposed over mgmtd's separate protobuf
+/// "Frontend Interface" socket (`mgmtd_fe.sock`), not over a daemon's
+/// plain-text `.vty` socket - `mgmtd.vty` is the same kind of legacy,
+/// immediate-apply line CLI every other daemon exposes. Concretely, that
+/// meant: `configure terminal` over the vty socket applied each command
+/// *live* as it was typed (not into any undoable candidate), `abort` is
+/// not a real vty CLI command there (so it likely did nothing but
+/// silently fail), and a rejected line partway through left every
+/// command before it already applied to the running daemons - the
+/// opposite of validation. `vtysh -C` is FRR's own, actually offline,
+/// actually side-effect-free syntax checker.
+fn validate(conf_path: &Path, runner: &impl Runner) -> Result<()> {
+    let conf_str = conf_path.to_string_lossy().into_owned();
+    let out = runner
+        .run("vtysh", &["-f", &conf_str, "-C"])
+        .context("failed to spawn vtysh")?;
+    if out.status.success() {
+        return Ok(());
     }
-
-    let configure = client
-        .execute("configure terminal")
-        .context("vty: configure terminal")?;
-    if !configure.success() {
-        bail!("vty: configure terminal failed: {}", configure.output);
-    }
-
-    let mut failure: Option<String> = None;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('!') || trimmed.starts_with('#') {
-            continue;
-        }
-        match client.execute(line) {
-            Ok(resp) if resp.success() => {}
-            Ok(resp) => {
-                failure = Some(format!("line {line:?} rejected: {}", resp.output));
-                break;
-            }
-            Err(e) => {
-                failure = Some(format!("line {line:?}: vty error: {e}"));
-                break;
-            }
-        }
-    }
-
-    // Discard the candidate configuration unconditionally rather than
-    // committing it, whether or not validation failed.
-    let _ = client.execute("abort");
-
-    match failure {
-        Some(msg) => bail!(msg),
-        None => Ok(()),
-    }
+    let mut output = String::from_utf8_lossy(&out.stdout).into_owned();
+    output.push_str(&String::from_utf8_lossy(&out.stderr));
+    bail!(output)
 }
 
 fn chown_and_chmod(path: &Path, runner: &impl Runner) -> Result<()> {
@@ -248,16 +207,37 @@ fn files_equal(a: &Path, b: &Path) -> bool {
     matches!((fs::read(a), fs::read(b)), (Ok(a), Ok(b)) if a == b)
 }
 
+/// Kubernetes ConfigMap/Secret mounts use a hidden `..data ->
+/// ..<timestamp>/` symlink indirection for atomic updates (the same
+/// mechanism referenced in the Containerfile's top comment on why
+/// inotify doesn't work here) - every visible entry (`frr.conf`,
+/// `daemons`, ...) is itself a symlink through `..data`, not a regular
+/// file. `DirEntry::file_type()` is `lstat`-based and does not follow
+/// symlinks, so checking `.is_file()`/`.is_dir()` on it treats every one
+/// of those entries as neither, silently skipping all of them - which
+/// used to mean staging a directory with nothing in it at all, and then
+/// `rsync --delete`ing that empty staging directory over the real
+/// `/etc/frr`. `fs::metadata` (unlike `symlink_metadata`/`file_type()`)
+/// follows symlinks, so it resolves each convenience symlink to what it
+/// actually points at. Hidden entries (`..data`, the timestamped
+/// directory itself) are skipped outright rather than resolved, so only
+/// the convenience symlinks get copied - resolved to their real content
+/// - not the Kubernetes-internal machinery backing them.
 fn copy_dir_contents(src: &Path, dst: &Path) -> io::Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
-        let file_type = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-        if file_type.is_dir() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let meta = fs::metadata(&path)?;
+        let dst_path = dst.join(&name);
+        if meta.is_dir() {
             fs::create_dir_all(&dst_path)?;
-            copy_dir_contents(&entry.path(), &dst_path)?;
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), &dst_path)?;
+            copy_dir_contents(&path, &dst_path)?;
+        } else if meta.is_file() {
+            fs::copy(&path, &dst_path)?;
         }
     }
     Ok(())
@@ -267,10 +247,7 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    use std::io::Write as _;
-    use std::os::unix::net::{UnixListener, UnixStream};
     use std::process::{ExitStatus, Output};
-    use std::thread;
 
     struct FakeRunner {
         calls: RefCell<Vec<(String, Vec<String>)>>,
@@ -341,11 +318,10 @@ mod tests {
     fn empty_source_is_a_noop() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
-        let socket = tempfile::tempdir().unwrap().path().join("mgmtd.vty");
         let runner = FakeRunner::new();
         let log = Logger::new("test");
 
-        sync_inner(src.path(), dst.path(), &socket, &runner, &log).unwrap();
+        sync_inner(src.path(), dst.path(), &runner, &log).unwrap();
         assert!(runner.calls().is_empty());
     }
 
@@ -353,14 +329,13 @@ mod tests {
     fn daemons_diff_triggers_restart_not_reload() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
-        let socket = tempfile::tempdir().unwrap().path().join("mgmtd.vty");
         write_file(src.path(), "daemons", "bgpd=yes\n");
         write_file(dst.path(), "daemons", "bgpd=no\n");
 
         let runner = FakeRunner::new();
         let log = Logger::new("test");
 
-        sync_inner(src.path(), dst.path(), &socket, &runner, &log).unwrap();
+        sync_inner(src.path(), dst.path(), &runner, &log).unwrap();
 
         let calls = runner.calls();
         assert!(calls.contains(&"systemctl".to_string()));
@@ -371,7 +346,6 @@ mod tests {
     fn matching_daemons_triggers_reload_not_restart() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
-        let socket = tempfile::tempdir().unwrap().path().join("mgmtd.vty");
         write_file(src.path(), "daemons", "bgpd=yes\n");
         write_file(dst.path(), "daemons", "bgpd=yes\n");
         fs::write(dst.path().join("frr.conf"), "").unwrap();
@@ -379,7 +353,7 @@ mod tests {
         let runner = FakeRunner::new();
         let log = Logger::new("test");
 
-        sync_inner(src.path(), dst.path(), &socket, &runner, &log).unwrap();
+        sync_inner(src.path(), dst.path(), &runner, &log).unwrap();
 
         let calls = runner.calls();
         assert!(calls.contains(&FRR_RELOAD.to_string()));
@@ -390,13 +364,12 @@ mod tests {
     fn rsync_failure_aborts_before_any_reload_or_restart() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
-        let socket = tempfile::tempdir().unwrap().path().join("mgmtd.vty");
         write_file(src.path(), "daemons", "bgpd=yes\n");
 
         let runner = FakeRunner::new().on("rsync", fail_output(""));
         let log = Logger::new("test");
 
-        let result = sync_inner(src.path(), dst.path(), &socket, &runner, &log);
+        let result = sync_inner(src.path(), dst.path(), &runner, &log);
         assert!(result.is_err());
 
         let calls = runner.calls();
@@ -408,7 +381,6 @@ mod tests {
     fn reload_failure_falls_back_to_restart() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
-        let socket = tempfile::tempdir().unwrap().path().join("mgmtd.vty");
         write_file(src.path(), "daemons", "bgpd=yes\n");
         write_file(dst.path(), "daemons", "bgpd=yes\n");
 
@@ -417,7 +389,7 @@ mod tests {
             .on("systemctl", ok_output(""));
         let log = Logger::new("test");
 
-        sync_inner(src.path(), dst.path(), &socket, &runner, &log).unwrap();
+        sync_inner(src.path(), dst.path(), &runner, &log).unwrap();
 
         let calls = runner.calls();
         assert!(calls.contains(&FRR_RELOAD.to_string()));
@@ -428,92 +400,142 @@ mod tests {
     fn chown_failure_aborts_before_rsync() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
-        let socket = tempfile::tempdir().unwrap().path().join("mgmtd.vty");
         write_file(src.path(), "daemons", "bgpd=yes\n");
 
         let runner = FakeRunner::new().on("chown", fail_output(""));
         let log = Logger::new("test");
 
-        let result = sync_inner(src.path(), dst.path(), &socket, &runner, &log);
+        let result = sync_inner(src.path(), dst.path(), &runner, &log);
         assert!(result.is_err());
         assert!(!runner.calls().contains(&"rsync".to_string()));
     }
 
-    fn spawn_mgmtd_mock(socket_path: &Path, reject_line: Option<&'static str>) {
-        let listener = UnixListener::bind(socket_path).unwrap();
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            while let Some(cmd) = read_command(&mut stream) {
-                let ok = reject_line.map(|r| cmd != r).unwrap_or(true);
-                let status: u8 = if ok { 0 } else { 1 };
-                stream.write_all(&[0, 0, 0, status]).unwrap();
-            }
-        });
-    }
-
-    fn read_command(stream: &mut UnixStream) -> Option<String> {
-        use std::io::Read as _;
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 256];
-        loop {
-            let n = stream.read(&mut chunk).ok()?;
-            if n == 0 {
-                return None;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.last() == Some(&0) {
-                buf.pop();
-                return Some(String::from_utf8_lossy(&buf).into_owned());
-            }
-        }
-    }
-
     #[test]
-    fn validation_success_always_ends_with_abort() {
+    fn validation_calls_vtysh_dry_run_on_the_staged_file() {
         let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("mgmtd.vty");
-        spawn_mgmtd_mock(&socket_path, None);
-
         let conf = dir.path().join("frr.conf");
         fs::write(
             &conf,
-            "! comment\nrouter bgp 65001\n neighbor 10.0.0.1 remote-as 65002\n",
+            "router bgp 65001\n neighbor 10.0.0.1 remote-as 65002\n",
         )
         .unwrap();
+        let runner = FakeRunner::new().on("vtysh", ok_output(""));
 
-        validate(&conf, &socket_path).unwrap();
+        validate(&conf, &runner).unwrap();
+
+        let calls = runner.calls.borrow();
+        let (_, args) = calls.iter().find(|(cmd, _)| cmd == "vtysh").unwrap();
+        assert_eq!(
+            args,
+            &vec![
+                "-f".to_string(),
+                conf.to_string_lossy().into_owned(),
+                "-C".to_string()
+            ]
+        );
     }
 
     #[test]
-    fn validation_failure_reports_the_rejected_line_and_still_aborts() {
+    fn validation_failure_reports_vtysh_output() {
         let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("mgmtd.vty");
-        spawn_mgmtd_mock(&socket_path, Some("bogus line"));
-
         let conf = dir.path().join("frr.conf");
-        fs::write(&conf, "router bgp 65001\nbogus line\n").unwrap();
+        fs::write(&conf, "bogus line\n").unwrap();
+        let runner = FakeRunner::new().on("vtysh", fail_output("% Unknown command: bogus line\n"));
 
-        let err = validate(&conf, &socket_path).unwrap_err();
-        assert!(err.to_string().contains("bogus line"));
+        let err = validate(&conf, &runner).unwrap_err();
+        assert!(err.to_string().contains("Unknown command"));
     }
 
     #[test]
     fn validation_failure_blocks_rsync_in_full_sync() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
-        let socket_dir = tempfile::tempdir().unwrap();
-        let socket_path = socket_dir.path().join("mgmtd.vty");
-        spawn_mgmtd_mock(&socket_path, Some("bogus line"));
-
         write_file(src.path(), "daemons", "bgpd=yes\n");
         write_file(src.path(), "frr.conf", "bogus line\n");
+
+        let runner = FakeRunner::new().on("vtysh", fail_output("% Unknown command\n"));
+        let log = Logger::new("test");
+
+        let result = sync_inner(src.path(), dst.path(), &runner, &log);
+        assert!(result.is_err());
+        assert!(!runner.calls().contains(&"rsync".to_string()));
+        assert!(!dst.path().join("frr.conf").exists());
+    }
+
+    /// Kubernetes ConfigMap mounts don't put plain files directly in the
+    /// mount directory - each visible name is a symlink through a
+    /// hidden `..data -> ..<timestamp>/` indirection, e.g.:
+    ///   frr.conf -> ..data/frr.conf
+    ///   ..data -> ..2026_01_01_00_00_00.000000000
+    ///   ..2026_01_01_00_00_00.000000000/frr.conf   (the real file)
+    /// `copy_dir_contents` used to check `DirEntry::file_type()`
+    /// (lstat-based, doesn't follow symlinks), so it saw every one of
+    /// these entries as neither a file nor a directory and silently
+    /// staged nothing at all.
+    fn write_configmap_style(dir: &Path, files: &[(&str, &str)]) {
+        let timestamp_dir = dir.join("..2026_01_01_00_00_00.000000000");
+        fs::create_dir(&timestamp_dir).unwrap();
+        for (name, content) in files {
+            fs::write(timestamp_dir.join(name), content).unwrap();
+        }
+        std::os::unix::fs::symlink(timestamp_dir.file_name().unwrap(), dir.join("..data")).unwrap();
+        for (name, _) in files {
+            std::os::unix::fs::symlink(format!("..data/{name}"), dir.join(name)).unwrap();
+        }
+    }
+
+    #[test]
+    fn copy_dir_contents_follows_configmap_style_symlinks() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write_configmap_style(
+            src.path(),
+            &[
+                ("frr.conf", "router bgp 65001\n"),
+                ("daemons", "bgpd=yes\n"),
+            ],
+        );
+
+        copy_dir_contents(src.path(), dst.path()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dst.path().join("frr.conf")).unwrap(),
+            "router bgp 65001\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dst.path().join("daemons")).unwrap(),
+            "bgpd=yes\n"
+        );
+        // The hidden Kubernetes-internal indirection itself is not
+        // duplicated into the staging directory - only the resolved
+        // convenience symlinks are.
+        assert!(!dst.path().join("..data").exists());
+    }
+
+    #[test]
+    fn full_sync_validates_configmap_style_staged_frr_conf() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write_configmap_style(
+            src.path(),
+            &[
+                ("frr.conf", "router bgp 65001\n"),
+                ("daemons", "bgpd=yes\n"),
+            ],
+        );
+        write_file(dst.path(), "daemons", "bgpd=yes\n");
 
         let runner = FakeRunner::new();
         let log = Logger::new("test");
 
-        let result = sync_inner(src.path(), dst.path(), &socket_path, &runner, &log);
-        assert!(result.is_err());
-        assert!(!runner.calls().contains(&"rsync".to_string()));
-        assert!(!dst.path().join("frr.conf").exists());
+        // Before the copy_dir_contents fix, a ConfigMap-style symlinked
+        // frr.conf was silently skipped while staging: `frr.conf` never
+        // looked like a file to the old lstat-based check, so
+        // `staged_conf.is_file()` was false and validation never ran at
+        // all - vtysh would never have been invoked here, and rsync
+        // --delete would have run for real against an empty staging
+        // directory, wiping out the previously-synced /etc/frr.
+        sync_inner(src.path(), dst.path(), &runner, &log).unwrap();
+        assert!(runner.calls().contains(&"vtysh".to_string()));
     }
 }

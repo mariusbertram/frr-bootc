@@ -32,7 +32,7 @@ documents how it's deployed at scale.
   polls internally, no        polls internally, no
   .timer; see below)          .timer; see below)
    → /etc/frr/*                 → nmstate crate .apply() on *.yml/*.yaml
-   → vty socket (validation)
+   → vtysh -C (validation)
    → frr-reload.py (live)
    → on daemons change:
      systemctl restart frr
@@ -41,13 +41,22 @@ documents how it's deployed at scale.
 Both sync binaries are compiled from a single Rust crate,
 [`config-sync/`](config-sync/) (`frr-config-sync` and `network-config-sync`
 - see its own module docs for the full control flow). Everything that
-isn't nmstate/FRR configuration logic - staging, `rsync`, `chown`/`chmod`,
+isn't nmstate configuration logic - staging, FRR config validation
+(`vtysh -C`) and reload (`frr-reload.py`), `rsync`, `chown`/`chmod`,
 `systemctl restart frr.service` - is still just a subprocess call, same as
-the bash scripts this replaced; only the nmstate apply and the FRR
-validation step now go through a library directly instead of shelling out
-to `nmstatectl`/`vtysh`. FRR's own `frr-reload.py` is kept as a subprocess
-call too - it's a mature, actively-maintained diff engine, not something
-worth reimplementing.
+the bash scripts this replaced; only the network config apply goes
+through the `nmstate` crate directly instead of shelling out to
+`nmstatectl`. An earlier version of this also replaced `vtysh -C` with a
+direct vty-socket client, reasoning that mgmtd exposes a candidate/commit/
+abort datastore over its vty socket the same way vtysh's `-C` uses - that
+reasoning was wrong (FRR's actual transactional datastore is behind a
+*different*, protobuf-based socket; a daemon's plain `.vty` socket,
+mgmtd's included, is the same immediate-apply legacy CLI every daemon has
+always exposed) and has been reverted: `vtysh -C` is FRR's own actually
+side-effect-free, offline syntax checker, and is what's used again now.
+FRR's own `frr-reload.py` is kept as a subprocess call too - it's a
+mature, actively-maintained diff engine, not something worth
+reimplementing.
 
 Both config sources are mounted into the VM via **virtiofs** (not as a disk
 image). That's the way KubeVirt intends `ConfigMap`, `Secret` and
@@ -73,15 +82,17 @@ tries again next tick.
 ### Why Two Separate Sync Paths?
 
 - **FRR configuration** (`frr.conf`, `daemons`, `vtysh.conf`) is
-  re-synced on every change. `frr.conf` changes are validated over FRR's
-  `mgmtd` vty Unix socket (a direct client, [`frr-vty/`](frr-vty/) - the
-  same transport `vtysh` itself uses, replacing `vtysh -C`; also used by
-  the console dashboard for its own read-only FRR status queries) and
-  then applied live via `frr-reload.py` (no restart, no disruption of running
+  re-synced on every change. `frr.conf` changes are validated with
+  `vtysh -C` (a subprocess call, via `Runner` - FRR's own offline,
+  side-effect-free syntax checker) and then applied live via
+  `frr-reload.py` (no restart, no disruption of running
   sessions/adjacencies, as far as FRR allows for that). If `daemons`
   changes (e.g. `bgpd` gets enabled), restarting `frr.service` is
   unavoidable since that's what determines which daemon processes are
-  actually running.
+  actually running. [`frr-vty/`](frr-vty/) (a direct vty Unix-socket
+  client) is used elsewhere - by the console dashboard, for its own
+  read-only FRR status queries - but *not* for `frr.conf` validation; see
+  the note above on why that specific use was tried and reverted.
 - **Network configuration** (`nmstate.yml`) is applied by
   `network-config-sync.service`, which runs **after** `NetworkManager.service`
   since applying nmstate state requires a running NetworkManager. The VM's
@@ -201,15 +212,15 @@ VRFs, which is exactly the situation `net.vrf.strict_mode` hardens: it
 closes a kernel-level socket-to-VRF binding ambiguity that can otherwise
 arise in that case, as defense in depth alongside FRR's own `vrf`
 scoping above. It's declared in
-[`files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf`](files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf)
-for documentation/consistency with the other sysctl knobs there, but that
-static file alone doesn't reliably take effect - the sysctl node only
-exists once the `vrf` kernel module has loaded (on first VRF interface
-creation), normally *after* `systemd-sysctl.service` already ran at boot.
-`network-config-sync` re-applies the same value at runtime after every
-successful sync instead (best-effort - a `NotFound` write, meaning no VRF
-exists anywhere on the system yet, is expected and not logged as an
-error). Doesn't affect the route-leaking design above
+[`files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf`](files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf) -
+the sysctl node only exists once the `vrf` kernel module has loaded, so
+[`files/etc/modules-load.d/vrf.conf`](files/etc/modules-load.d/vrf.conf)
+loads it early at boot (before `systemd-sysctl.service` runs) so the
+static file actually takes effect from boot, before any VRF exists.
+`network-config-sync` also re-applies the same value at runtime after
+every successful sync, as a defensive fallback rather than the primary
+mechanism (best-effort - a `NotFound` write is expected and not logged
+as an error). Doesn't affect the route-leaking design above
 (`routes:`/`route-rules:`) - that's FIB/PBR based, a separate mechanism
 strict mode doesn't touch.
 
@@ -721,7 +732,7 @@ serial console).
 - Both `frr-config-sync` and `network-config-sync` are persistent daemons
   that poll internally on a ~2min interval only (no inotify, no `.timer`)
   and always re-apply, whether or not the ConfigMap actually changed - the
-  FRR vty validation, `rsync`, `frr-reload.py`, and the nmstate apply are
+  `vtysh -C` validation, `rsync`, `frr-reload.py`, and the nmstate apply are
   all cheap and safe to re-run, so expect a change to take up to ~2min to
   land, not immediately. `systemctl status frr-config-sync.service` shows
   the daemon itself is running - whether its *last sync attempt* succeeded

@@ -43,12 +43,13 @@ ARG BASE_IMAGE=quay.io/fedora/fedora-bootc:44
 # the final Fedora image's glibc, which sidesteps that question outright
 # instead of relying on this builder's glibc happening to be old enough.
 # frr-vty (see frr-vty/src/lib.rs) is a small, dependency-free crate
-# implementing FRR's vty Unix-socket protocol directly - shared as a
-# `path = "../frr-vty"` dependency between console (read-only status
-# queries) and config-sync (frr.conf validation), so neither pulls in
-# the other's unrelated dependencies. Both builder stages below need it
-# copied alongside their own crate, at the same relative path their
-# Cargo.toml's `../frr-vty` expects.
+# implementing FRR's vty Unix-socket protocol directly, used by console
+# for its own read-only FRR status queries - a `path = "../frr-vty"`
+# dependency, so it needs copying alongside console/ at the same
+# relative path its Cargo.toml expects. config-sync does NOT depend on
+# it (frr.conf validation goes through `vtysh -C` as a subprocess
+# instead - see config-sync/src/frr/mod.rs's `validate()` doc comment
+# for why a vty-socket approach was tried there and reverted).
 FROM docker.io/library/rust:1-alpine AS console-builder
 RUN apk add --no-cache musl-dev gcc
 WORKDIR /build
@@ -58,15 +59,13 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-musl
 
 # config-sync (frr-config-sync + network-config-sync - see config-sync/src,
 # and the "Configuration Sync" section of README.md) replaces what used to
-# be two plain bash scripts. It talks to nmstate and to FRR's mgmtd vty
-# socket directly via Rust libraries instead of shelling out to
-# nmstatectl/vtysh for that part - see config-sync/src/network.rs and
-# frr-vty/src/lib.rs. Same musl-static-build reasoning as console-builder
-# above.
+# be two plain bash scripts. It talks to nmstate directly via the
+# `nmstate` Rust crate instead of shelling out to nmstatectl - see
+# config-sync/src/network.rs. Same musl-static-build reasoning as
+# console-builder above.
 FROM docker.io/library/rust:1-alpine AS config-sync-builder
 RUN apk add --no-cache musl-dev gcc
 WORKDIR /build
-COPY frr-vty/ /frr-vty/
 COPY config-sync/ .
 RUN cargo build --release --locked --target x86_64-unknown-linux-musl
 
@@ -91,6 +90,7 @@ COPY files/etc/frr/vtysh.conf /etc/frr/vtysh.conf
 COPY files/etc/sysctl.d/71-frr-bootc-forwarding.conf /etc/sysctl.d/71-frr-bootc-forwarding.conf
 COPY files/etc/sysctl.d/72-frr-bootc-console-quiet.conf /etc/sysctl.d/72-frr-bootc-console-quiet.conf
 COPY files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf /etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf
+COPY files/etc/modules-load.d/vrf.conf /etc/modules-load.d/vrf.conf
 # fedora-bootc doesn't include cloud-init's own image-mode drop-in (unlike
 # quay.io/centos-bootc): growpart must target /sysroot, not /, since that's
 # where the real root filesystem is mounted in image mode. See

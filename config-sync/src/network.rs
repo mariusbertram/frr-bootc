@@ -8,11 +8,11 @@ use nmstate::NetworkState;
 use crate::{has_extension, is_empty_source, list_names, Logger};
 
 /// Mirrors `files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf`'s
-/// value - that static file alone can't reliably apply it (the sysctl
-/// node only exists once the `vrf` kernel module is loaded, which
-/// happens on first VRF interface creation, normally *after*
-/// systemd-sysctl.service already ran at boot), so it's re-applied here
-/// after every successful sync instead.
+/// value. `files/etc/modules-load.d/vrf.conf` loads the `vrf` kernel
+/// module at boot so that static file actually applies from boot - this
+/// is a defensive fallback re-applying the same value after every
+/// successful sync, in case that ever isn't the case (e.g. a kernel
+/// where `vrf` isn't a loadable module the same way).
 const VRF_STRICT_MODE_PATH: &str = "/proc/sys/net/vrf/strict_mode";
 
 /// Applies nmstate desired-state documents (`*.yml`/`*.yaml`) from `src`
@@ -80,12 +80,24 @@ fn apply_vrf_strict_mode(path: &Path, log: &Logger) {
     }
 }
 
+/// Kubernetes ConfigMap mounts present each file as a symlink through a
+/// hidden `..data -> ..<timestamp>/` indirection (see
+/// `frr::copy_dir_contents`'s doc comment for the full picture).
+/// `DirEntry::file_type()` is `lstat`-based and doesn't follow symlinks,
+/// so checking `.is_file()` on it treated every `*.yml`/`*.yaml`
+/// symlink as "not a file" and silently applied nothing at all - use
+/// `fs::metadata` (follows symlinks) instead, and skip hidden entries
+/// outright rather than trying to resolve them as state files.
 fn statefile_paths(src: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))? {
         let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let path = entry.path();
-        if entry.file_type()?.is_file() && has_extension(&path, &["yml", "yaml"]) {
+        if fs::metadata(&path).is_ok_and(|m| m.is_file()) && has_extension(&path, &["yml", "yaml"])
+        {
             paths.push(path);
         }
     }
@@ -118,6 +130,32 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["a.yml", "b.yaml"]);
+    }
+
+    /// Kubernetes ConfigMap mounts present `nmstate.yml` as a symlink
+    /// through a hidden `..data -> ..<timestamp>/` indirection, not as
+    /// a plain file directly in the mount directory - `DirEntry::
+    /// file_type()` (lstat-based) doesn't follow that, so it used to
+    /// see the symlink as "not a file" and applied nothing at all.
+    #[test]
+    fn statefile_paths_follows_configmap_style_symlinks() {
+        let src = tempfile::tempdir().unwrap();
+        let timestamp_dir = src.path().join("..2026_01_01_00_00_00.000000000");
+        fs::create_dir(&timestamp_dir).unwrap();
+        fs::write(timestamp_dir.join("nmstate.yml"), "interfaces: []\n").unwrap();
+        std::os::unix::fs::symlink(
+            timestamp_dir.file_name().unwrap(),
+            src.path().join("..data"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("..data/nmstate.yml", src.path().join("nmstate.yml")).unwrap();
+
+        let paths = statefile_paths(src.path()).unwrap();
+        let names: Vec<String> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["nmstate.yml"]);
     }
 
     #[test]

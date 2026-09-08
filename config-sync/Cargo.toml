@@ -18,7 +18,6 @@ path = "src/bin/network-config-sync.rs"
 
 [dependencies]
 anyhow = "1"
-frr-vty = { path = "../frr-vty" }
 libc = "0.2.189"
 nmstate = "2.2"
 tempfile = "3"

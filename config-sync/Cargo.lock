@@ -89,7 +89,6 @@ name = "config-sync"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "frr-vty",
  "libc",
  "nmstate",
  "tempfile",
@@ -181,10 +180,6 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
-
-[[package]]
-name = "frr-vty"
-version = "0.1.0"
 
 [[package]]
 name = "futures"
