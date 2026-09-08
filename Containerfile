@@ -60,6 +60,7 @@ COPY files/etc/frr/daemons /etc/frr/daemons
 COPY files/etc/frr/frr.conf /etc/frr/frr.conf
 COPY files/etc/frr/vtysh.conf /etc/frr/vtysh.conf
 COPY files/etc/sysctl.d/71-frr-bootc-forwarding.conf /etc/sysctl.d/71-frr-bootc-forwarding.conf
+COPY files/etc/sysctl.d/72-frr-bootc-console-quiet.conf /etc/sysctl.d/72-frr-bootc-console-quiet.conf
 # fedora-bootc doesn't include cloud-init's own image-mode drop-in (unlike
 # quay.io/centos-bootc): growpart must target /sysroot, not /, since that's
 # where the real root filesystem is mounted in image mode. See

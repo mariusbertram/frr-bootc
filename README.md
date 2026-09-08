@@ -513,6 +513,17 @@ into the middle of the drawn output, which happened for real with an
 earlier `systemctl is-active`/`is-failed` call that only checked the exit
 code but still let the printed status word through.
 
+Subprocess stdout isn't the only source of stray text on the console,
+though: the kernel's own `printk` messages (interface/driver events,
+watchdog warnings, ...) are written straight to whichever tty is the
+kernel console - same tty `frr-console` draws to - completely outside any
+userspace process's stdout/stderr, so nothing on the Rust side can capture
+or suppress them. `files/etc/sysctl.d/72-frr-bootc-console-quiet.conf`
+lowers `kernel.printk`'s console log level so only `err`-and-worse
+messages reach the console tty; genuinely serious kernel messages (a hard
+lockup, a panic) are emitted at a severity that bypasses this filter
+either way, so they still surface.
+
 The two variable-length panels (Network Interfaces, FRR's per-VRF BGP
 peers) size themselves to whatever room is actually left after the
 fixed-size panels, and cap what they list with an explicit "+N more" line
@@ -576,11 +587,20 @@ users:
     lock_passwd: false        # cloud-init locks the account otherwise,
                                # even with hashed_passwd set below
     hashed_passwd: $6$...
+    shell: /bin/bash          # see below - don't rely on the useradd default
 ```
 
 `lock_passwd: false` is easy to miss and silently leaves the account
 locked despite a password being set - `passwd -S <user>` on the VM shows
 `P` (usable) vs `L` (locked) either way.
+
+`shell:` is just as easy to miss, and fails differently: without it,
+cloud-init doesn't pass `--shell` to `useradd` at all, so the account gets
+whatever this image's `useradd` default resolves to - not guaranteed to be
+an interactive shell. When it isn't, `/bin/login` still authenticates the
+password fine, then has nothing to exec into, so `b` drops the operator
+right back out with no shell. `getent passwd <user>` on the VM shows the
+account's actual shell field if this needs confirming.
 
 Even with that right, a real password can still get rejected: typing it
 wrong a couple of times trips `pam_faillock`'s default lockout (3
