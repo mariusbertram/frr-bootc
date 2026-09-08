@@ -3,11 +3,23 @@
 //! operator would run is a smaller, more obviously-correct surface than
 //! hand-rolling a systemd D-Bus client for three property reads.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+// systemctl is-active/is-failed print the state word to stdout in
+// addition to signaling it via the exit code - only the exit code is
+// used here, but with the default inherited stdio, that printed word
+// would go straight to the real terminal (not through ratatui, which
+// only controls what it itself writes) and land wherever the cursor
+// happened to be, stomping the frame mid-render. Every call here
+// explicitly nulls both stdout and stderr for exactly that reason - this
+// bit the dashboard for real (a wall of stray "active"/"inactive"/"ok"
+// fragments scattered across the screen, reported live).
+fn quiet(cmd: &mut Command) -> &mut Command {
+    cmd.stdout(Stdio::null()).stderr(Stdio::null())
+}
 
 pub fn is_active(unit: &str) -> bool {
-    Command::new("systemctl")
-        .args(["is-active", unit])
+    quiet(Command::new("systemctl").args(["is-active", unit]))
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -17,8 +29,7 @@ pub fn is_failed(unit: &str) -> bool {
     // is-failed exits 0 (and prints "failed") exactly when the unit is in
     // the failed state - that exit code IS the answer, no stdout parsing
     // needed.
-    Command::new("systemctl")
-        .args(["is-failed", unit])
+    quiet(Command::new("systemctl").args(["is-failed", unit]))
         .status()
         .map(|s| s.success())
         .unwrap_or(false)

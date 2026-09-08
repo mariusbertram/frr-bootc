@@ -1,0 +1,38 @@
+#!/usr/bin/bash
+# Resets pam_faillock's failed-login tally, at every boot, for every
+# account with an interactive login shell (root plus whatever cloud-init
+# provisioned) - not a specific hardcoded user, since which account(s)
+# actually exist is entirely up to the deployer's own cloud-init
+# user-data (see README.md's "Console Dashboard" section).
+#
+# Why this exists: a real account with a real password (cloud-init's
+# `users:` entry, `lock_passwd: false` + `hashed_passwd`) can still fail
+# `b` in frr-console with "Permission denied" - not because the password
+# is wrong, but because pam_faillock's default policy (3 attempts/10min
+# on Fedora) locks the account out from *earlier* failed attempts,
+# regardless of the password being correct now. `faillock --user X
+# --reset` fixes it, but only if you know to run it and can already get
+# a shell some other way (e.g. SSH) - not something a console meant to
+# work immediately should require. faillock's own default storage is
+# tmpfs (/run/faillock), which a reboot already clears on its own, but
+# doing this explicitly means it doesn't depend on that default never
+# having been overridden to something persistent.
+#
+# `faillock` with no --user only acts on the *invoking* user (root, since
+# this runs as root), not "every user" - hence the explicit loop below
+# instead of a single call.
+set -uo pipefail
+
+log() { echo "frr-console-reset-faillock: $*"; }
+
+reset_count=0
+while IFS=: read -r name _ _ _ _ _ shell; do
+    case "$shell" in
+        */nologin|/bin/false|"") continue ;;
+    esac
+    if faillock --user "$name" --reset >/dev/null 2>&1; then
+        reset_count=$((reset_count + 1))
+    fi
+done < <(getent passwd)
+
+log "reset faillock tally for $reset_count account(s) with a login shell"

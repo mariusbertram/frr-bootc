@@ -16,7 +16,7 @@ pub struct FrrStatus {
 /// asking `vtysh` anything) - this only covers what's queried through
 /// `vtysh`, which is skipped entirely when the service isn't up.
 pub fn gather(service_active: bool) -> FrrStatus {
-    if !service_active || !have_vtysh() {
+    if !service_active {
         return FrrStatus {
             daemons: String::new(),
             route_summary: None,
@@ -24,6 +24,11 @@ pub fn gather(service_active: bool) -> FrrStatus {
         };
     }
 
+    // No separate "is vtysh even installed" pre-check: vtysh() already
+    // returns an empty string on any failure, binary missing included, so
+    // the rest of this falls through to the same empty/no-op result
+    // either way - one less process spawned per refresh for the common
+    // case where it's simply there.
     let daemons = vtysh("show daemons").trim().to_string();
     let route_summary = parse_route_summary(&vtysh("show ip route summary"));
     let bgp_vrf_peers = if daemons.split_whitespace().any(|d| d == "bgpd") {
@@ -37,14 +42,6 @@ pub fn gather(service_active: bool) -> FrrStatus {
         route_summary,
         bgp_vrf_peers,
     }
-}
-
-fn have_vtysh() -> bool {
-    Command::new("sh")
-        .args(["-c", "command -v vtysh >/dev/null 2>&1"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 fn vtysh(cmd: &str) -> String {

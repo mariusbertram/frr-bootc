@@ -496,14 +496,30 @@ back the moment they log back out.
 [ratatui](https://ratatui.rs/), compiled in its own build stage in the
 `Containerfile` (statically against musl, so its binary carries no runtime
 libc dependency of its own to version-match against the final image's) and
-copied into `/usr/local/bin/frr-console`. `ratatui::Terminal::draw` diffs
-each frame against the last one and only touches the terminal cells that
-actually changed, which is what makes redraws flicker-free *and* immune to
-stale content bleeding through when a section's height changes between
+copied into `/usr/local/bin/frr-console`. It draws real bordered panels -
+tables for interfaces/sync services, gauges for memory/disk - rather than
+one block of plain text, and `ratatui::Terminal::draw` diffs each frame
+against the last one and only touches the terminal cells that actually
+changed, which is what makes redraws flicker-free *and* immune to stale
+content bleeding through when a section's height changes between
 refreshes (an interface's address line coming and going, a VRF's BGP peers
 appearing/disappearing, ...) - a class of bug an earlier, hand-rolled
 cursor-position/erase-sequence bash version of this dashboard had to
-chase down one escape sequence at a time.
+chase down one escape sequence at a time. Every subprocess call
+(`systemctl`, `ip`, `vtysh`, `bootc`) has its stdout/stderr explicitly
+captured or discarded, never left to inherit the console's own - letting
+even one leak through corrupts the frame with raw, unstyled text stomped
+into the middle of the drawn output, which happened for real with an
+earlier `systemctl is-active`/`is-failed` call that only checked the exit
+code but still let the printed status word through.
+
+The two variable-length panels (Network Interfaces, FRR's per-VRF BGP
+peers) size themselves to whatever room is actually left after the
+fixed-size panels, and cap what they list with an explicit "+N more" line
+rather than silently running off the bottom of a small console window -
+this repo's own scaling example is "150 BGP-coupled tenants" (see "A
+Trunk Instead of One NIC per Tenant" above), so both lists can genuinely
+get long.
 
 - `frr-console-tty1.service` - the graphical/VNC console (`virtctl vnc`)
 - `frr-console-ttyS0.service` - the serial console (`virtctl console`)
@@ -547,25 +563,37 @@ the shell exiting *is* that step.
 it.** The usual cloud-init default (e.g. `fedora`, key-only via
 `cloudInitNoCloud`) has no password at all, and SSH keys authenticate the
 SSH protocol, not a local console prompt - there's no way to bridge the
-two. Since every deploy of this VM is a fresh instance, requiring a
-manual `passwd` step (over an SSH connection that itself needs the key to
-already be working) before `b` becomes usable would defeat the point of a
-console that's supposed to work right away, so
-`frr-console-init-password.service` runs once at boot and, only if
-**root**'s password is still locked (`passwd -S root` - never overwrites
-a password set some other way, e.g. cloud-init's own `chpasswd`/`password`
-fields, and never regenerates one on a later plain reboot), generates a
-random one and sets it. The dashboard shows it in a banner at the very
-top for as long as `/etc/frr-console-initial-password` (root-only
-readable) exists - `rm` it once you've noted the password down or changed
-it with `passwd`, to stop the banner. The same service also
-unconditionally resets `pam_faillock`'s tally for root on every boot -
-mistyping a freshly generated password (or one set via cloud-init) a
-couple of times trips Fedora's default lockout (3 attempts/10min)
-regardless of the password being correct on a later attempt; if `b`
-still refuses a password you're sure is right, `sudo faillock --user
-root --reset` (or `faillock --user <user> --reset` for a different
-account) clears it immediately without waiting it out or rebooting.
+two. This image doesn't invent credentials of its own for that (no
+auto-generated password baked in anywhere) - whichever accounts should be
+able to use `b` need a real password set through your own cloud-init
+user-data, e.g.:
+
+```yaml
+#cloud-config
+users:
+  - name: fedora
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false        # cloud-init locks the account otherwise,
+                               # even with hashed_passwd set below
+    hashed_passwd: $6$...
+```
+
+`lock_passwd: false` is easy to miss and silently leaves the account
+locked despite a password being set - `passwd -S <user>` on the VM shows
+`P` (usable) vs `L` (locked) either way.
+
+Even with that right, a real password can still get rejected: typing it
+wrong a couple of times trips `pam_faillock`'s default lockout (3
+attempts/10min on Fedora) for that account, regardless of the password
+being correct on a later attempt. `frr-console-reset-faillock.service`
+resets the tally, at every boot, for every account with an interactive
+login shell (`root` plus whatever cloud-init provisioned - not a specific
+hardcoded user) - `faillock`'s own default storage is tmpfs
+(`/run/faillock`), which a reboot already clears on its own, but doing it
+here too means this doesn't depend on that default never having been
+overridden to something persistent. If `b` still refuses a password
+you're sure is right without waiting for a reboot, `sudo faillock --user
+<user> --reset` on the VM clears it immediately.
 
 To get a plain login prompt back on a given tty instead (e.g. while
 debugging this mechanism itself), on the VM:

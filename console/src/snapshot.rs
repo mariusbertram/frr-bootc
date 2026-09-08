@@ -28,7 +28,6 @@ pub struct Snapshot {
     pub frr: FrrStatus,
     pub sync_units: Vec<SyncUnit>,
     pub bootc_status: Option<String>,
-    pub initial_root_password: Option<String>,
 }
 
 const SYNC_UNITS: &[(&str, &str, &str)] = &[
@@ -72,7 +71,6 @@ pub fn gather(net: &mut ThroughputSampler) -> Snapshot {
             })
             .collect(),
         bootc_status: bootc_status(),
-        initial_root_password: system::initial_root_password(),
     }
 }
 
