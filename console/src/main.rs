@@ -62,7 +62,7 @@ const REFRESH: Duration = Duration::from_secs(REFRESH_SECS);
 fn main() {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         let mut net = ThroughputSampler::new();
-        print_plain(&snapshot::gather(&mut net));
+        print_plain(&snapshot::gather(&mut net, None));
         return;
     }
 
@@ -72,7 +72,7 @@ fn main() {
     let mut net = ThroughputSampler::new();
     let mut state = AppState::default();
 
-    let mut snap = snapshot::gather(&mut net);
+    let mut snap = snapshot::gather(&mut net, None);
     let mut last_refresh = Instant::now();
 
     loop {
@@ -116,22 +116,44 @@ fn main() {
                     KeyCode::Char('3') => state.set_tab(Tab::Frr),
                     KeyCode::Tab | KeyCode::Right => state.next_tab(),
                     KeyCode::BackTab | KeyCode::Left => state.prev_tab(),
-                    KeyCode::Down => state.scroll_by(1),
-                    KeyCode::Up => state.scroll_by(-1),
-                    KeyCode::PageDown => state.scroll_by(10),
-                    KeyCode::PageUp => state.scroll_by(-10),
-                    KeyCode::Home => state.scroll_to_top(),
-                    KeyCode::End => state.scroll_to_bottom(),
+                    KeyCode::Down => state.move_selection(1),
+                    KeyCode::Up => state.move_selection(-1),
+                    KeyCode::PageDown => state.move_selection(10),
+                    KeyCode::PageUp => state.move_selection(-10),
+                    KeyCode::Home => state.select_first(),
+                    KeyCode::End => state.select_last(),
+                    // Enter drills into whichever interface/VRF is
+                    // currently highlighted - see ui::interface_detail_popup/
+                    // vrf_detail_popup.
+                    KeyCode::Enter => state.toggle_detail(),
+                    KeyCode::Esc => state.close_detail(),
                     _ => {}
                 }
             }
         }
 
         if last_refresh.elapsed() >= REFRESH {
-            snap = snapshot::gather(&mut net);
+            let selected_interface = selected_interface_name(&state, &snap);
+            snap = snapshot::gather(&mut net, selected_interface);
             last_refresh = Instant::now();
         }
     }
+}
+
+/// The name of the interface the Interfaces tab's detail popup is
+/// currently open on, if it's open at all - `snapshot::gather`'s cue for
+/// which single interface (if any) is worth the extra `/sys` reads
+/// `net::detail` does. Looked up against the *previous* snapshot's
+/// interface list (the one still on screen when this fires, right
+/// before the next one replaces it) since that's what the popup is
+/// actually showing right now.
+fn selected_interface_name<'a>(state: &AppState, snap: &'a Snapshot) -> Option<&'a str> {
+    if state.tab != Tab::Interfaces || !state.detail_open() {
+        return None;
+    }
+    snap.interfaces
+        .get(state.interfaces_selected())
+        .map(|iface| iface.name.as_str())
 }
 
 /// `.exec()` only returns when the exec itself failed - on success it
@@ -233,6 +255,16 @@ fn print_plain(snap: &Snapshot) {
             println!("  BGP peers (per VRF):");
             for (vrf, estab, total) in &snap.frr.bgp_vrf_peers {
                 println!("    {vrf:<20} {estab}/{total} established");
+                for peer in snap.frr.bgp_vrf_peer_detail.get(vrf).into_iter().flatten() {
+                    let as_text = peer
+                        .remote_as
+                        .map_or_else(|| "-".to_string(), |a| a.to_string());
+                    let uptime = peer.uptime.as_deref().unwrap_or("-");
+                    println!(
+                        "      {:<16} {:<12} {:<11} AS {as_text:<6} up {uptime:<10} pfx in/out {}/{}",
+                        peer.peer, peer.afi, peer.state, peer.pfx_rcd, peer.pfx_snt
+                    );
+                }
             }
         }
     }

@@ -99,6 +99,69 @@ fn read_counter(name: &str, stat: &str) -> Option<u64> {
         .ok()
 }
 
+/// Extra per-interface detail beyond what the always-on `Interface`
+/// listing carries - gathered only for whichever single interface the
+/// console dashboard's "drill in" detail view is currently showing
+/// (see ui.rs), not for every interface on every refresh: cheap per
+/// interface, but with this repo's own scaling example being "150
+/// BGP-coupled tenants" (see the README's "A Trunk Instead of One NIC
+/// per Tenant" section), each with its own VLAN sub-interface, gathering
+/// all of this for every one of them on every 5s tick would add up for
+/// no benefit - nothing shows this except the one open detail view.
+pub struct InterfaceDetail {
+    pub mtu: Option<u32>,
+    pub mac: Option<String>,
+    /// The device this interface is enslaved to (e.g. its VRF, for a
+    /// tenant's VLAN sub-interface - see "VRF per Tenant" in the
+    /// README), read from the `master` symlink `ip link` itself follows
+    /// to show the same relationship.
+    pub master: Option<String>,
+    pub rx_bytes: Option<u64>,
+    pub tx_bytes: Option<u64>,
+    pub rx_packets: Option<u64>,
+    pub tx_packets: Option<u64>,
+    pub rx_errors: Option<u64>,
+    pub tx_errors: Option<u64>,
+    pub rx_dropped: Option<u64>,
+    pub tx_dropped: Option<u64>,
+}
+
+pub fn detail(name: &str) -> InterfaceDetail {
+    InterfaceDetail {
+        mtu: read_sys_value(name, "mtu"),
+        mac: fs::read_to_string(format!("/sys/class/net/{name}/address"))
+            .ok()
+            .map(|s| s.trim().to_string()),
+        master: read_master(name),
+        rx_bytes: read_counter(name, "rx_bytes"),
+        tx_bytes: read_counter(name, "tx_bytes"),
+        rx_packets: read_counter(name, "rx_packets"),
+        tx_packets: read_counter(name, "tx_packets"),
+        rx_errors: read_counter(name, "rx_errors"),
+        tx_errors: read_counter(name, "tx_errors"),
+        rx_dropped: read_counter(name, "rx_dropped"),
+        tx_dropped: read_counter(name, "tx_dropped"),
+    }
+}
+
+fn read_sys_value<T: std::str::FromStr>(name: &str, file: &str) -> Option<T> {
+    fs::read_to_string(format!("/sys/class/net/{name}/{file}"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// `/sys/class/net/<name>/master` is a symlink to the enslaving device
+/// (e.g. `/sys/class/net/<name>/master -> ../vrf-tenant1`) when one
+/// exists, absent otherwise - the same relationship `ip -d link show`
+/// reports as `master vrf-tenant1`, read directly rather than shelling
+/// out for it.
+fn read_master(name: &str) -> Option<String> {
+    let link = fs::read_link(format!("/sys/class/net/{name}/master")).ok()?;
+    link.file_name()?.to_str().map(str::to_string)
+}
+
 fn ip_brief_addr() -> String {
     Command::new("ip")
         .args(["-brief", "addr", "show"])

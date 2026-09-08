@@ -585,15 +585,28 @@ That compact **Overview** is one of three tabs - `1`/`2`/`3` jumps
 straight to one (the same idea as btop's own number-key box switcher), or
 `Tab`/`Shift+Tab`/`←`/`→` cycles - switching to the two detail tabs
 (**Interfaces**, **FRR / BGP**), which list everything with nothing cut
-off, scrollable with `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End`, the same keys
-htop's own process list uses (deliberately no vi bindings alongside them -
-one recognizable control scheme, not two overlapping ones). Each tab keeps
-its own scroll position, so switching away and back doesn't lose your
-place. The footer is a permanent key/action hint bar in the same spirit as
-htop's own `F1Help F2Setup ...` row. Redraws on a key press happen
-immediately rather than waiting for the next refresh tick, but the
-underlying data itself still only refreshes on its own 5s cadence either
-way.
+off. `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` move a highlighted selection
+through that tab's list rather than just scrolling blindly (the same keys
+htop's own process list uses - deliberately no vi bindings alongside them,
+one recognizable control scheme, not two overlapping ones), and the view
+scrolls to follow the selection only once it would otherwise go off
+screen. `Enter` opens a popup with that one item's own detail - for an
+interface: MTU, MAC address, which VRF/device it's enslaved to (read from
+`/sys/class/net/<iface>/master`, same relationship `ip -d link show`
+reports as `master vrf-tenant1`), and cumulative rx/tx byte/packet/error/
+drop counters, gathered on demand only for the one interface being looked
+at (see `net::InterfaceDetail`) rather than for every interface on every
+tick; for a VRF: its individual BGP peers (a dual-stack peer shows as two
+rows, one per AFI, since the sessions can be in different states), each
+with its state, remote AS, uptime, and prefixes received/sent - FRR's own
+`pfxRcd`/`pfxSnt` numbers, i.e. what that peer has had imported into this
+VRF's table and exported/advertised to it. `Esc` closes the popup. Each
+tab keeps its own selection and scroll position, so switching away and
+back doesn't lose your place. The footer is a permanent key/action hint
+bar in the same spirit as htop's own `F1Help F2Setup ...` row. Redraws on
+a key press happen immediately rather than waiting for the next refresh
+tick, but the underlying data itself still only refreshes on its own 5s
+cadence either way.
 
 - `frr-console-tty1.service` - the graphical/VNC console (`virtctl vnc`)
 - `frr-console-ttyS0.service` - the serial console (`virtctl console`)
