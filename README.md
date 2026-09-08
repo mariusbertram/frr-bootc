@@ -532,14 +532,19 @@ this repo's own scaling example is "150 BGP-coupled tenants" (see "A
 Trunk Instead of One NIC per Tenant" above), so both lists can genuinely
 get long.
 
-That compact **Overview** is one of three tabs - `Tab`/`Shift+Tab` (or
-`←`/`→`, or `1`/`2`/`3`) switches between it and two detail tabs
-(**Interfaces**, **FRR / BGP**) that list everything with nothing cut
-off, scrollable with `↑`/`↓`, `j`/`k`, `PgUp`/`PgDn`, or `Home`/`End` (`g`/
-`G`) - each tab keeps its own scroll position, so switching away and back
-doesn't lose your place. Redraws on a key press happen immediately rather
-than waiting for the next refresh tick, but the underlying data itself
-still only refreshes on its own 5s cadence either way.
+That compact **Overview** is one of three tabs - `1`/`2`/`3` jumps
+straight to one (the same idea as btop's own number-key box switcher), or
+`Tab`/`Shift+Tab`/`←`/`→` cycles - switching to the two detail tabs
+(**Interfaces**, **FRR / BGP**), which list everything with nothing cut
+off, scrollable with `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End`, the same keys
+htop's own process list uses (deliberately no vi bindings alongside them -
+one recognizable control scheme, not two overlapping ones). Each tab keeps
+its own scroll position, so switching away and back doesn't lose your
+place. The footer is a permanent key/action hint bar in the same spirit as
+htop's own `F1Help F2Setup ...` row. Redraws on a key press happen
+immediately rather than waiting for the next refresh tick, but the
+underlying data itself still only refreshes on its own 5s cadence either
+way.
 
 - `frr-console-tty1.service` - the graphical/VNC console (`virtctl vnc`)
 - `frr-console-ttyS0.service` - the serial console (`virtctl console`)

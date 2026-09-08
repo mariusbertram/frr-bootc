@@ -707,27 +707,32 @@ fn image_panel(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     );
 }
 
+/// htop/btop-style hint bar: each key rendered as a highlighted block
+/// glued directly to its action label (no "[key] description" prose) -
+/// the same visual language as htop's permanently-visible
+/// `F1Help F2Setup ...` row, with number keys picking a tab the way
+/// btop's own box switcher uses its number row.
 fn footer(frame: &mut Frame, area: Rect, tab: Tab, refresh_secs: u64) {
-    let key = |text| {
-        Span::styled(
-            text,
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )
+    let key_style = Style::default().fg(Color::Black).bg(ACCENT);
+    let label_style = Style::default().fg(MUTED);
+    let hint = |k: &'static str, label: &'static str| {
+        [
+            Span::styled(k, key_style),
+            Span::styled(label, label_style),
+            Span::raw(" "),
+        ]
     };
 
-    let mut spans = vec![Span::raw(format!("Refreshing every {refresh_secs}s   "))];
-    spans.push(key("[Tab]"));
-    if tab == Tab::Overview {
-        spans.push(Span::raw(" view details   "));
-    } else {
-        spans.push(Span::raw(" switch   "));
-        spans.push(key("[\u{2191}\u{2193}/jk]"));
-        spans.push(Span::raw(" scroll   "));
-        spans.push(key("[PgUp/PgDn]"));
-        spans.push(Span::raw(" page   "));
+    let mut spans = Vec::new();
+    spans.extend(hint("1", "Overview"));
+    spans.extend(hint("2", "Interfaces"));
+    spans.extend(hint("3", "FRR/BGP"));
+    if tab != Tab::Overview {
+        spans.extend(hint("\u{2191}\u{2193}", "Scroll"));
+        spans.extend(hint("PgUp/PgDn", "Page"));
     }
-    spans.push(key("[b]"));
-    spans.push(Span::raw(" log in for a shell"));
+    spans.extend(hint("b", "Shell"));
+    spans.push(Span::raw(format!("  (every {refresh_secs}s)")));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

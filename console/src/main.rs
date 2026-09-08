@@ -103,17 +103,25 @@ fn main() {
                         std::thread::sleep(Duration::from_secs(2));
                         terminal = setup_terminal().expect("failed to re-enter terminal");
                     }
-                    KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => state.next_tab(),
-                    KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => state.prev_tab(),
+                    // Number keys jump straight to a tab (btop's own way
+                    // of switching its boxes) - Tab/Shift+Tab and Left/
+                    // Right cycle, for anyone who'd rather not look down
+                    // at the number row. Scrolling is plain arrow keys/
+                    // PageUp/PageDown/Home/End throughout, the same as
+                    // htop's process list - no vi bindings, to keep this
+                    // one consistent, recognizable control scheme rather
+                    // than two overlapping ones.
                     KeyCode::Char('1') => state.set_tab(Tab::Overview),
                     KeyCode::Char('2') => state.set_tab(Tab::Interfaces),
                     KeyCode::Char('3') => state.set_tab(Tab::Frr),
-                    KeyCode::Down | KeyCode::Char('j') => state.scroll_by(1),
-                    KeyCode::Up | KeyCode::Char('k') => state.scroll_by(-1),
+                    KeyCode::Tab | KeyCode::Right => state.next_tab(),
+                    KeyCode::BackTab | KeyCode::Left => state.prev_tab(),
+                    KeyCode::Down => state.scroll_by(1),
+                    KeyCode::Up => state.scroll_by(-1),
                     KeyCode::PageDown => state.scroll_by(10),
                     KeyCode::PageUp => state.scroll_by(-10),
-                    KeyCode::Home | KeyCode::Char('g') => state.scroll_to_top(),
-                    KeyCode::End | KeyCode::Char('G') => state.scroll_to_bottom(),
+                    KeyCode::Home => state.scroll_to_top(),
+                    KeyCode::End => state.scroll_to_bottom(),
                     _ => {}
                 }
             }
