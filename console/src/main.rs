@@ -130,6 +130,12 @@ fn install_panic_hook() {
 }
 
 fn print_plain(snap: &Snapshot) {
+    if let Some(password) = &snap.initial_root_password {
+        println!("Initial root password: {password}");
+        println!("Log in with 'b', then run `passwd` and `rm /etc/frr-console-initial-password`");
+        println!();
+    }
+
     println!("frr-bootc - {} - {}", snap.hostname, snap.now);
     println!("  Uptime: {}", snap.uptime);
     println!();

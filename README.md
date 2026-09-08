@@ -543,6 +543,30 @@ unit's `Restart=always` immediately answers by relaunching the dashboard
 on the same tty - there's no separate "log out of the dashboard" step,
 the shell exiting *is* that step.
 
+**`/bin/login` needs an actual password - an SSH-key-only account can't use
+it.** The usual cloud-init default (e.g. `fedora`, key-only via
+`cloudInitNoCloud`) has no password at all, and SSH keys authenticate the
+SSH protocol, not a local console prompt - there's no way to bridge the
+two. Since every deploy of this VM is a fresh instance, requiring a
+manual `passwd` step (over an SSH connection that itself needs the key to
+already be working) before `b` becomes usable would defeat the point of a
+console that's supposed to work right away, so
+`frr-console-init-password.service` runs once at boot and, only if
+**root**'s password is still locked (`passwd -S root` - never overwrites
+a password set some other way, e.g. cloud-init's own `chpasswd`/`password`
+fields, and never regenerates one on a later plain reboot), generates a
+random one and sets it. The dashboard shows it in a banner at the very
+top for as long as `/etc/frr-console-initial-password` (root-only
+readable) exists - `rm` it once you've noted the password down or changed
+it with `passwd`, to stop the banner. The same service also
+unconditionally resets `pam_faillock`'s tally for root on every boot -
+mistyping a freshly generated password (or one set via cloud-init) a
+couple of times trips Fedora's default lockout (3 attempts/10min)
+regardless of the password being correct on a later attempt; if `b`
+still refuses a password you're sure is right, `sudo faillock --user
+root --reset` (or `faillock --user <user> --reset` for a different
+account) clears it immediately without waiting it out or rebooting.
+
 To get a plain login prompt back on a given tty instead (e.g. while
 debugging this mechanism itself), on the VM:
 

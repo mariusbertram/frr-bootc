@@ -26,6 +26,7 @@ use crate::systemd::SyncHealth;
 const OK: Color = Color::Green;
 const WARN: Color = Color::Yellow;
 const BAD: Color = Color::Red;
+const NOTICE: Color = Color::Magenta;
 
 fn heading(text: impl Into<String>) -> Line<'static> {
     Line::from(Span::styled(
@@ -47,6 +48,7 @@ pub fn render(frame: &mut Frame, snap: &Snapshot, refresh_secs: u64) {
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
 
     let mut lines = Vec::new();
+    password_banner(&mut lines, snap);
     header(&mut lines, snap);
     system_section(&mut lines, snap);
     interfaces_section(&mut lines, snap);
@@ -61,6 +63,34 @@ pub fn render(frame: &mut Frame, snap: &Snapshot, refresh_secs: u64) {
         )),
         footer,
     );
+}
+
+// Shown for as long as /etc/frr-console-initial-password exists (see
+// frr-console-init-password.service) - i.e. until whoever reads it off
+// here removes that file, which is the acknowledgment that they've
+// recorded (or changed) the password. Not auto-dismissed on any
+// timer/login-detection heuristic: an explicit `rm` is simpler to reason
+// about than guessing whether "the operator has seen this" from state
+// that wasn't designed to answer that question.
+fn password_banner(lines: &mut Vec<Line<'static>>, snap: &Snapshot) {
+    let Some(password) = &snap.initial_root_password else {
+        return;
+    };
+    let bar = "*".repeat(80);
+    lines.push(Line::styled(bar.clone(), Style::default().fg(NOTICE)));
+    lines.push(Line::from(vec![
+        Span::styled("  Initial root password: ", Style::default().fg(NOTICE)),
+        Span::styled(
+            password.clone(),
+            Style::default().fg(NOTICE).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::styled(
+        "  Log in with 'b', then run `passwd` and `rm /etc/frr-console-initial-password`",
+        Style::default().fg(NOTICE),
+    ));
+    lines.push(Line::styled(bar, Style::default().fg(NOTICE)));
+    lines.push(Line::default());
 }
 
 fn header(lines: &mut Vec<Line<'static>>, snap: &Snapshot) {
