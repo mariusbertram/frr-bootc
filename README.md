@@ -492,6 +492,19 @@ dashboard (`/usr/local/bin/frr-console`), Talos-Linux style: it's there
 before, without, and regardless of anyone logging in, and it comes right
 back the moment they log back out.
 
+`frr-console` is a small Rust crate ([`console/`](console/)) built on
+[ratatui](https://ratatui.rs/), compiled in its own build stage in the
+`Containerfile` (statically against musl, so its binary carries no runtime
+libc dependency of its own to version-match against the final image's) and
+copied into `/usr/local/bin/frr-console`. `ratatui::Terminal::draw` diffs
+each frame against the last one and only touches the terminal cells that
+actually changed, which is what makes redraws flicker-free *and* immune to
+stale content bleeding through when a section's height changes between
+refreshes (an interface's address line coming and going, a VRF's BGP peers
+appearing/disappearing, ...) - a class of bug an earlier, hand-rolled
+cursor-position/erase-sequence bash version of this dashboard had to
+chase down one escape sequence at a time.
+
 - `frr-console-tty1.service` - the graphical/VNC console (`virtctl vnc`)
 - `frr-console-ttyS0.service` - the serial console (`virtctl console`)
 
@@ -525,8 +538,7 @@ Viewing it needs no authentication - whoever already has console access to
 the VM (via `virtctl`/`oc` RBAC) is already privileged enough that this
 isn't new exposure. `b` execs a real `/bin/login` (the normal
 "login:"/password prompt), so an actual shell is still gated on real
-credentials; `r` redraws immediately instead of waiting out the refresh
-interval. Exiting that shell ends the `login` process, which the owning
+credentials. Exiting that shell ends the `login` process, which the owning
 unit's `Restart=always` immediately answers by relaunching the dashboard
 on the same tty - there's no separate "log out of the dashboard" step,
 the shell exiting *is* that step.

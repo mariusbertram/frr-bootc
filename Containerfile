@@ -18,6 +18,20 @@
 # images is comparatively rare/heavyweight, so a missed inotify event
 # there is a smaller/rarer cost than for these two).
 # See README.md for the full architecture and deployment manifests.
+
+# frr-console (the console dashboard - see console/src/main.rs, and the
+# "Console Dashboard" section of README.md) is a separate Rust crate built
+# on ratatui, compiled here in its own stage rather than installing a Rust
+# toolchain into the final image. --target ...-musl links it fully static:
+# a musl binary has no runtime libc of its own to version-mismatch against
+# the final Fedora image's glibc, which sidesteps that question outright
+# instead of relying on this builder's glibc happening to be old enough.
+FROM docker.io/library/rust:1-alpine AS console-builder
+RUN apk add --no-cache musl-dev gcc
+WORKDIR /build
+COPY console/ .
+RUN cargo build --release --locked --target x86_64-unknown-linux-musl
+
 ARG BASE_IMAGE=quay.io/fedora/fedora-bootc:44
 FROM ${BASE_IMAGE}
 
@@ -46,7 +60,7 @@ COPY files/etc/cloud/cloud.cfg.d/10-bootc.cfg /etc/cloud/cloud.cfg.d/10-bootc.cf
 COPY files/usr/local/bin/frr-config-sync /usr/local/bin/frr-config-sync
 COPY files/usr/local/bin/network-config-sync /usr/local/bin/network-config-sync
 COPY files/usr/local/bin/bootc-image-sync /usr/local/bin/bootc-image-sync
-COPY files/usr/local/bin/frr-console /usr/local/bin/frr-console
+COPY --from=console-builder /build/target/x86_64-unknown-linux-musl/release/frr-console /usr/local/bin/frr-console
 
 COPY files/usr/lib/systemd/system/run-config-frr.mount /usr/lib/systemd/system/run-config-frr.mount
 COPY files/usr/lib/systemd/system/run-config-network.mount /usr/lib/systemd/system/run-config-network.mount
