@@ -196,6 +196,23 @@ Correspondingly, `frr.conf` runs a separate BGP instance per tenant
 failure detection - see `bfdd=yes` in `daemons`), which advertises the
 networks intended for that VRF via a `network` statement.
 
+Tenants can legitimately reuse the same private address ranges across
+VRFs, which is exactly the situation `net.vrf.strict_mode` hardens: it
+closes a kernel-level socket-to-VRF binding ambiguity that can otherwise
+arise in that case, as defense in depth alongside FRR's own `vrf`
+scoping above. It's declared in
+[`files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf`](files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf)
+for documentation/consistency with the other sysctl knobs there, but that
+static file alone doesn't reliably take effect - the sysctl node only
+exists once the `vrf` kernel module has loaded (on first VRF interface
+creation), normally *after* `systemd-sysctl.service` already ran at boot.
+`network-config-sync` re-applies the same value at runtime after every
+successful sync instead (best-effort - a `NotFound` write, meaning no VRF
+exists anywhere on the system yet, is expected and not logged as an
+error). Doesn't affect the route-leaking design above
+(`routes:`/`route-rules:`) - that's FIB/PBR based, a separate mechanism
+strict mode doesn't touch.
+
 For those networks to actually leave via the corresponding tenant VLAN -
 even though they're physically attached to a different VLAN sub-interface
 (in the example: `eth-lan`, itself a `type: vlan` sub-interface of

@@ -1,10 +1,19 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use nmstate::NetworkState;
 
 use crate::{has_extension, is_empty_source, list_names, Logger};
+
+/// Mirrors `files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf`'s
+/// value - that static file alone can't reliably apply it (the sysctl
+/// node only exists once the `vrf` kernel module is loaded, which
+/// happens on first VRF interface creation, normally *after*
+/// systemd-sysctl.service already ran at boot), so it's re-applied here
+/// after every successful sync instead.
+const VRF_STRICT_MODE_PATH: &str = "/proc/sys/net/vrf/strict_mode";
 
 /// Applies nmstate desired-state documents (`*.yml`/`*.yaml`) from `src`
 /// (the mounted `network-config` ConfigMap) via the `nmstate` crate
@@ -48,8 +57,27 @@ pub fn sync(src: &Path, log: &Logger) -> Result<()> {
         log.log(format!("applied {name} successfully"));
     }
 
+    apply_vrf_strict_mode(Path::new(VRF_STRICT_MODE_PATH), log);
+
     log.log("sync complete");
     Ok(())
+}
+
+/// Best-effort - not part of the sync's success/failure outcome, since
+/// the actual network config already applied successfully by the time
+/// this runs. `NotFound` (no VRF exists anywhere on the system yet, so
+/// the `vrf` kernel module hasn't loaded and the sysctl node doesn't
+/// exist) is expected and unremarkable on a VM with no VRF-using tenant
+/// configured yet - anything else is worth a log line since it means a
+/// VRF *does* exist but hardening it failed.
+fn apply_vrf_strict_mode(path: &Path, log: &Logger) {
+    match fs::write(path, "1\n") {
+        Ok(()) => log.log("net.vrf.strict_mode=1 (VRF isolation hardening)"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            log.log("net.vrf.strict_mode not available yet (no VRF interfaces present) - skipping");
+        }
+        Err(e) => log.err(format!("failed to set net.vrf.strict_mode=1: {e}")),
+    }
 }
 
 fn statefile_paths(src: &Path) -> Result<Vec<PathBuf>> {
@@ -90,5 +118,26 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["a.yml", "b.yaml"]);
+    }
+
+    #[test]
+    fn vrf_strict_mode_writes_1_when_the_sysctl_node_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_mode");
+        fs::write(&path, "0\n").unwrap();
+        let log = Logger::new("test");
+
+        apply_vrf_strict_mode(&path, &log);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "1\n");
+    }
+
+    #[test]
+    fn vrf_strict_mode_missing_node_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-such-vrf-module/strict_mode");
+        let log = Logger::new("test");
+
+        apply_vrf_strict_mode(&path, &log);
     }
 }
