@@ -513,6 +513,17 @@ into the middle of the drawn output, which happened for real with an
 earlier `systemctl is-active`/`is-failed` call that only checked the exit
 code but still let the printed status word through.
 
+Subprocess stdout isn't the only source of stray text on the console,
+though: the kernel's own `printk` messages (interface/driver events,
+watchdog warnings, ...) are written straight to whichever tty is the
+kernel console - same tty `frr-console` draws to - completely outside any
+userspace process's stdout/stderr, so nothing on the Rust side can capture
+or suppress them. `files/etc/sysctl.d/72-frr-bootc-console-quiet.conf`
+lowers `kernel.printk`'s console log level so only `err`-and-worse
+messages reach the console tty; genuinely serious kernel messages (a hard
+lockup, a panic) are emitted at a severity that bypasses this filter
+either way, so they still surface.
+
 The two variable-length panels (Network Interfaces, FRR's per-VRF BGP
 peers) size themselves to whatever room is actually left after the
 fixed-size panels, and cap what they list with an explicit "+N more" line
@@ -571,16 +582,47 @@ user-data, e.g.:
 ```yaml
 #cloud-config
 users:
-  - name: fedora
+  - name: admin
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: false        # cloud-init locks the account otherwise,
                                # even with hashed_passwd set below
     hashed_passwd: $6$...
+    shell: /bin/bash
 ```
 
 `lock_passwd: false` is easy to miss and silently leaves the account
 locked despite a password being set - `passwd -S <user>` on the VM shows
 `P` (usable) vs `L` (locked) either way.
+
+A correctly-set `shell:` on a freshly-created account can *still* end in
+`login`'s "no shell: Permission denied" after a correct password -
+`getent passwd <user>` shows a perfectly good `/bin/bash` and even
+forcing it again via `runcmd: usermod -s /bin/bash <user>` changes
+nothing. That symptom isn't the passwd entry at all: it's SELinux denying
+the final `execve()` into the shell, confirmed live via
+`journalctl`'s AVC record:
+
+```
+AVC avc:  denied  { transition } for  pid=... comm="login" path="/usr/bin/bash"
+    scontext=system_u:system_r:unconfined_service_t:s0
+    tcontext=unconfined_u:unconfined_r:unconfined_t:s0 tclass=process
+```
+
+`frr-console-tty1.service`/`frr-console-ttyS0.service` exec `frr-console`
+directly in the role `/sbin/agetty` normally has - but without agetty's
+own `getty_exec_t` file context, there's no policy rule to transition it
+(or anything it execs) out of the generic `unconfined_service_t` every
+plain service gets. That breaks the whole chain SELinux otherwise handles
+for a normal console login (`init_t` → `getty_t` on exec'ing agetty →
+`local_login_t` on exec'ing `/bin/login` → the operator's own context on
+exec'ing their shell): `login` keeps running as `unconfined_service_t`,
+and the final transition into the shell's context is exactly what gets
+denied - independent of what the account's password, `lock_passwd`, or
+`shell:` say, which is why none of those ever touched this. Labeling
+`frr-console` itself as `getty_exec_t` (in the `Containerfile`) puts it
+through that same already-correct chain instead of needing any new
+policy, and is the actual fix - nothing to add on the cloud-init side for
+this one.
 
 Even with that right, a real password can still get rejected: typing it
 wrong a couple of times trips `pam_faillock`'s default lockout (3

@@ -329,7 +329,16 @@ fn frr_panel(frame: &mut Frame, area: Rect, snap: &Snapshot) {
                 )));
                 let (shown, extra) = bgp_visible_rows(total_vrfs, section_budget - 1);
                 for (vrf, estab, total) in snap.frr.bgp_vrf_peers.iter().take(shown) {
-                    let color = if *estab == *total {
+                    // A VRF can have a BGP instance but zero configured
+                    // neighbors - shown (unlike the old text-table
+                    // parser, which never produced an entry for it at
+                    // all) rather than hidden, but "0/0" isn't a healthy
+                    // "OK" so much as "nothing to report" - MUTED reads
+                    // that way, where green would misleadingly imply
+                    // every configured peer (there are none) is up.
+                    let color = if *total == 0 {
+                        MUTED
+                    } else if *estab == *total {
                         OK
                     } else if *estab == 0 {
                         BAD
