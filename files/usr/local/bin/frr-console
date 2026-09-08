@@ -48,20 +48,33 @@ else
     c_bold=""; c_reset=""; c_green=""; c_red=""; c_yellow=""
 fi
 
-# Cursor-home + erase-to-end-of-screen, cached once like the color codes
-# above. Used instead of `clear` on every redraw: `clear` erases the
-# whole screen before drawing the new frame, so the terminal shows a
-# blank flash between frames - the classic cause of a "flickering"
-# status dashboard. Moving the cursor home and overwriting the old frame
-# in place, only erasing whatever's left over *after* the new content is
-# already on screen, never shows a blank frame. cup/ed are basic
-# terminfo capabilities supported by essentially every terminal a login
-# session could show up on (vt100, linux, xterm, ...) - more universal
-# than 8-color support even - so this isn't gated behind use_color.
+# Cursor-home + per-line erase-to-end-of-line + a final
+# erase-to-end-of-screen, cached once like the color codes above. Used
+# instead of `clear` on every redraw: `clear` erases the whole screen
+# before drawing the new frame, so the terminal shows a blank flash
+# between frames - the classic cause of a "flickering" status dashboard.
+# Moving the cursor home and overwriting the old frame in place instead
+# never shows a blank frame - BUT the frame's total line count is not
+# actually constant between redraws (an interface gaining/losing its
+# address line, a VRF's BGP peers appearing/disappearing, `bootc status`
+# wrapping differently, ...), and erasing only *after* the whole new
+# frame is a no-op for any row that shrank without the frame as a whole
+# getting shorter: a later line lands on top of an unrelated old line
+# that happened to be longer, and whatever the new line didn't overwrite
+# stays on screen, glued onto it (this actually happened - see the
+# comment above cap_el's use below). So every line gets its own
+# erase-to-end-of-line right after it's printed, in addition to the
+# final erase-to-end-of-screen for when the new frame has fewer *total*
+# lines than the old one. cup/el/ed are basic terminfo capabilities
+# supported by essentially every terminal a login session could show up
+# on (vt100, linux, xterm, ...) - more universal than 8-color support
+# even - so none of this is gated behind use_color.
 cap_home=""
+cap_el=""
 cap_eed=""
 if [ "$interactive" = "1" ] && command -v tput >/dev/null 2>&1; then
     cap_home=$(tput cup 0 0 2>/dev/null) || cap_home=""
+    cap_el=$(tput el 2>/dev/null) || cap_el=""
     cap_eed=$(tput ed 2>/dev/null) || cap_eed=""
 fi
 
@@ -293,20 +306,30 @@ trap '' INT
 # Only the very first draw of this process needs a real `clear`: the
 # screen could be showing anything at that point (boot messages, this
 # unit's own startup, systemd's own log lines). Every redraw after that
-# is overwriting this same script's own previous frame, which has the
-# same shape line to line (fixed-width fields), so cursor-home +
-# erase-to-end-of-screen (see cap_home/cap_eed above) is safe and doesn't
-# flash - the whole reason this loop stopped using `clear` every cycle.
+# overwrites this same script's own previous frame in place (see
+# cap_home/cap_el/cap_eed above) instead - the whole reason this loop
+# stopped using `clear` every cycle.
 first_frame=1
 
 while true; do
     frame=$(render; hr; printf 'Refreshing every %ss - [b] log in for a shell   [r] refresh now\n' "$REFRESH_SECS")
-    if [ "$first_frame" = "1" ] || [ -z "$cap_home" ]; then
+    if [ "$first_frame" = "1" ] || [ -z "$cap_home" ] || [ -z "$cap_el" ]; then
         clear
+        printf '%s\n' "$frame"
     else
         printf '%s' "$cap_home"
+        # Print line by line, erasing to end-of-line after each: the
+        # dashboard's own total line count isn't actually constant
+        # between redraws (an interface's address line coming and going,
+        # a VRF's BGP peers appearing/disappearing, ...), so a later line
+        # can land on a row a shorter old frame didn't reach that far
+        # down on, or a longer old line at that exact row - either way,
+        # without clearing each row individually, whatever the new line
+        # doesn't overwrite stays on screen, glued onto it.
+        while IFS= read -r frame_line || [ -n "$frame_line" ]; do
+            printf '%s%s\n' "$frame_line" "$cap_el"
+        done <<<"$frame"
     fi
-    printf '%s\n' "$frame"
     [ -n "$cap_eed" ] && printf '%s' "$cap_eed"
     first_frame=0
     key=""
