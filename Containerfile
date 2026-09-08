@@ -69,6 +69,7 @@ COPY files/etc/cloud/cloud.cfg.d/10-bootc.cfg /etc/cloud/cloud.cfg.d/10-bootc.cf
 COPY files/usr/local/bin/frr-config-sync /usr/local/bin/frr-config-sync
 COPY files/usr/local/bin/network-config-sync /usr/local/bin/network-config-sync
 COPY files/usr/local/bin/bootc-image-sync /usr/local/bin/bootc-image-sync
+COPY files/usr/local/bin/frr-console-init-password /usr/local/bin/frr-console-init-password
 COPY --from=console-builder /build/target/x86_64-unknown-linux-musl/release/frr-console /usr/local/bin/frr-console
 
 COPY files/usr/lib/systemd/system/run-config-frr.mount /usr/lib/systemd/system/run-config-frr.mount
@@ -83,6 +84,7 @@ COPY files/usr/lib/systemd/system/bootc-image-sync.path /usr/lib/systemd/system/
 COPY files/usr/lib/systemd/system/bootc-image-sync.timer /usr/lib/systemd/system/bootc-image-sync.timer
 COPY files/usr/lib/systemd/system/frr-console-tty1.service /usr/lib/systemd/system/frr-console-tty1.service
 COPY files/usr/lib/systemd/system/frr-console-ttyS0.service /usr/lib/systemd/system/frr-console-ttyS0.service
+COPY files/usr/lib/systemd/system/frr-console-init-password.service /usr/lib/systemd/system/frr-console-init-password.service
 
 # frr-console-tty1.service/frr-console-ttyS0.service (enabled below) take
 # over the console outright, Talos-Linux style - mask the getty units they
@@ -96,6 +98,7 @@ RUN chmod 0755 \
         /usr/local/bin/frr-config-sync \
         /usr/local/bin/network-config-sync \
         /usr/local/bin/bootc-image-sync \
+        /usr/local/bin/frr-console-init-password \
         /usr/local/bin/frr-console \
     && mkdir -p /run/config/frr /run/config/network /run/config/bootc \
     && chown -R frr:frr /etc/frr \
@@ -113,6 +116,7 @@ RUN chmod 0755 \
         bootc-image-sync.service \
         bootc-image-sync.path \
         bootc-image-sync.timer \
+        frr-console-init-password.service \
         frr-console-tty1.service \
         frr-console-ttyS0.service
 

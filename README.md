@@ -544,15 +544,21 @@ on the same tty - there's no separate "log out of the dashboard" step,
 the shell exiting *is* that step.
 
 **`/bin/login` needs an actual password - an SSH-key-only account can't use
-it.** If the only account provisioned is the usual cloud-init
-default (e.g. `fedora`, key-only via `cloudInitNoCloud`), its password is
-locked, so every attempt at `b` fails with "Permission denied" and drops
-back to the dashboard, on both consoles, regardless of credentials typed -
-that's expected, not a bug in the dashboard: SSH keys authenticate the SSH
-protocol, not a local console prompt, and there's no way to bridge the
-two. Set an actual password for at least one account before relying on
-`b` - either via cloud-init's `chpasswd`/`password` user-data fields, or
-by running `sudo passwd <user>` once over SSH.
+it.** The usual cloud-init default (e.g. `fedora`, key-only via
+`cloudInitNoCloud`) has no password at all, and SSH keys authenticate the
+SSH protocol, not a local console prompt - there's no way to bridge the
+two. Since every deploy of this VM is a fresh instance, requiring a
+manual `passwd` step (over an SSH connection that itself needs the key to
+already be working) before `b` becomes usable would defeat the point of a
+console that's supposed to work right away, so
+`frr-console-init-password.service` runs once at boot and, only if
+**root**'s password is still locked (`passwd -S root` - never overwrites
+a password set some other way, e.g. cloud-init's own `chpasswd`/`password`
+fields, and never regenerates one on a later plain reboot), generates a
+random one and sets it. The dashboard shows it in a banner at the very
+top for as long as `/etc/frr-console-initial-password` (root-only
+readable) exists - `rm` it once you've noted the password down or changed
+it with `passwd`, to stop the banner.
 
 To get a plain login prompt back on a given tty instead (e.g. while
 debugging this mechanism itself), on the VM:
