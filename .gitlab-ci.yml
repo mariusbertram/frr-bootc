@@ -1,5 +1,23 @@
 stages:
+  - test
   - build
+
+# Fast feedback on the frr-console (console dashboard) Rust crate, ahead of
+# and independent from the Containerfile builds below: the Kaniko build's
+# `cargo build` inside its console-builder stage only proves the crate
+# compiles, not that it's linted or its tests pass, and waiting on a full
+# image build just to see a clippy warning is a bad loop.
+console-check:
+  stage: test
+  image: docker.io/library/rust:1
+  before_script:
+    - rustup component add rustfmt clippy
+    - cd console
+  script:
+    - cargo fmt --check
+    - cargo clippy --all-targets --locked -- -D warnings
+    - cargo test --locked
+    - cargo build --release --locked
 
 # Kaniko builds the OCI image without needing a privileged runner or
 # docker-in-docker, which also makes it work on OpenShift-hosted runners.
