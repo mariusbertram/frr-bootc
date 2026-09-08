@@ -7,9 +7,10 @@
 //! the comment in each of those two unit files for the full boot-time
 //! picture.
 //!
-//! This exists because there is no dashboard/alerting for this VM (see the
-//! comment at the top of frr-config-sync) - console access is the only way
-//! in, so the console itself should always be showing the same "is
+//! This exists because there is no dashboard/alerting for this VM (see
+//! the module docs at the top of config-sync/src/bin/frr-config-sync.rs)
+//! - console access is the only way in, so the console itself should
+//! always be showing the same "is
 //! everything actually working" information a human would otherwise have
 //! to piece together by hand from several journalctl/vtysh/ip/systemctl
 //! calls.

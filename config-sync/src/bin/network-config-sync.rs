@@ -1,3 +1,14 @@
+//! Applies network configuration from the mounted "network-config"
+//! ConfigMap (`/run/config/network`, a read-only virtiofs mount) via the
+//! `nmstate` crate. Runs after `NetworkManager.service`, triggered at
+//! boot and periodically by network-config-sync.timer - see
+//! [`config_sync::network::sync`] for the full control flow. nmstate
+//! documents only (`*.yml`/`*.yaml`) - no NetworkManager `.nmconnection`
+//! keyfile support.
+//!
+//! Logs verbosely at every stage on purpose (`journalctl -u
+//! network-config-sync.service`), same reasoning as frr-config-sync.rs.
+
 use std::path::Path;
 use std::process::ExitCode;
 

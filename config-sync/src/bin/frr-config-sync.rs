@@ -1,3 +1,17 @@
+//! Syncs FRR configuration from the mounted "frr-config" ConfigMap
+//! (`/run/config/frr`, a read-only virtiofs mount) into `/etc/frr`, then
+//! reloads or restarts FRR as needed. Triggered at boot and periodically
+//! by frr-config-sync.timer - see [`config_sync::frr::sync`] for the
+//! full control flow (staging, vty-socket validation, rsync, then either
+//! `frr-reload.py --reload` or a full `systemctl restart frr.service` if
+//! the enabled daemon set changed).
+//!
+//! Logs verbosely at every stage on purpose (`journalctl -u
+//! frr-config-sync.service`): this VM has no dashboard/alerting beyond
+//! the console (see console/src/main.rs), console access is the only
+//! way in, and a vague "something failed" here used to mean piecing the
+//! actual cause back together by hand.
+
 use std::path::Path;
 use std::process::ExitCode;
 
