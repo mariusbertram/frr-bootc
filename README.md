@@ -609,20 +609,31 @@ AVC avc:  denied  { transition } for  pid=... comm="login" path="/usr/bin/bash"
 ```
 
 `frr-console-tty1.service`/`frr-console-ttyS0.service` exec `frr-console`
-directly in the role `/sbin/agetty` normally has - but without agetty's
-own `getty_exec_t` file context, there's no policy rule to transition it
-(or anything it execs) out of the generic `unconfined_service_t` every
-plain service gets. That breaks the whole chain SELinux otherwise handles
-for a normal console login (`init_t` → `getty_t` on exec'ing agetty →
-`local_login_t` on exec'ing `/bin/login` → the operator's own context on
-exec'ing their shell): `login` keeps running as `unconfined_service_t`,
-and the final transition into the shell's context is exactly what gets
-denied - independent of what the account's password, `lock_passwd`, or
-`shell:` say, which is why none of those ever touched this. Labeling
-`frr-console` itself as `getty_exec_t` (in the `Containerfile`) puts it
-through that same already-correct chain instead of needing any new
-policy, and is the actual fix - nothing to add on the cloud-init side for
-this one.
+directly in the role `/sbin/agetty` normally has, running as
+`unconfined_service_t` - the domain any plain systemd service binary
+gets - and it execs `/bin/login` itself. Only `getty_t` has a
+policy-provided transition into `local_login_t` on exec'ing `login_exec_t`
+(`/bin/login`'s own file type); without it, `login` just keeps running as
+`unconfined_service_t`, and the *final* transition into the operator's own
+shell context is exactly what gets denied - independent of what the
+account's password, `lock_passwd`, or `shell:` say, which is why none of
+those ever touched this.
+
+The obvious-looking fix - labeling `frr-console` itself as `getty_exec_t`,
+so it goes through the exact chain agetty does - was tried first and
+reverted: that puts the *entire* `frr-console` process into `getty_t` for
+its whole lifetime, not just the moment of the `b` handoff, and `getty_t`
+is scoped for what agetty actually does (open a tty, wait, exec `login`) -
+it has no allowance for what `frr-console` spends nearly all its time
+doing instead (spawning `systemctl`/`ip`/`vtysh`/`bootc`, reading `/proc`,
+...), so every one of *those* got denied instead and the dashboard went
+blank. The actual fix is a small custom SELinux policy module
+(`files/selinux/frr_console.te`, compiled and loaded in the
+`Containerfile`) granting only the one missing transition
+(`unconfined_service_t` → `local_login_t` on exec'ing `login_exec_t`) -
+`frr-console`'s own steady-state domain stays `unconfined_service_t` the
+entire time it's just being a dashboard. Nothing to add on the cloud-init
+side for this one either way.
 
 Even with that right, a real password can still get rejected: typing it
 wrong a couple of times trips `pam_faillock`'s default lockout (3
