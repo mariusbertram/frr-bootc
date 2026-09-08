@@ -1,23 +1,24 @@
 # Consumed by network-config-sync.service inside the VM (mounted read-only
 # at /run/config/network via virtiofs).
 #
-# nmstate.yml is an ordinary nmstate desired-state document, applied with
-# `nmstatectl apply`. Every tenant gets a VLAN sub-interface on the shared
-# "eth-trunk" NIC, enslaved into its own VRF (see the "Adding Tenants
-# Without a VM Restart" section of README.md); frr-config's frr.conf runs a
-# per-tenant BGP instance in that VRF, and nmstate's own route-rules do the
-# PBR that steers the networks each instance advertises into that VRF - a
-# flat, source-prefix-based rule that scales to many tenants far better
-# than binding an FRR pbr-map to one fixed ingress interface.
+# nmstate.yml is an ordinary nmstate desired-state document, applied
+# directly via the `nmstate` Rust crate (NetworkState::apply(), no
+# `nmstatectl` subprocess - see config-sync/src/network.rs). Every tenant
+# gets a VLAN sub-interface on the shared "eth-trunk" NIC, enslaved into
+# its own VRF (see the "Adding Tenants Without a VM Restart" section of
+# README.md); frr-config's frr.conf runs a per-tenant BGP instance in that
+# VRF, and nmstate's own route-rules do the PBR that steers the networks
+# each instance advertises into that VRF - a flat, source-prefix-based
+# rule that scales to many tenants far better than binding an FRR pbr-map
+# to one fixed ingress interface.
 #
 # "eth-trunk" is identified below by the same fixed macAddress set on it
 # in the VirtualMachine spec (30-virtualmachine.yaml) - nmstate renames it
 # to "eth-trunk" itself as part of this apply, no udev/.link file/
 # initramfs involved.
 #
-# NetworkManager keyfiles can be used instead of/alongside nmstate by adding
-# a "*.nmconnection" key here - network-config-sync installs those directly
-# into /etc/NetworkManager/system-connections/.
+# Only nmstate documents ("*.yml"/"*.yaml" keys) are supported here - raw
+# NetworkManager ".nmconnection" keyfiles are not.
 apiVersion: v1
 kind: ConfigMap
 metadata:

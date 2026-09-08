@@ -9,11 +9,11 @@
 # watching the virtiofs mount): virtiofs doesn't reliably propagate the
 # host-side atomic symlink swap kubelet uses to update a mounted
 # ConfigMap as an inotify event into the guest, so relying on it left
-# both scripts triggering unreliably in practice. Both scripts always
-# re-apply in full rather than trying to skip unchanged content - cheap
-# and safe to re-run every 2min, and unlike a skip, can't get stuck
-# treating a config change as "already applied" when it wasn't (see each
-# script's own comment). bootc-image-sync.{service,path,timer} still
+# both binaries triggering unreliably in practice. Both always re-apply
+# in full rather than trying to skip unchanged content - cheap and safe
+# to re-run every 2min, and unlike a skip, can't get stuck treating a
+# config change as "already applied" when it wasn't (see config-sync/src
+# for the full control flow). bootc-image-sync.{service,path,timer} still
 # uses the .path+.timer combo (much longer 30min interval, and switching
 # images is comparatively rare/heavyweight, so a missed inotify event
 # there is a smaller/rarer cost than for these two).
@@ -42,6 +42,19 @@ WORKDIR /build
 COPY console/ .
 RUN cargo build --release --locked --target x86_64-unknown-linux-musl
 
+# config-sync (frr-config-sync + network-config-sync - see config-sync/src,
+# and the "Configuration Sync" section of README.md) replaces what used to
+# be two plain bash scripts. It talks to nmstate and to FRR's mgmtd vty
+# socket directly via Rust libraries instead of shelling out to
+# nmstatectl/vtysh for that part - see config-sync/src/network.rs and
+# config-sync/src/frr/vty.rs. Same musl-static-build reasoning as
+# console-builder above.
+FROM docker.io/library/rust:1-alpine AS config-sync-builder
+RUN apk add --no-cache musl-dev gcc
+WORKDIR /build
+COPY config-sync/ .
+RUN cargo build --release --locked --target x86_64-unknown-linux-musl
+
 FROM ${BASE_IMAGE}
 
 RUN dnf -y install \
@@ -68,11 +81,11 @@ COPY files/etc/sysctl.d/72-frr-bootc-console-quiet.conf /etc/sysctl.d/72-frr-boo
 # https://gitlab.com/fedora/bootc/examples/-/tree/main/cloud-init.
 COPY files/etc/cloud/cloud.cfg.d/10-bootc.cfg /etc/cloud/cloud.cfg.d/10-bootc.cfg
 
-COPY files/usr/local/bin/frr-config-sync /usr/local/bin/frr-config-sync
-COPY files/usr/local/bin/network-config-sync /usr/local/bin/network-config-sync
 COPY files/usr/local/bin/bootc-image-sync /usr/local/bin/bootc-image-sync
 COPY files/usr/local/bin/frr-console-reset-faillock /usr/local/bin/frr-console-reset-faillock
 COPY --from=console-builder /build/target/x86_64-unknown-linux-musl/release/frr-console /usr/local/bin/frr-console
+COPY --from=config-sync-builder /build/target/x86_64-unknown-linux-musl/release/frr-config-sync /usr/local/bin/frr-config-sync
+COPY --from=config-sync-builder /build/target/x86_64-unknown-linux-musl/release/network-config-sync /usr/local/bin/network-config-sync
 
 COPY files/usr/lib/systemd/system/run-config-frr.mount /usr/lib/systemd/system/run-config-frr.mount
 COPY files/usr/lib/systemd/system/run-config-network.mount /usr/lib/systemd/system/run-config-network.mount

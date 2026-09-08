@@ -33,12 +33,23 @@ documents how it's deployed at scale.
         │                            │
         ▼                            ▼
  frr-config-sync.service     network-config-sync.service
-   → /etc/frr/*                 → *.nmconnection to NetworkManager
-   → vtysh -C (validation)      → nmstatectl apply *.yml/*.yaml
+   → /etc/frr/*                 → nmstate crate .apply() on *.yml/*.yaml
+   → vty socket (validation)
    → frr-reload.py (live)
    → on daemons change:
      systemctl restart frr
 ```
+
+Both sync binaries are compiled from a single Rust crate,
+[`config-sync/`](config-sync/) (`frr-config-sync` and `network-config-sync`
+- see its own module docs for the full control flow). Everything that
+isn't nmstate/FRR configuration logic - staging, `rsync`, `chown`/`chmod`,
+`systemctl restart frr.service` - is still just a subprocess call, same as
+the bash scripts this replaced; only the nmstate apply and the FRR
+validation step now go through a library directly instead of shelling out
+to `nmstatectl`/`vtysh`. FRR's own `frr-reload.py` is kept as a subprocess
+call too - it's a mature, actively-maintained diff engine, not something
+worth reimplementing.
 
 Both config sources are mounted into the VM via **virtiofs** (not as a disk
 image). That's the way KubeVirt intends `ConfigMap`, `Secret` and
@@ -58,19 +69,21 @@ non-issue for planned changes like onboarding a new tenant.
 ### Why Two Separate Sync Paths?
 
 - **FRR configuration** (`frr.conf`, `daemons`, `vtysh.conf`) is
-  re-synced on every change. `frr.conf` changes are validated with
-  `vtysh -C` and then applied live via `frr-reload.py` (no restart, no
-  disruption of running sessions/adjacencies, as far as FRR allows for
-  that). If `daemons` changes (e.g. `bgpd` gets enabled), restarting
-  `frr.service` is unavoidable since that's what determines which daemon
-  processes are actually running.
-- **Network configuration** (`nmstate.yml`/`*.nmconnection`) is applied by
+  re-synced on every change. `frr.conf` changes are validated over FRR's
+  `mgmtd` vty Unix socket (a direct client, `config-sync/src/frr/vty.rs`
+  - the same transport `vtysh` itself uses, replacing `vtysh -C`) and then
+  applied live via `frr-reload.py` (no restart, no disruption of running
+  sessions/adjacencies, as far as FRR allows for that). If `daemons`
+  changes (e.g. `bgpd` gets enabled), restarting `frr.service` is
+  unavoidable since that's what determines which daemon processes are
+  actually running.
+- **Network configuration** (`nmstate.yml`) is applied by
   `network-config-sync.service`, which runs **after** `NetworkManager.service`
-  since `nmstatectl` requires a running NetworkManager. The VM's single
-  network device is identified by its fixed `macAddress` and named
-  "eth-trunk" by `nmstatectl apply` itself, as part of this same sync step
-  (see "A Trunk Instead of One NIC per Tenant" below) - no separate naming
-  step to sequence around.
+  since applying nmstate state requires a running NetworkManager. The VM's
+  single network device is identified by its fixed `macAddress` and named
+  "eth-trunk" by the `nmstate` crate's `.apply()` itself, as part of this
+  same sync step (see "A Trunk Instead of One NIC per Tenant" below) - no
+  separate naming step to sequence around.
 
 ## Configuration Format
 
@@ -87,19 +100,17 @@ See [`manifests/10-configmap-frr-config.yaml`](manifests/10-configmap-frr-config
 ### `network-config` ConfigMap → `/run/config/network`
 
 - `*.yml` / `*.yaml` — [nmstate](https://nmstate.io/) desired-state
-  documents, applied via `nmstatectl apply`. The VM's one and only network
-  device is identified by `identifier: mac-address`/`mac-address:` against
-  its fixed `macAddress` (set in the `VirtualMachine` spec) and named
-  "eth-trunk" by nmstate itself as part of the same apply (see "A Trunk
-  Instead of One NIC per Tenant" below), so every other VLAN sub-interface
-  in the same document can just refer to `eth-trunk` directly as
-  `base-iface`.
-- `*.nmconnection` — raw NetworkManager keyfiles, installed into
-  `/etc/NetworkManager/system-connections/` and activated.
+  documents, applied via the `nmstate` crate directly (`NetworkState::
+  new_from_yaml(...).apply()` in `config-sync/src/network.rs` - no
+  `nmstatectl` subprocess). The VM's one and only network device is
+  identified by `identifier: mac-address`/`mac-address:` against its fixed
+  `macAddress` (set in the `VirtualMachine` spec) and named "eth-trunk" by
+  nmstate itself as part of the same apply (see "A Trunk Instead of One
+  NIC per Tenant" below), so every other VLAN sub-interface in the same
+  document can just refer to `eth-trunk` directly as `base-iface`.
 
-Both formats (nmstate and NetworkManager keyfiles) can be used at the same
-time - it just depends on which file extension the respective keys in the
-ConfigMap have.
+Only `*.yml`/`*.yaml` (nmstate) files are supported - raw NetworkManager
+`.nmconnection` keyfiles are not.
 
 See [`manifests/11-configmap-network-config.yaml`](manifests/11-configmap-network-config.yaml).
 
@@ -125,7 +136,7 @@ tenant count, and no separate pod/masquerade "default" network either:
 A fixed, deterministic `macAddress` is set for it in the `VirtualMachine`
 spec, and `network-config`'s `nmstate.yml` identifies the device by that
 same MAC (`identifier: mac-address`, `mac-address: <...>`) and names it
-"eth-trunk" as part of the normal `nmstatectl apply` done by
+"eth-trunk" as part of the normal nmstate apply done by
 `network-config-sync.service` at boot - no udev `.link` file, no
 initramfs rebuild step, nothing that has to run before the real root
 filesystem is even mounted. Whoever generates the `VirtualMachine`
@@ -310,7 +321,7 @@ touches neither the `VirtualMachine` nor the `NetworkAttachmentDefinition`
    `router bgp ... vrf ...` instance for the new tenant.
 
 `frr-config-sync.timer` and `network-config-sync.timer` pick up both
-changes automatically (up to ~2min) - `nmstatectl apply` creates the new
+changes automatically (up to ~2min) - the nmstate apply creates the new
 VLAN sub-interface without disturbing the existing interfaces or other
 tenants' running BGP sessions. At this scale, the ConfigMap contents are
 best generated (Helm/Kustomize/your own script) rather than hand-maintained;
@@ -330,7 +341,7 @@ KubeVirt doesn't hot-plug bridge interfaces.
 > Changes to already-existing interfaces (IP addresses, routing, new VLAN
 > sub-interfaces on the trunk), on the other hand, are picked up **without
 > a restart** via `network-config-sync.timer` (up to ~2min), live, through
-> `nmstate.yml`/`*.nmconnection`.
+> `nmstate.yml`.
 
 ## bootc Image Tracking
 
@@ -682,11 +693,11 @@ serial console).
   see "Console Dashboard" above)
 - Both `frr-config-sync` and `network-config-sync` run on a 2min timer only
   (no inotify) and always re-apply, whether or not the ConfigMap actually
-  changed - `vtysh -C`/`rsync`/`frr-reload.py`/`nmstatectl apply`/`nmcli`
-  are all cheap and safe to re-run, so expect a change to take up to ~2min
-  to land, not immediately.
-- FRR validation failures also end up in `/tmp/frr-config-check.log`
-  inside the VM.
+  changed - the FRR vty validation, `rsync`, `frr-reload.py`, and the
+  nmstate apply are all cheap and safe to re-run, so expect a change to
+  take up to ~2min to land, not immediately.
+- FRR validation failures are logged in full via
+  `journalctl -u frr-config-sync.service` (passwords redacted).
 - `nmstatectl show` or `nmcli connection show` to check the current network
   state.
 - If the trunk NIC shows up as `enp3s0` (or another kernel-assigned name)
