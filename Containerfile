@@ -36,9 +36,17 @@ ARG BASE_IMAGE=quay.io/fedora/fedora-bootc:44
 # a musl binary has no runtime libc of its own to version-mismatch against
 # the final Fedora image's glibc, which sidesteps that question outright
 # instead of relying on this builder's glibc happening to be old enough.
+# frr-vty (see frr-vty/src/lib.rs) is a small, dependency-free crate
+# implementing FRR's vty Unix-socket protocol directly - shared as a
+# `path = "../frr-vty"` dependency between console (read-only status
+# queries) and config-sync (frr.conf validation), so neither pulls in
+# the other's unrelated dependencies. Both builder stages below need it
+# copied alongside their own crate, at the same relative path their
+# Cargo.toml's `../frr-vty` expects.
 FROM docker.io/library/rust:1-alpine AS console-builder
 RUN apk add --no-cache musl-dev gcc
 WORKDIR /build
+COPY frr-vty/ /frr-vty/
 COPY console/ .
 RUN cargo build --release --locked --target x86_64-unknown-linux-musl
 
@@ -47,11 +55,12 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-musl
 # be two plain bash scripts. It talks to nmstate and to FRR's mgmtd vty
 # socket directly via Rust libraries instead of shelling out to
 # nmstatectl/vtysh for that part - see config-sync/src/network.rs and
-# config-sync/src/frr/vty.rs. Same musl-static-build reasoning as
-# console-builder above.
+# frr-vty/src/lib.rs. Same musl-static-build reasoning as console-builder
+# above.
 FROM docker.io/library/rust:1-alpine AS config-sync-builder
 RUN apk add --no-cache musl-dev gcc
 WORKDIR /build
+COPY frr-vty/ /frr-vty/
 COPY config-sync/ .
 RUN cargo build --release --locked --target x86_64-unknown-linux-musl
 

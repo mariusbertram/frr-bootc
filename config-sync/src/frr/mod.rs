@@ -1,13 +1,11 @@
-pub mod vty;
-
 use std::fs;
 use std::io;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use frr_vty::VtyClient;
 
 use crate::{is_empty_source, list_names, redact_passwords, Logger, Runner};
-use vty::VtyClient;
 
 /// mgmtd's vty socket - frr-bootc runs with `mgmtd=yes` and `service
 /// integrated-vtysh-config`, so mgmtd owns the whole integrated

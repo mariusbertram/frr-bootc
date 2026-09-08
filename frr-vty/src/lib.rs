@@ -1,6 +1,9 @@
 //! Direct client for FRR's vty Unix-socket protocol - the same transport
 //! `vtysh` itself uses to talk to each daemon's `/var/run/frr/<daemon>.vty`
-//! socket. Protocol, confirmed from FRR's own `vtysh/vtysh.c` source:
+//! socket. Shared between `config-sync` (validating/applying `frr.conf`)
+//! and `console` (read-only status queries), kept dependency-free so
+//! neither pulls in the other's unrelated dependencies. Protocol,
+//! confirmed from FRR's own `vtysh/vtysh.c` source:
 //!
 //! - **Request**: the raw command bytes, followed by exactly one `0x00`.
 //! - **Response**: text output, followed by a 4-byte terminator of three

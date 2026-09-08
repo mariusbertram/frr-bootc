@@ -381,11 +381,16 @@ name = "frr-console"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "frr-vty",
  "libc",
  "ratatui",
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "frr-vty"
+version = "0.1.0"
 
 [[package]]
 name = "futures-core"

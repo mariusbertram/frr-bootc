@@ -70,9 +70,10 @@ non-issue for planned changes like onboarding a new tenant.
 
 - **FRR configuration** (`frr.conf`, `daemons`, `vtysh.conf`) is
   re-synced on every change. `frr.conf` changes are validated over FRR's
-  `mgmtd` vty Unix socket (a direct client, `config-sync/src/frr/vty.rs`
-  - the same transport `vtysh` itself uses, replacing `vtysh -C`) and then
-  applied live via `frr-reload.py` (no restart, no disruption of running
+  `mgmtd` vty Unix socket (a direct client, [`frr-vty/`](frr-vty/) - the
+  same transport `vtysh` itself uses, replacing `vtysh -C`; also used by
+  the console dashboard for its own read-only FRR status queries) and
+  then applied live via `frr-reload.py` (no restart, no disruption of running
   sessions/adjacencies, as far as FRR allows for that). If `daemons`
   changes (e.g. `bgpd` gets enabled), restarting `frr.service` is
   unavoidable since that's what determines which daemon processes are
@@ -517,12 +518,16 @@ refreshes (an interface's address line coming and going, a VRF's BGP peers
 appearing/disappearing, ...) - a class of bug an earlier, hand-rolled
 cursor-position/erase-sequence bash version of this dashboard had to
 chase down one escape sequence at a time. Every subprocess call
-(`systemctl`, `ip`, `vtysh`, `bootc`) has its stdout/stderr explicitly
-captured or discarded, never left to inherit the console's own - letting
+(`systemctl`, `ip`, `bootc`) has its stdout/stderr explicitly captured or
+discarded, never left to inherit the console's own - letting
 even one leak through corrupts the frame with raw, unstyled text stomped
 into the middle of the drawn output, which happened for real with an
 earlier `systemctl is-active`/`is-failed` call that only checked the exit
-code but still let the printed status word through.
+code but still let the printed status word through. FRR status
+(`console/src/frr.rs`) isn't one of those subprocess calls at all - it
+queries each daemon's vty socket directly via [`frr-vty/`](frr-vty/),
+the same client `frr-config-sync` uses, so there's no `vtysh` stdout to
+worry about leaking through in the first place.
 
 Subprocess stdout isn't the only source of stray text on the console,
 though: the kernel's own `printk` messages (interface/driver events,
