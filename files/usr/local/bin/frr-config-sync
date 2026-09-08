@@ -23,6 +23,15 @@ LOCK=/run/frr-config-sync.lock
 log() { echo "frr-config-sync: $*"; }
 err() { echo "frr-config-sync: ERROR: $*" >&2; }
 
+# Both vtysh -C's error output and frr-reload.py's own output can echo
+# back full config lines - including a BGP neighbor's cleartext
+# "password" line (MD5 auth) if one happens to be near whatever it's
+# reporting on. Every place either gets logged goes through this first,
+# so a peer's password can't end up sitting in journalctl in the clear.
+redact_passwords() {
+    sed -E 's/^([[:space:]]*neighbor[[:space:]]+[^[:space:]]+[[:space:]]+password[[:space:]]+).*/\1<REDACTED>/'
+}
+
 exec {LOCKFD}>"$LOCK"
 if ! flock -n "$LOCKFD"; then
     log "another run is already in progress, skipping"
@@ -51,7 +60,8 @@ cp -a "$SRC"/. "$stage"/
 
 if [ -f "$stage/frr.conf" ]; then
     log "validating staged frr.conf (vtysh -f <staged> -C)"
-    if ! vtysh -f "$stage/frr.conf" -C >/tmp/frr-config-check.log 2>&1; then
+    if ! check_out=$(vtysh -f "$stage/frr.conf" -C 2>&1); then
+        echo "$check_out" | redact_passwords >/tmp/frr-config-check.log
         err "staged frr.conf failed validation, keeping the currently running config unchanged."
         err "full 'vtysh -C' output (also saved to /tmp/frr-config-check.log):"
         cat /tmp/frr-config-check.log >&2
@@ -88,10 +98,10 @@ else
     log "reloading frr configuration (frr-reload.py --reload)"
     if reload_out=$(/usr/libexec/frr/frr-reload.py --reload --stdout "$DST/frr.conf" 2>&1); then
         log "frr-reload.py succeeded"
-        [ -n "$reload_out" ] && echo "$reload_out" | sed 's/^/frr-config-sync:   /'
+        [ -n "$reload_out" ] && echo "$reload_out" | redact_passwords | sed 's/^/frr-config-sync:   /'
     else
         err "frr-reload.py failed (exit $?), full output:"
-        echo "$reload_out" | sed 's/^/frr-config-sync:   /' >&2
+        echo "$reload_out" | redact_passwords | sed 's/^/frr-config-sync:   /' >&2
         log "falling back to systemctl restart frr.service"
         if systemctl restart frr.service; then
             log "frr.service restarted successfully (fallback)"

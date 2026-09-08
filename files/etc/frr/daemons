@@ -26,9 +26,9 @@ pathd=no
 mgmtd=yes
 
 vtysh_enable=yes
-zebra_options="   -A 127.0.0.1 -s 90000000"
+zebra_options="   -A 127.0.0.1 -s 90000000 --limit-fds 100000"
 mgmtd_options="   -A 127.0.0.1"
-bgpd_options="    -A 127.0.0.1"
+bgpd_options="    -A 127.0.0.1 --limit-fds 100000"
 ospfd_options="   -A 127.0.0.1"
 ospf6d_options="  -A ::1"
 ripd_options="    -A 127.0.0.1"
@@ -42,8 +42,16 @@ eigrpd_options="  -A 127.0.0.1"
 babeld_options="  -A 127.0.0.1"
 sharpd_options="  -A 127.0.0.1"
 pbrd_options="    -A 127.0.0.1"
-staticd_options=" -A 127.0.0.1"
-bfdd_options="    -A 127.0.0.1"
+staticd_options=" -A 127.0.0.1 --limit-fds 100000"
+bfdd_options="    -A 127.0.0.1 --limit-fds 100000"
 fabricd_options=" -A 127.0.0.1"
 vrrpd_options="   -A 127.0.0.1"
 pathd_options="   -A 127.0.0.1"
+
+# Read at startup by /etc/init.d/frr-style tooling to set the daemons'
+# own ulimit before exec'ing them - matters for bgpd/zebra specifically
+# on a router meant to scale to many BGP-coupled tenants (this repo's
+# own scaling example is "150", see the README's "A Trunk Instead of
+# One NIC per Tenant" section), where each peer/VRF socket eats into the
+# default (usually 1024) fd limit.
+MAX_FDS=100000
