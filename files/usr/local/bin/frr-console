@@ -48,6 +48,23 @@ else
     c_bold=""; c_reset=""; c_green=""; c_red=""; c_yellow=""
 fi
 
+# Cursor-home + erase-to-end-of-screen, cached once like the color codes
+# above. Used instead of `clear` on every redraw: `clear` erases the
+# whole screen before drawing the new frame, so the terminal shows a
+# blank flash between frames - the classic cause of a "flickering"
+# status dashboard. Moving the cursor home and overwriting the old frame
+# in place, only erasing whatever's left over *after* the new content is
+# already on screen, never shows a blank frame. cup/ed are basic
+# terminfo capabilities supported by essentially every terminal a login
+# session could show up on (vt100, linux, xterm, ...) - more universal
+# than 8-color support even - so this isn't gated behind use_color.
+cap_home=""
+cap_eed=""
+if [ "$interactive" = "1" ] && command -v tput >/dev/null 2>&1; then
+    cap_home=$(tput cup 0 0 2>/dev/null) || cap_home=""
+    cap_eed=$(tput ed 2>/dev/null) || cap_eed=""
+fi
+
 # Per-interface throughput is a delta between two samples, not something
 # a single `ip`/`/sys` read gives you - these hold the previous sample
 # across loop iterations (render() runs in the same long-lived process,
@@ -273,11 +290,25 @@ fi
 
 trap '' INT
 
+# Only the very first draw of this process needs a real `clear`: the
+# screen could be showing anything at that point (boot messages, this
+# unit's own startup, systemd's own log lines). Every redraw after that
+# is overwriting this same script's own previous frame, which has the
+# same shape line to line (fixed-width fields), so cursor-home +
+# erase-to-end-of-screen (see cap_home/cap_eed above) is safe and doesn't
+# flash - the whole reason this loop stopped using `clear` every cycle.
+first_frame=1
+
 while true; do
-    clear
-    render
-    hr
-    printf 'Refreshing every %ss - [b] log in for a shell   [r] refresh now\n' "$REFRESH_SECS"
+    frame=$(render; hr; printf 'Refreshing every %ss - [b] log in for a shell   [r] refresh now\n' "$REFRESH_SECS")
+    if [ "$first_frame" = "1" ] || [ -z "$cap_home" ]; then
+        clear
+    else
+        printf '%s' "$cap_home"
+    fi
+    printf '%s\n' "$frame"
+    [ -n "$cap_eed" ] && printf '%s' "$cap_eed"
+    first_frame=0
     key=""
     read -rsn1 -t "$REFRESH_SECS" key || true
     case "$key" in
