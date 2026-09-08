@@ -19,6 +19,16 @@
 # there is a smaller/rarer cost than for these two).
 # See README.md for the full architecture and deployment manifests.
 
+# BASE_IMAGE has to stay declared here, before ANY "FROM" - an ARG's value
+# is only visible to a later "FROM <image>" instruction's own image-name
+# substitution when the ARG was declared before the *first* FROM in the
+# file; declared after one (even in an earlier, unrelated build stage like
+# console-builder below), it's scoped to that stage's instructions and
+# doesn't carry into a later stage's FROM line, which resolved to a blank
+# image name and failed the build ("base name (${BASE_IMAGE}) should not
+# be blank") the one time this got tried the other way round.
+ARG BASE_IMAGE=quay.io/fedora/fedora-bootc:44
+
 # frr-console (the console dashboard - see console/src/main.rs, and the
 # "Console Dashboard" section of README.md) is a separate Rust crate built
 # on ratatui, compiled here in its own stage rather than installing a Rust
@@ -32,7 +42,6 @@ WORKDIR /build
 COPY console/ .
 RUN cargo build --release --locked --target x86_64-unknown-linux-musl
 
-ARG BASE_IMAGE=quay.io/fedora/fedora-bootc:44
 FROM ${BASE_IMAGE}
 
 RUN dnf -y install \
