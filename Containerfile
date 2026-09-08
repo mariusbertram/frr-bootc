@@ -55,6 +55,7 @@ RUN dnf -y install \
         audit \
         cloud-init \
         tcpdump \
+        qemu-guest-agent \
     && dnf clean all
 
 COPY files/etc/frr/daemons /etc/frr/daemons
@@ -111,6 +112,7 @@ RUN chmod 0755 \
         NetworkManager.service \
         auditd.service \
         cloud-init.target \
+        qemu-guest-agent.service \
         frr-config-sync.service \
         frr-config-sync.timer \
         network-config-sync.service \
