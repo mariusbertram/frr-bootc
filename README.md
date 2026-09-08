@@ -582,7 +582,7 @@ user-data, e.g.:
 ```yaml
 #cloud-config
 users:
-  - name: fedora
+  - name: admin
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: false        # cloud-init locks the account otherwise,
                                # even with hashed_passwd set below
@@ -599,8 +599,22 @@ cloud-init doesn't pass `--shell` to `useradd` at all, so the account gets
 whatever this image's `useradd` default resolves to - not guaranteed to be
 an interactive shell. When it isn't, `/bin/login` still authenticates the
 password fine, then has nothing to exec into, so `b` drops the operator
-right back out with no shell. `getent passwd <user>` on the VM shows the
-account's actual shell field if this needs confirming.
+right back out with no shell (`login`'s own "no shell: Permission denied"
+message). `getent passwd <user>` on the VM shows the account's actual
+shell field if this needs confirming.
+
+**Use a name other than `fedora` for this**, as in the example above -
+`fedora` is fedora-bootc's own cloud-init `default_user`, created on
+first boot by the base image's *own* `/etc/cloud/cloud.cfg` before your
+`#cloud-config`'s `users:` list is even processed. cloud-init then sees an
+account by that name already exists and only layers
+password/`lock_passwd`/SSH-key config from your entry onto it - the
+useradd-only options, `shell:` included, are silently skipped for an
+account that already exists. This is exactly the "I set `shell:` and it's
+still broken" trap: the fix isn't the key, it's the name collision. If
+`fedora` has to stay the name, `usermod -s /bin/bash fedora` in a
+`runcmd:` fixes it unconditionally instead, since that runs regardless of
+whether cloud-init's own user-creation code path touched the account.
 
 Even with that right, a real password can still get rejected: typing it
 wrong a couple of times trips `pam_faillock`'s default lockout (3
