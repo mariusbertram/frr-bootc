@@ -1,0 +1,23 @@
+[package]
+name = "config-sync"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "config_sync"
+path = "src/lib.rs"
+
+[[bin]]
+name = "frr-config-sync"
+path = "src/bin/frr-config-sync.rs"
+
+[[bin]]
+name = "network-config-sync"
+path = "src/bin/network-config-sync.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2.189"
+nmstate = "2.2"
+tempfile = "3"

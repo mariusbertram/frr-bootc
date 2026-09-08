@@ -3,8 +3,10 @@ Description=Sync FRR configuration from the mounted frr-config ConfigMap
 RequiresMountsFor=/run/config/frr
 
 [Service]
-Type=oneshot
+Type=simple
 ExecStart=/usr/local/bin/frr-config-sync
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

@@ -7,7 +7,7 @@ use std::process::Command;
 use crate::frr::{self, FrrStatus};
 use crate::net::{Interface, ThroughputSampler};
 use crate::system::{self, DiskInfo, MemInfo};
-use crate::systemd::{self, SyncHealth};
+use crate::systemd::{self, SyncHealth, SyncKind};
 
 pub struct SyncUnit {
     pub label: &'static str,
@@ -30,21 +30,31 @@ pub struct Snapshot {
     pub bootc_status: Option<String>,
 }
 
-const SYNC_UNITS: &[(&str, &str, &str)] = &[
+/// frr-config-sync/network-config-sync are persistent daemons now (no
+/// `.timer` - see the Containerfile's top comment), health comes from
+/// whether the process is up plus the status file it writes after every
+/// attempt. bootc-image-sync is still the older oneshot+`.timer` shape.
+const SYNC_UNITS: &[(&str, &str, SyncKind)] = &[
     (
         "FRR config sync",
         "frr-config-sync.service",
-        "frr-config-sync.timer",
+        SyncKind::Daemon {
+            status_file: "/run/frr-config-sync.status",
+        },
     ),
     (
         "Network config sync",
         "network-config-sync.service",
-        "network-config-sync.timer",
+        SyncKind::Daemon {
+            status_file: "/run/network-config-sync.status",
+        },
     ),
     (
         "bootc image sync",
         "bootc-image-sync.service",
-        "bootc-image-sync.timer",
+        SyncKind::Timer {
+            timer: "bootc-image-sync.timer",
+        },
     ),
 ];
 
@@ -64,10 +74,10 @@ pub fn gather(net: &mut ThroughputSampler) -> Snapshot {
         frr: frr::gather(frr_service_active),
         sync_units: SYNC_UNITS
             .iter()
-            .map(|(label, service, timer)| SyncUnit {
+            .map(|(label, service, kind)| SyncUnit {
                 label,
                 service,
-                health: systemd::sync_health(service, timer),
+                health: systemd::sync_health(service, kind),
             })
             .collect(),
         bootc_status: bootc_status(),

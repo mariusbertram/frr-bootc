@@ -3,20 +3,26 @@
 #
 # FRR and network configuration are not baked into the image; they are
 # mounted at runtime from Kubernetes ConfigMaps (via virtiofs) and kept in
-# sync by frr-config-sync.{service,timer} and
-# network-config-sync.{service,timer} - a periodic poll (every 2min) is
-# the ONLY trigger for both, deliberately not inotify (a "*.path" unit
-# watching the virtiofs mount): virtiofs doesn't reliably propagate the
-# host-side atomic symlink swap kubelet uses to update a mounted
-# ConfigMap as an inotify event into the guest, so relying on it left
-# both scripts triggering unreliably in practice. Both scripts always
-# re-apply in full rather than trying to skip unchanged content - cheap
-# and safe to re-run every 2min, and unlike a skip, can't get stuck
-# treating a config change as "already applied" when it wasn't (see each
-# script's own comment). bootc-image-sync.{service,path,timer} still
-# uses the .path+.timer combo (much longer 30min interval, and switching
-# images is comparatively rare/heavyweight, so a missed inotify event
-# there is a smaller/rarer cost than for these two).
+# sync by frr-config-sync.service and network-config-sync.service - each
+# a persistent daemon (Type=simple, Restart=always, started once at boot)
+# that polls its ConfigMap on its own internal ~2min interval
+# (config_sync::POLL_INTERVAL), not a systemd .timer anymore. Still a
+# plain poll, deliberately not inotify (a "*.path" unit watching the
+# virtiofs mount): virtiofs doesn't reliably propagate the host-side
+# atomic symlink swap kubelet uses to update a mounted ConfigMap as an
+# inotify event into the guest, so relying on it left both triggering
+# unreliably in practice. Both always re-apply in full rather than trying
+# to skip unchanged content - cheap and safe to re-run every ~2min, and
+# unlike a skip, can't get stuck treating a config change as "already
+# applied" when it wasn't (see config-sync/src for the full control
+# flow). Each writes a one-line status file after every attempt
+# (/run/{frr,network}-config-sync.status) that the console dashboard
+# reads for "did the last sync succeed" - the daemon's own exit code no
+# longer means that, since a single failed attempt just logs and retries
+# next tick instead of exiting. bootc-image-sync.{service,path,timer}
+# still uses the oneshot+.path+.timer combo (much longer 30min interval,
+# and switching images is comparatively rare/heavyweight, so a missed
+# inotify event there is a smaller/rarer cost than for these two).
 # See README.md for the full architecture and deployment manifests.
 
 # BASE_IMAGE has to stay declared here, before ANY "FROM" - an ARG's value
@@ -36,10 +42,31 @@ ARG BASE_IMAGE=quay.io/fedora/fedora-bootc:44
 # a musl binary has no runtime libc of its own to version-mismatch against
 # the final Fedora image's glibc, which sidesteps that question outright
 # instead of relying on this builder's glibc happening to be old enough.
+# frr-vty (see frr-vty/src/lib.rs) is a small, dependency-free crate
+# implementing FRR's vty Unix-socket protocol directly, used by console
+# for its own read-only FRR status queries - a `path = "../frr-vty"`
+# dependency, so it needs copying alongside console/ at the same
+# relative path its Cargo.toml expects. config-sync does NOT depend on
+# it (frr.conf validation goes through `vtysh -C` as a subprocess
+# instead - see config-sync/src/frr/mod.rs's `validate()` doc comment
+# for why a vty-socket approach was tried there and reverted).
 FROM docker.io/library/rust:1-alpine AS console-builder
 RUN apk add --no-cache musl-dev gcc
 WORKDIR /build
+COPY frr-vty/ /frr-vty/
 COPY console/ .
+RUN cargo build --release --locked --target x86_64-unknown-linux-musl
+
+# config-sync (frr-config-sync + network-config-sync - see config-sync/src,
+# and the "Configuration Sync" section of README.md) replaces what used to
+# be two plain bash scripts. It talks to nmstate directly via the
+# `nmstate` Rust crate instead of shelling out to nmstatectl - see
+# config-sync/src/network.rs. Same musl-static-build reasoning as
+# console-builder above.
+FROM docker.io/library/rust:1-alpine AS config-sync-builder
+RUN apk add --no-cache musl-dev gcc
+WORKDIR /build
+COPY config-sync/ .
 RUN cargo build --release --locked --target x86_64-unknown-linux-musl
 
 FROM ${BASE_IMAGE}
@@ -62,25 +89,25 @@ COPY files/etc/frr/frr.conf /etc/frr/frr.conf
 COPY files/etc/frr/vtysh.conf /etc/frr/vtysh.conf
 COPY files/etc/sysctl.d/71-frr-bootc-forwarding.conf /etc/sysctl.d/71-frr-bootc-forwarding.conf
 COPY files/etc/sysctl.d/72-frr-bootc-console-quiet.conf /etc/sysctl.d/72-frr-bootc-console-quiet.conf
+COPY files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf /etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf
+COPY files/etc/modules-load.d/vrf.conf /etc/modules-load.d/vrf.conf
 # fedora-bootc doesn't include cloud-init's own image-mode drop-in (unlike
 # quay.io/centos-bootc): growpart must target /sysroot, not /, since that's
 # where the real root filesystem is mounted in image mode. See
 # https://gitlab.com/fedora/bootc/examples/-/tree/main/cloud-init.
 COPY files/etc/cloud/cloud.cfg.d/10-bootc.cfg /etc/cloud/cloud.cfg.d/10-bootc.cfg
 
-COPY files/usr/local/bin/frr-config-sync /usr/local/bin/frr-config-sync
-COPY files/usr/local/bin/network-config-sync /usr/local/bin/network-config-sync
 COPY files/usr/local/bin/bootc-image-sync /usr/local/bin/bootc-image-sync
 COPY files/usr/local/bin/frr-console-reset-faillock /usr/local/bin/frr-console-reset-faillock
 COPY --from=console-builder /build/target/x86_64-unknown-linux-musl/release/frr-console /usr/local/bin/frr-console
+COPY --from=config-sync-builder /build/target/x86_64-unknown-linux-musl/release/frr-config-sync /usr/local/bin/frr-config-sync
+COPY --from=config-sync-builder /build/target/x86_64-unknown-linux-musl/release/network-config-sync /usr/local/bin/network-config-sync
 
 COPY files/usr/lib/systemd/system/run-config-frr.mount /usr/lib/systemd/system/run-config-frr.mount
 COPY files/usr/lib/systemd/system/run-config-network.mount /usr/lib/systemd/system/run-config-network.mount
 COPY files/usr/lib/systemd/system/run-config-bootc.mount /usr/lib/systemd/system/run-config-bootc.mount
 COPY files/usr/lib/systemd/system/frr-config-sync.service /usr/lib/systemd/system/frr-config-sync.service
-COPY files/usr/lib/systemd/system/frr-config-sync.timer /usr/lib/systemd/system/frr-config-sync.timer
 COPY files/usr/lib/systemd/system/network-config-sync.service /usr/lib/systemd/system/network-config-sync.service
-COPY files/usr/lib/systemd/system/network-config-sync.timer /usr/lib/systemd/system/network-config-sync.timer
 COPY files/usr/lib/systemd/system/bootc-image-sync.service /usr/lib/systemd/system/bootc-image-sync.service
 COPY files/usr/lib/systemd/system/bootc-image-sync.path /usr/lib/systemd/system/bootc-image-sync.path
 COPY files/usr/lib/systemd/system/bootc-image-sync.timer /usr/lib/systemd/system/bootc-image-sync.timer
@@ -113,9 +140,7 @@ RUN chmod 0755 \
         cloud-init.target \
         qemu-guest-agent.service \
         frr-config-sync.service \
-        frr-config-sync.timer \
         network-config-sync.service \
-        network-config-sync.timer \
         bootc-image-sync.service \
         bootc-image-sync.path \
         bootc-image-sync.timer \

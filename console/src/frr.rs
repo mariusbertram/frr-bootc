@@ -1,18 +1,27 @@
-//! FRR status via `vtysh`. There's no stable library API to link against,
-//! so this talks to the same CLI a human would, exactly like the bash
-//! version of this dashboard did - but asking it for `json` output rather
-//! than parsing the human-readable tables: those tables' exact column
-//! layout and section-header wording turned out to vary between what this
-//! was originally written against and what a real, live FRR instance
-//! actually prints (see git history - a whole VRF's peers silently ended
-//! up folded into "default" because a header line's format didn't match
-//! what the text parser assumed). JSON has a stable, documented schema
-//! instead of a layout that has to be reverse-engineered from output.
+//! FRR status via direct connections to each daemon's vty Unix socket
+//! (`frr_vty`, shared with `config-sync`) rather than shelling out to
+//! `vtysh` - one less process spawned per refresh, and the exact same
+//! transport `vtysh` itself uses under the hood. Status is asked for as
+//! `json` rather than parsed from the human-readable tables: those
+//! tables' exact column layout and section-header wording turned out to
+//! vary between what this was originally written against and what a
+//! real, live FRR instance actually prints (see git history - a whole
+//! VRF's peers silently ended up folded into "default" because a header
+//! line's format didn't match what the text parser assumed). JSON has a
+//! stable, documented schema instead of a layout that has to be
+//! reverse-engineered from output.
 
 use std::collections::BTreeMap;
-use std::process::Command;
+use std::fs;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 
+use frr_vty::VtyClient;
 use serde::Deserialize;
+
+const FRR_RUN_DIR: &str = "/var/run/frr";
+const ZEBRA_SOCKET: &str = "/var/run/frr/zebra.vty";
+const BGPD_SOCKET: &str = "/var/run/frr/bgpd.vty";
 
 pub struct FrrStatus {
     pub daemons: String,
@@ -23,8 +32,8 @@ pub struct FrrStatus {
 
 /// `frr.service`'s own active/inactive state lives on `Snapshot` directly
 /// (it's read once up front, before deciding whether it's even worth
-/// asking `vtysh` anything) - this only covers what's queried through
-/// `vtysh`, which is skipped entirely when the service isn't up.
+/// querying any daemon socket) - this only covers what's queried below,
+/// which is skipped entirely when the service isn't up.
 pub fn gather(service_active: bool) -> FrrStatus {
     if !service_active {
         return FrrStatus {
@@ -34,15 +43,16 @@ pub fn gather(service_active: bool) -> FrrStatus {
         };
     }
 
-    // No separate "is vtysh even installed" pre-check: vtysh() already
-    // returns an empty string on any failure, binary missing included, so
-    // the rest of this falls through to the same empty/no-op result
-    // either way - one less process spawned per refresh for the common
-    // case where it's simply there.
-    let daemons = vtysh("show daemons").trim().to_string();
-    let route_summary = parse_route_summary(&vtysh("show ip route summary json"));
+    let daemons = list_daemons();
+    let route_summary = parse_route_summary(&query(
+        Path::new(ZEBRA_SOCKET),
+        "show ip route summary json",
+    ));
     let bgp_vrf_peers = if daemons.split_whitespace().any(|d| d == "bgpd") {
-        parse_bgp_vrf_summary(&vtysh("show bgp vrf all summary json"))
+        parse_bgp_vrf_summary(&query(
+            Path::new(BGPD_SOCKET),
+            "show bgp vrf all summary json",
+        ))
     } else {
         Vec::new()
     };
@@ -54,14 +64,46 @@ pub fn gather(service_active: bool) -> FrrStatus {
     }
 }
 
-fn vtysh(cmd: &str) -> String {
-    Command::new("vtysh")
-        .args(["-c", cmd])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+/// Space-separated, alphabetically sorted list of daemons whose vty
+/// socket is present *and* currently accepting connections - the same
+/// shape `vtysh`'s own `show daemons` produces (a plain list of names,
+/// used elsewhere via `.split_whitespace().any(|d| d == "bgpd")`), but
+/// derived directly from socket liveness rather than a vtysh-internal
+/// command with no single backend to query instead.
+fn list_daemons() -> String {
+    let Ok(entries) = fs::read_dir(FRR_RUN_DIR) else {
+        return String::new();
+    };
+
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("vty") {
+                return None;
+            }
+            UnixStream::connect(&path).ok()?;
+            path.file_stem()?.to_str().map(str::to_string)
+        })
+        .collect();
+
+    names.sort();
+    names.join(" ")
+}
+
+/// Runs one command against a daemon's vty socket, returning its output
+/// on success or an empty string on any failure (connection refused,
+/// timeout, non-zero status) - same best-effort fallback the old `vtysh`
+/// subprocess helper had, so a daemon being down just blanks that part
+/// of the dashboard instead of erroring.
+fn query(socket_path: &Path, cmd: &str) -> String {
+    let Ok(mut client) = VtyClient::connect(socket_path) else {
+        return String::new();
+    };
+    match client.execute(cmd) {
+        Ok(resp) if resp.success() => resp.output,
+        _ => String::new(),
+    }
 }
 
 #[derive(Deserialize)]

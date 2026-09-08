@@ -27,50 +27,79 @@ documents how it's deployed at scale.
  /run/config/frr (ro)        /run/config/network (ro)
         │                            │
         ▼                            ▼
- frr-config-sync.timer       network-config-sync.timer
- (2min poll - the only       (2min poll - the only
-  trigger; see below)         trigger; see below)
-        │                            │
-        ▼                            ▼
  frr-config-sync.service     network-config-sync.service
-   → /etc/frr/*                 → *.nmconnection to NetworkManager
-   → vtysh -C (validation)      → nmstatectl apply *.yml/*.yaml
+ (persistent daemon,         (persistent daemon,
+  polls internally, no        polls internally, no
+  .timer; see below)          .timer; see below)
+   → /etc/frr/*                 → nmstate crate .apply() on *.yml/*.yaml
+   → vtysh -C (validation)
    → frr-reload.py (live)
    → on daemons change:
      systemctl restart frr
 ```
+
+Both sync binaries are compiled from a single Rust crate,
+[`config-sync/`](config-sync/) (`frr-config-sync` and `network-config-sync`
+- see its own module docs for the full control flow). Everything that
+isn't nmstate configuration logic - staging, FRR config validation
+(`vtysh -C`) and reload (`frr-reload.py`), `rsync`, `chown`/`chmod`,
+`systemctl restart frr.service` - is still just a subprocess call, same as
+the bash scripts this replaced; only the network config apply goes
+through the `nmstate` crate directly instead of shelling out to
+`nmstatectl`. An earlier version of this also replaced `vtysh -C` with a
+direct vty-socket client, reasoning that mgmtd exposes a candidate/commit/
+abort datastore over its vty socket the same way vtysh's `-C` uses - that
+reasoning was wrong (FRR's actual transactional datastore is behind a
+*different*, protobuf-based socket; a daemon's plain `.vty` socket,
+mgmtd's included, is the same immediate-apply legacy CLI every daemon has
+always exposed) and has been reverted: `vtysh -C` is FRR's own actually
+side-effect-free, offline syntax checker, and is what's used again now.
+FRR's own `frr-reload.py` is kept as a subprocess call too - it's a
+mature, actively-maintained diff engine, not something worth
+reimplementing.
 
 Both config sources are mounted into the VM via **virtiofs** (not as a disk
 image). That's the way KubeVirt intends `ConfigMap`, `Secret` and
 `ServiceAccount` contents to be handed to a VM as plain files 1:1, without
 needing a cloud-init ISO or a reboot.
 
-Both sync services are triggered purely by a 2-minute `systemd` timer, not
-by an inotify `*.path` unit watching the mount for changes - an earlier
-version used both, but the `*.path` trigger proved unreliable in practice:
-virtiofs doesn't reliably propagate the host-side atomic symlink swap
-kubelet uses to update a mounted `ConfigMap` as an inotify event into the
-guest, so it would sometimes just never fire. A plain periodic poll is
-simpler and, empirically, more reliable - the cost is that a change can
-take up to ~2 minutes to land instead of being near-instant, which is a
-non-issue for planned changes like onboarding a new tenant.
+Both sync binaries are persistent daemons (`Type=simple`, `Restart=always`,
+started once at boot) that poll on their own internal ~2-minute interval
+(`config_sync::POLL_INTERVAL`) - not a `systemd` `.timer` re-spawning a
+oneshot, and not an inotify `*.path` unit watching the mount for changes
+either: an earlier version used a `.path` unit, but that trigger proved
+unreliable in practice - virtiofs doesn't reliably propagate the host-side
+atomic symlink swap kubelet uses to update a mounted `ConfigMap` as an
+inotify event into the guest, so it would sometimes just never fire. A
+plain periodic poll is simpler and, empirically, more reliable - the cost
+is that a change can take up to ~2 minutes to land instead of being
+near-instant, which is a non-issue for planned changes like onboarding a
+new tenant. A single failed sync attempt doesn't stop the daemon - it logs
+the error, writes it to a status file
+(`/run/{frr,network}-config-sync.status`) the console dashboard reads, and
+tries again next tick.
 
 ### Why Two Separate Sync Paths?
 
 - **FRR configuration** (`frr.conf`, `daemons`, `vtysh.conf`) is
   re-synced on every change. `frr.conf` changes are validated with
-  `vtysh -C` and then applied live via `frr-reload.py` (no restart, no
-  disruption of running sessions/adjacencies, as far as FRR allows for
-  that). If `daemons` changes (e.g. `bgpd` gets enabled), restarting
-  `frr.service` is unavoidable since that's what determines which daemon
-  processes are actually running.
-- **Network configuration** (`nmstate.yml`/`*.nmconnection`) is applied by
+  `vtysh -C` (a subprocess call, via `Runner` - FRR's own offline,
+  side-effect-free syntax checker) and then applied live via
+  `frr-reload.py` (no restart, no disruption of running
+  sessions/adjacencies, as far as FRR allows for that). If `daemons`
+  changes (e.g. `bgpd` gets enabled), restarting `frr.service` is
+  unavoidable since that's what determines which daemon processes are
+  actually running. [`frr-vty/`](frr-vty/) (a direct vty Unix-socket
+  client) is used elsewhere - by the console dashboard, for its own
+  read-only FRR status queries - but *not* for `frr.conf` validation; see
+  the note above on why that specific use was tried and reverted.
+- **Network configuration** (`nmstate.yml`) is applied by
   `network-config-sync.service`, which runs **after** `NetworkManager.service`
-  since `nmstatectl` requires a running NetworkManager. The VM's single
-  network device is identified by its fixed `macAddress` and named
-  "eth-trunk" by `nmstatectl apply` itself, as part of this same sync step
-  (see "A Trunk Instead of One NIC per Tenant" below) - no separate naming
-  step to sequence around.
+  since applying nmstate state requires a running NetworkManager. The VM's
+  single network device is identified by its fixed `macAddress` and named
+  "eth-trunk" by the `nmstate` crate's `.apply()` itself, as part of this
+  same sync step (see "A Trunk Instead of One NIC per Tenant" below) - no
+  separate naming step to sequence around.
 
 ## Configuration Format
 
@@ -87,19 +116,17 @@ See [`manifests/10-configmap-frr-config.yaml`](manifests/10-configmap-frr-config
 ### `network-config` ConfigMap → `/run/config/network`
 
 - `*.yml` / `*.yaml` — [nmstate](https://nmstate.io/) desired-state
-  documents, applied via `nmstatectl apply`. The VM's one and only network
-  device is identified by `identifier: mac-address`/`mac-address:` against
-  its fixed `macAddress` (set in the `VirtualMachine` spec) and named
-  "eth-trunk" by nmstate itself as part of the same apply (see "A Trunk
-  Instead of One NIC per Tenant" below), so every other VLAN sub-interface
-  in the same document can just refer to `eth-trunk` directly as
-  `base-iface`.
-- `*.nmconnection` — raw NetworkManager keyfiles, installed into
-  `/etc/NetworkManager/system-connections/` and activated.
+  documents, applied via the `nmstate` crate directly (`NetworkState::
+  new_from_yaml(...).apply()` in `config-sync/src/network.rs` - no
+  `nmstatectl` subprocess). The VM's one and only network device is
+  identified by `identifier: mac-address`/`mac-address:` against its fixed
+  `macAddress` (set in the `VirtualMachine` spec) and named "eth-trunk" by
+  nmstate itself as part of the same apply (see "A Trunk Instead of One
+  NIC per Tenant" below), so every other VLAN sub-interface in the same
+  document can just refer to `eth-trunk` directly as `base-iface`.
 
-Both formats (nmstate and NetworkManager keyfiles) can be used at the same
-time - it just depends on which file extension the respective keys in the
-ConfigMap have.
+Only `*.yml`/`*.yaml` (nmstate) files are supported - raw NetworkManager
+`.nmconnection` keyfiles are not.
 
 See [`manifests/11-configmap-network-config.yaml`](manifests/11-configmap-network-config.yaml).
 
@@ -125,7 +152,7 @@ tenant count, and no separate pod/masquerade "default" network either:
 A fixed, deterministic `macAddress` is set for it in the `VirtualMachine`
 spec, and `network-config`'s `nmstate.yml` identifies the device by that
 same MAC (`identifier: mac-address`, `mac-address: <...>`) and names it
-"eth-trunk" as part of the normal `nmstatectl apply` done by
+"eth-trunk" as part of the normal nmstate apply done by
 `network-config-sync.service` at boot - no udev `.link` file, no
 initramfs rebuild step, nothing that has to run before the real root
 filesystem is even mounted. Whoever generates the `VirtualMachine`
@@ -179,6 +206,23 @@ Correspondingly, `frr.conf` runs a separate BGP instance per tenant
 (`router bgp <ASN> vrf vrf-tenant1`, with `neighbor ... bfd` for fast
 failure detection - see `bfdd=yes` in `daemons`), which advertises the
 networks intended for that VRF via a `network` statement.
+
+Tenants can legitimately reuse the same private address ranges across
+VRFs, which is exactly the situation `net.vrf.strict_mode` hardens: it
+closes a kernel-level socket-to-VRF binding ambiguity that can otherwise
+arise in that case, as defense in depth alongside FRR's own `vrf`
+scoping above. It's declared in
+[`files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf`](files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf) -
+the sysctl node only exists once the `vrf` kernel module has loaded, so
+[`files/etc/modules-load.d/vrf.conf`](files/etc/modules-load.d/vrf.conf)
+loads it early at boot (before `systemd-sysctl.service` runs) so the
+static file actually takes effect from boot, before any VRF exists.
+`network-config-sync` also re-applies the same value at runtime after
+every successful sync, as a defensive fallback rather than the primary
+mechanism (best-effort - a `NotFound` write is expected and not logged
+as an error). Doesn't affect the route-leaking design above
+(`routes:`/`route-rules:`) - that's FIB/PBR based, a separate mechanism
+strict mode doesn't touch.
 
 For those networks to actually leave via the corresponding tenant VLAN -
 even though they're physically attached to a different VLAN sub-interface
@@ -288,9 +332,9 @@ below):
    router-id` stays in IPv4 dotted-quad form either way - that's a BGP
    protocol requirement, not something IPv6-specific.
 
-Both changes are picked up live via `frr-config-sync.timer`/
-`network-config-sync.timer` (up to ~2min), same as any other tenant
-change - no VM restart either way.
+Both changes are picked up live by `frr-config-sync`/`network-config-sync`'s
+own internal poll (up to ~2min), same as any other tenant change - no VM
+restart either way.
 
 ## Adding Tenants Without a VM Restart
 
@@ -309,9 +353,10 @@ touches neither the `VirtualMachine` nor the `NetworkAttachmentDefinition`
 3. In `frr-config`'s `frr.conf`, add the matching
    `router bgp ... vrf ...` instance for the new tenant.
 
-`frr-config-sync.timer` and `network-config-sync.timer` pick up both
-changes automatically (up to ~2min) - `nmstatectl apply` creates the new
-VLAN sub-interface without disturbing the existing interfaces or other
+`frr-config-sync` and `network-config-sync` pick up both changes
+automatically on their own next poll (up to ~2min) - the nmstate apply
+creates the new VLAN sub-interface without disturbing the existing
+interfaces or other
 tenants' running BGP sessions. At this scale, the ConfigMap contents are
 best generated (Helm/Kustomize/your own script) rather than hand-maintained;
 that changes nothing about the ConfigMaps' format itself.
@@ -329,8 +374,8 @@ KubeVirt doesn't hot-plug bridge interfaces.
 
 > Changes to already-existing interfaces (IP addresses, routing, new VLAN
 > sub-interfaces on the trunk), on the other hand, are picked up **without
-> a restart** via `network-config-sync.timer` (up to ~2min), live, through
-> `nmstate.yml`/`*.nmconnection`.
+> a restart** by `network-config-sync`'s own poll (up to ~2min), live,
+> through `nmstate.yml`.
 
 ## bootc Image Tracking
 
@@ -506,12 +551,16 @@ refreshes (an interface's address line coming and going, a VRF's BGP peers
 appearing/disappearing, ...) - a class of bug an earlier, hand-rolled
 cursor-position/erase-sequence bash version of this dashboard had to
 chase down one escape sequence at a time. Every subprocess call
-(`systemctl`, `ip`, `vtysh`, `bootc`) has its stdout/stderr explicitly
-captured or discarded, never left to inherit the console's own - letting
+(`systemctl`, `ip`, `bootc`) has its stdout/stderr explicitly captured or
+discarded, never left to inherit the console's own - letting
 even one leak through corrupts the frame with raw, unstyled text stomped
 into the middle of the drawn output, which happened for real with an
 earlier `systemctl is-active`/`is-failed` call that only checked the exit
-code but still let the printed status word through.
+code but still let the printed status word through. FRR status
+(`console/src/frr.rs`) isn't one of those subprocess calls at all - it
+queries each daemon's vty socket directly via [`frr-vty/`](frr-vty/),
+the same client `frr-config-sync` uses, so there's no `vtysh` stdout to
+worry about leaking through in the first place.
 
 Subprocess stdout isn't the only source of stray text on the console,
 though: the kernel's own `printk` messages (interface/driver events,
@@ -680,13 +729,18 @@ serial console).
   `journalctl -u frr-config-sync.service -u network-config-sync.service -u bootc-image-sync.service`
   (or just look at the "Sync Services" section of the console dashboard -
   see "Console Dashboard" above)
-- Both `frr-config-sync` and `network-config-sync` run on a 2min timer only
-  (no inotify) and always re-apply, whether or not the ConfigMap actually
-  changed - `vtysh -C`/`rsync`/`frr-reload.py`/`nmstatectl apply`/`nmcli`
-  are all cheap and safe to re-run, so expect a change to take up to ~2min
-  to land, not immediately.
-- FRR validation failures also end up in `/tmp/frr-config-check.log`
-  inside the VM.
+- Both `frr-config-sync` and `network-config-sync` are persistent daemons
+  that poll internally on a ~2min interval only (no inotify, no `.timer`)
+  and always re-apply, whether or not the ConfigMap actually changed - the
+  `vtysh -C` validation, `rsync`, `frr-reload.py`, and the nmstate apply are
+  all cheap and safe to re-run, so expect a change to take up to ~2min to
+  land, not immediately. `systemctl status frr-config-sync.service` shows
+  the daemon itself is running - whether its *last sync attempt* succeeded
+  is in `/run/frr-config-sync.status` (and the console dashboard's "Sync
+  Services" panel), not the service's own state, since a single failed
+  attempt no longer stops the process.
+- FRR validation failures are logged in full via
+  `journalctl -u frr-config-sync.service` (passwords redacted).
 - `nmstatectl show` or `nmcli connection show` to check the current network
   state.
 - If the trunk NIC shows up as `enp3s0` (or another kernel-assigned name)
