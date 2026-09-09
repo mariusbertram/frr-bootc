@@ -63,8 +63,23 @@ fn sync_inner(src: &Path, dst: &Path, runner: &impl Runner, log: &Logger) -> Res
     log.log(format!("rsyncing staged config into {}", dst.display()));
     let stage_src = format!("{}/", stage.path().display());
     let dst_arg = format!("{}/", dst.display());
+    // `--checksum`: every sync stages into a *fresh* temp directory
+    // (see above), and `copy_dir_contents` copies via `fs::copy`, which
+    // doesn't preserve the ConfigMap mount's original mtime - the
+    // staged copy's mtime is always "now". Without `--checksum`, rsync's
+    // default quick check (size+mtime) sees that "now" mtime differ from
+    // whatever's already in `dst` and re-transfers the file on *every*
+    // tick even when the content is byte-identical, which defeats the
+    // whole point of gating reload/restart on `changed` below - `rsync`
+    // would report every file "changed" forever, so FRR got reloaded on
+    // every `POLL_INTERVAL` regardless of the ConfigMap, the exact bug
+    // this gate was meant to fix. `--checksum` compares actual content
+    // instead, so identical content is correctly reported as unchanged.
     let rsync_out = runner
-        .run("rsync", &["-avi", "--delete", &stage_src, &dst_arg])
+        .run(
+            "rsync",
+            &["-avi", "--checksum", "--delete", &stage_src, &dst_arg],
+        )
         .context("failed to spawn rsync")?;
     if !rsync_out.status.success() {
         log.err(format!("rsync into {} failed:", dst.display()));
@@ -372,6 +387,36 @@ mod tests {
         let calls = runner.calls();
         assert!(calls.contains(&FRR_RELOAD.to_string()));
         assert!(!calls.contains(&"systemctl".to_string()));
+    }
+
+    /// The regression this guards: every sync stages into a fresh temp
+    /// directory, and `copy_dir_contents` copies via `fs::copy`, which
+    /// gives the staged copy a fresh "now" mtime rather than preserving
+    /// the source's. Without `--checksum`, rsync's default quick check
+    /// (size+mtime) sees that mtime differ from what's already in `dst`
+    /// and re-transfers on *every* tick regardless of actual content -
+    /// which made `unchanged_config_skips_reload_and_restart` above a
+    /// lie in production: `changed` was never actually empty, so FRR got
+    /// reloaded on every `POLL_INTERVAL` tick exactly as before that fix,
+    /// confirmed live via BGP sessions still resetting every ~2 minutes
+    /// after it shipped.
+    #[test]
+    fn rsync_is_invoked_with_checksum_to_ignore_staging_mtime_churn() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write_file(src.path(), "daemons", "bgpd=yes\n");
+
+        let runner = FakeRunner::new();
+        let log = Logger::new("test");
+
+        sync_inner(src.path(), dst.path(), &runner, &log).unwrap();
+
+        let calls = runner.calls.borrow();
+        let (_, args) = calls.iter().find(|(cmd, _)| cmd == "rsync").unwrap();
+        assert!(
+            args.iter().any(|a| a == "--checksum"),
+            "rsync must be run with --checksum, got {args:?}"
+        );
     }
 
     #[test]
