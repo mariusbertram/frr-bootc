@@ -81,7 +81,20 @@ fn sync_inner(src: &Path, dst: &Path, runner: &impl Runner, log: &Logger) -> Res
         log.block(&changed.join("\n"));
     }
 
-    if daemons_changed {
+    // Reloading (or restarting) FRR is not free: `frr-reload.py` diffs
+    // the staged file against FRR's own normalized running-config output
+    // (not byte-for-byte against what was last written), and a
+    // cosmetic-only difference there (ordering, blank lines) can lead it
+    // to remove and re-add a BGP neighbor block that didn't functionally
+    // change - bouncing an established session. Since this runs on every
+    // poll tick (every `POLL_INTERVAL`, currently 2 minutes) forever,
+    // doing that unconditionally reset every BGP session on that same
+    // cadence even when the ConfigMap never changed. Only touch FRR at
+    // all when rsync actually copied/deleted something, or the daemons
+    // set changed.
+    if !daemons_changed && changed.is_empty() {
+        log.log("no changes, skipping reload");
+    } else if daemons_changed {
         restart_frr(runner, log, false)?;
     } else {
         reload_frr(dst, runner, log)?;
@@ -348,15 +361,40 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         write_file(src.path(), "daemons", "bgpd=yes\n");
         write_file(dst.path(), "daemons", "bgpd=yes\n");
+        write_file(src.path(), "frr.conf", "router bgp 65001\n");
         fs::write(dst.path().join("frr.conf"), "").unwrap();
 
-        let runner = FakeRunner::new();
+        let runner = FakeRunner::new().on("rsync", ok_output(">f.st...... frr.conf\n"));
         let log = Logger::new("test");
 
         sync_inner(src.path(), dst.path(), &runner, &log).unwrap();
 
         let calls = runner.calls();
         assert!(calls.contains(&FRR_RELOAD.to_string()));
+        assert!(!calls.contains(&"systemctl".to_string()));
+    }
+
+    #[test]
+    fn unchanged_config_skips_reload_and_restart() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write_file(src.path(), "daemons", "bgpd=yes\n");
+        write_file(dst.path(), "daemons", "bgpd=yes\n");
+        write_file(src.path(), "frr.conf", "router bgp 65001\n");
+        write_file(dst.path(), "frr.conf", "router bgp 65001\n");
+
+        let runner = FakeRunner::new();
+        let log = Logger::new("test");
+
+        sync_inner(src.path(), dst.path(), &runner, &log).unwrap();
+
+        // rsync itself still runs (it's what tells us nothing changed),
+        // but neither frr-reload.py nor systemctl should - this is the
+        // ordinary "poll tick with an unchanged ConfigMap" case, and it
+        // must not touch FRR's running daemons or bounce any session.
+        let calls = runner.calls();
+        assert!(calls.contains(&"rsync".to_string()));
+        assert!(!calls.contains(&FRR_RELOAD.to_string()));
         assert!(!calls.contains(&"systemctl".to_string()));
     }
 
@@ -383,8 +421,10 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         write_file(src.path(), "daemons", "bgpd=yes\n");
         write_file(dst.path(), "daemons", "bgpd=yes\n");
+        write_file(src.path(), "frr.conf", "router bgp 65001\n");
 
         let runner = FakeRunner::new()
+            .on("rsync", ok_output(">f+++++++++ frr.conf\n"))
             .on(FRR_RELOAD, fail_output(""))
             .on("systemctl", ok_output(""));
         let log = Logger::new("test");

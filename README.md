@@ -89,7 +89,17 @@ tries again next tick.
   sessions/adjacencies, as far as FRR allows for that). If `daemons`
   changes (e.g. `bgpd` gets enabled), restarting `frr.service` is
   unavoidable since that's what determines which daemon processes are
-  actually running. [`frr-vty/`](frr-vty/) (a direct vty Unix-socket
+  actually running. Crucially, an ordinary poll tick where the
+  ConfigMap *hasn't* changed does neither: `frr-reload.py`/`systemctl
+  restart` only run when `rsync` actually copied or deleted a file into
+  `/etc/frr`, or the `daemons` set differs. Calling `frr-reload.py`
+  unconditionally on every tick was tried first and reverted - FRR's
+  reload diffs the staged file against its own normalized
+  running-config output, not byte-for-byte against what was last
+  written, and a purely cosmetic difference there was enough to make it
+  drop and re-add a BGP neighbor block, bouncing the session every
+  `POLL_INTERVAL` even with an unchanged ConfigMap.
+  [`frr-vty/`](frr-vty/) (a direct vty Unix-socket
   client) is used elsewhere - by the console dashboard, for its own
   read-only FRR status queries - but *not* for `frr.conf` validation; see
   the note above on why that specific use was tried and reverted.
