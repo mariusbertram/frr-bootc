@@ -24,10 +24,6 @@ use config_sync::{Lock, Logger};
 const LOCK_PATH: &str = "/run/network-config-sync.lock";
 const STATUS_PATH: &str = "/run/network-config-sync.status";
 const SRC: &str = "/run/config/network";
-/// `/run` is tmpfs, so this is empty again after a reboot - which is
-/// correct: on a fresh boot there's nothing yet to compare against, and
-/// the state should be applied at least once regardless.
-const CACHE_DIR: &str = "/run/network-config-sync/last-applied";
 
 fn main() -> ExitCode {
     let log = Logger::new("network-config-sync");
@@ -47,6 +43,6 @@ fn main() -> ExitCode {
     let _lock = lock;
 
     config_sync::run_forever(Path::new(STATUS_PATH), &log, || {
-        config_sync::network::sync(Path::new(SRC), Path::new(CACHE_DIR), &log)
+        config_sync::network::sync(Path::new(SRC), &log)
     })
 }

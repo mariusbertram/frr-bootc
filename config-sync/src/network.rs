@@ -19,25 +19,7 @@ const VRF_STRICT_MODE_PATH: &str = "/proc/sys/net/vrf/strict_mode";
 /// (the mounted `network-config` ConfigMap) via the `nmstate` crate
 /// directly - no `nmstatectl` subprocess, and no NetworkManager
 /// `.nmconnection` keyfile support (nmstate-only, by design).
-///
-/// `cache_dir` holds a copy of the last successfully-applied content of
-/// each state file (keyed by file name) - a poll tick whose content
-/// matches the cached copy byte-for-byte skips `NetworkState::apply()`
-/// entirely rather than calling it unconditionally on every tick. Same
-/// reasoning as `frr::sync_inner`'s `daemons_changed`/`changed` gate:
-/// nmstate's own diff engine computes its changes against the actual
-/// live NetworkManager/kernel state (not against our cache), so a no-op
-/// apply is generally a true no-op there - but "generally" isn't a
-/// guarantee, and reapplying identical desired state every
-/// `POLL_INTERVAL` for no reason is the same unnecessary-churn pattern
-/// that made `frr-reload.py` bounce BGP sessions on an unchanged
-/// ConfigMap. Skipping it entirely when nothing changed removes that
-/// risk outright, at the cost of this daemon no longer self-correcting
-/// out-of-band drift (e.g. a manual `nmcli`/`ip` change) on its own -
-/// only an actual ConfigMap change re-asserts the desired state. That
-/// trade-off is deliberate: this VM's network config is meant to be
-/// managed exclusively through the ConfigMap, not hand-edited live.
-pub fn sync(src: &Path, cache_dir: &Path, log: &Logger) -> Result<()> {
+pub fn sync(src: &Path, log: &Logger) -> Result<()> {
     if is_empty_source(src) {
         log.log(format!(
             "{} is empty or not mounted, nothing to sync",
@@ -62,55 +44,23 @@ pub fn sync(src: &Path, cache_dir: &Path, log: &Logger) -> Result<()> {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
+        log.log(format!("applying nmstate state {name}"));
 
         let yaml = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-
-        let cache_path = cache_dir.join(&name);
-        if fs::read_to_string(&cache_path).is_ok_and(|cached| cached == yaml) {
-            log.log(format!("{name} unchanged since last apply, skipping"));
-            continue;
-        }
-
-        log.log(format!("applying nmstate state {name}"));
         let state = NetworkState::new_from_yaml(&yaml)
             .with_context(|| format!("failed to parse {name} as an nmstate desired state"))?;
         state
             .apply()
             .with_context(|| format!("failed to apply {name}"))?;
-        log.log(format!("applied {name} successfully"));
 
-        cache_applied(&cache_path, &yaml, log);
+        log.log(format!("applied {name} successfully"));
     }
 
     apply_vrf_strict_mode(Path::new(VRF_STRICT_MODE_PATH), log);
 
     log.log("sync complete");
     Ok(())
-}
-
-/// Best-effort, same reasoning as `apply_vrf_strict_mode`: the state
-/// itself already applied successfully by the time this runs, so a
-/// failure to cache it doesn't fail the sync - it just means the next
-/// tick re-applies unnecessarily instead of skipping, which is exactly
-/// today's behavior and therefore never worse than not having the cache
-/// at all.
-fn cache_applied(cache_path: &Path, yaml: &str, log: &Logger) {
-    if let Some(parent) = cache_path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            log.err(format!(
-                "failed to create cache directory {}: {e}",
-                parent.display()
-            ));
-            return;
-        }
-    }
-    if let Err(e) = fs::write(cache_path, yaml) {
-        log.err(format!(
-            "failed to cache applied state at {}: {e}",
-            cache_path.display()
-        ));
-    }
 }
 
 /// Best-effort - not part of the sync's success/failure outcome, since
@@ -161,32 +111,8 @@ mod tests {
     #[test]
     fn empty_source_is_a_noop() {
         let src = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
         let log = Logger::new("test");
-        sync(src.path(), cache.path(), &log).unwrap();
-    }
-
-    /// The regression this guards: `sync` used to call
-    /// `NetworkState::apply()` unconditionally on every poll tick, even
-    /// when the ConfigMap hadn't changed since the last successful
-    /// apply - the same "reapply on every tick regardless of change"
-    /// pattern that made `frr-reload.py` bounce BGP sessions every
-    /// `POLL_INTERVAL`. This test can't run against a real
-    /// NetworkManager, so it proves the skip indirectly: with the cache
-    /// already holding byte-identical content, `sync` must return
-    /// `Ok(())` without ever reaching `NetworkState::apply()` - if it
-    /// did, this would fail (or hang) in a sandbox with no
-    /// NetworkManager D-Bus service to talk to.
-    #[test]
-    fn cached_unchanged_state_skips_apply() {
-        let src = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        let yaml = "interfaces: []\n";
-        fs::write(src.path().join("nmstate.yml"), yaml).unwrap();
-        fs::write(cache.path().join("nmstate.yml"), yaml).unwrap();
-        let log = Logger::new("test");
-
-        sync(src.path(), cache.path(), &log).unwrap();
+        sync(src.path(), &log).unwrap();
     }
 
     #[test]
