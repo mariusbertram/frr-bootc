@@ -109,7 +109,22 @@ tries again next tick.
   single network device is identified by its fixed `macAddress` and named
   "eth-trunk" by the `nmstate` crate's `.apply()` itself, as part of this
   same sync step (see "A Trunk Instead of One NIC per Tenant" below) - no
-  separate naming step to sequence around.
+  separate naming step to sequence around. Same gating principle as the
+  FRR side: each state file's content is compared against a cache of
+  what was last successfully applied (`/run/network-config-sync/
+  last-applied/`, tmpfs - empty again after a reboot, so the first tick
+  after boot always applies), and `NetworkState::apply()` is skipped
+  entirely when nothing changed. `nmstate` diffs against the actual live
+  NetworkManager/kernel state itself (unlike `frr-reload.py`'s
+  text-diff-against-its-own-rendered-output approach), so an unconditional
+  reapply here is inherently lower-risk than the `frr.conf` case above -
+  but it's the same "call the apply path on every tick regardless of
+  change" pattern, and skipping it outright removes the risk rather than
+  relying on `nmstate` always being a true no-op. The trade-off: this
+  daemon no longer self-corrects out-of-band drift (e.g. a manual
+  `nmcli`/`ip` change) by itself - only an actual ConfigMap change
+  re-asserts the desired state, since this VM's network config is meant
+  to be managed exclusively through the ConfigMap, not hand-edited live.
 
 ## Configuration Format
 
