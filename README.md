@@ -585,7 +585,8 @@ That compact **Overview** is one of three tabs - `1`/`2`/`3` jumps
 straight to one (the same idea as btop's own number-key box switcher), or
 `Tab`/`Shift+Tab`/`←`/`→` cycles - switching to the two detail tabs
 (**Interfaces**, **FRR / BGP**), which list everything with nothing cut
-off. `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` move a highlighted selection
+off (VRF devices themselves are excluded from the Interfaces list - see
+below). `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` move a highlighted selection
 through that tab's list rather than just scrolling blindly (the same keys
 htop's own process list uses - deliberately no vi bindings alongside them,
 one recognizable control scheme, not two overlapping ones), and the view
@@ -596,8 +597,22 @@ interface: MTU, MAC address, which VRF/device it's enslaved to (read from
 reports as `master vrf-tenant1`), and cumulative rx/tx byte/packet/error/
 drop counters, gathered on demand only for the one interface being looked
 at (see `net::InterfaceDetail`) rather than for every interface on every
-tick; for a VRF: its individual BGP peers (a dual-stack peer shows as two
-rows, one per AFI, since the sessions can be in different states), each
+tick. A sub-interface's kernel name is what actually has to be used for
+every one of those `/sys/class/net/...` reads - `ip` *displays* it
+suffixed with its parent (`bdbos@enp3s0`), but that suffix isn't part of
+the real interface name, so `net::sysfs_name` strips it back off first;
+missing that was a real bug (MTU/MAC/master/throughput all silently
+failed to resolve - a missing file, not an error - for every VLAN
+sub-interface, since none of them actually exist under that suffixed
+name in `/sys/class/net/`). VRF devices (`vrf-tenant1`) are filtered out
+of the Interfaces list entirely (`ip -brief link show type vrf` is the
+authoritative source for which devices those are) rather than shown with
+an MTU that reads as broken - the Linux VRF driver's default MTU is
+65535+ (a routing-table selector isn't a real link with a frame-size
+limit of its own), and a VRF already has its own detail view: the FRR/BGP
+tab. There, `Enter` on a VRF shows its individual BGP peers (a dual-stack
+peer shows as two rows, one per AFI, since the sessions can be in
+different states), each
 with its state, remote AS, uptime, and prefixes received/sent - FRR's own
 `pfxRcd`/`pfxSnt` numbers, i.e. what that peer has had imported into this
 VRF's table and exported/advertised to it. `Esc` closes the popup. Each

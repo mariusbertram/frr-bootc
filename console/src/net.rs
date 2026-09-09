@@ -14,7 +14,7 @@
 //! iterations; here it's just fields on a struct that lives as long as the
 //! process does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::process::Command;
 use std::time::Instant;
@@ -47,11 +47,20 @@ impl ThroughputSampler {
     }
 
     pub fn list(&mut self) -> Vec<Interface> {
+        let vrfs = vrf_device_names();
         let mut interfaces = Vec::new();
         for line in ip_brief_addr().lines() {
             let mut fields = line.split_whitespace();
             let Some(name) = fields.next() else { continue };
-            if name == "lo" {
+            // "lo" isn't a meaningful link to show here, and a VRF
+            // device (e.g. "vrf-tenant1") isn't a link at all - it's a
+            // routing-table selector the kernel's VRF driver exposes as
+            // a netdev for `ip`/rtnetlink's benefit, with its own
+            // driver-default MTU (65535+, unrelated to any real frame
+            // size) that reads as nonsensical/alarming in a table meant
+            // for physical/logical links. VRFs already have their own
+            // view - the FRR/BGP tab.
+            if name == "lo" || vrfs.contains(name) {
                 continue;
             }
             let up = fields.next() == Some("UP");
@@ -91,7 +100,22 @@ impl ThroughputSampler {
     }
 }
 
+/// `ip` displays a sub-interface's name suffixed with `@<parent>` (e.g.
+/// `bdbos@enp3s0` for a VLAN sub-interface, or any device whose
+/// `IFLA_LINK` points at a different one) - worth keeping as the
+/// *display* name (`Interface::name` already does, unchanged), but
+/// that suffix is purely an `ip`-side convention, not part of the real
+/// interface name: `/sys/class/net/` has no `bdbos@enp3s0` entry, only
+/// `bdbos`. Every sysfs read needs the stripped form, or it silently
+/// finds nothing (a missing file, not an error) - which is exactly what
+/// was happening to every VLAN sub-interface's throughput sampling,
+/// and to the detail popup's MTU/MAC/master/counters.
+fn sysfs_name(name: &str) -> &str {
+    name.split('@').next().unwrap_or(name)
+}
+
 fn read_counter(name: &str, stat: &str) -> Option<u64> {
+    let name = sysfs_name(name);
     fs::read_to_string(format!("/sys/class/net/{name}/statistics/{stat}"))
         .ok()?
         .trim()
@@ -129,7 +153,7 @@ pub struct InterfaceDetail {
 pub fn detail(name: &str) -> InterfaceDetail {
     InterfaceDetail {
         mtu: read_sys_value(name, "mtu"),
-        mac: fs::read_to_string(format!("/sys/class/net/{name}/address"))
+        mac: fs::read_to_string(format!("/sys/class/net/{}/address", sysfs_name(name)))
             .ok()
             .map(|s| s.trim().to_string()),
         master: read_master(name),
@@ -145,6 +169,7 @@ pub fn detail(name: &str) -> InterfaceDetail {
 }
 
 fn read_sys_value<T: std::str::FromStr>(name: &str, file: &str) -> Option<T> {
+    let name = sysfs_name(name);
     fs::read_to_string(format!("/sys/class/net/{name}/{file}"))
         .ok()?
         .trim()
@@ -158,6 +183,7 @@ fn read_sys_value<T: std::str::FromStr>(name: &str, file: &str) -> Option<T> {
 /// reports as `master vrf-tenant1`, read directly rather than shelling
 /// out for it.
 fn read_master(name: &str) -> Option<String> {
+    let name = sysfs_name(name);
     let link = fs::read_link(format!("/sys/class/net/{name}/master")).ok()?;
     link.file_name()?.to_str().map(str::to_string)
 }
@@ -170,6 +196,27 @@ fn ip_brief_addr() -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default()
+}
+
+/// The kernel's own authoritative list of VRF devices (`ip link show
+/// type vrf` filters by netdev kind, not by naming convention - a
+/// tenant could in principle name theirs anything). Same reasoning as
+/// `ip_brief_addr`'s own doc comment: the exact command an operator
+/// would run, not a heuristic layered on top of a different one's
+/// output.
+fn vrf_device_names() -> HashSet<String> {
+    let output = Command::new("ip")
+        .args(["-brief", "link", "show", "type", "vrf"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
 }
 
 /// bytes/sec -> human bit/s (network convention - bits, not bytes).
@@ -197,5 +244,12 @@ mod tests {
         assert_eq!(fmt_rate(15_625), "125.0 Kbit/s");
         assert_eq!(fmt_rate(15_625_000), "125.0 Mbit/s");
         assert_eq!(fmt_rate(125_000_000), "1.0 Gbit/s");
+    }
+
+    #[test]
+    fn sysfs_name_strips_the_ip_display_suffix() {
+        assert_eq!(sysfs_name("bdbos@enp3s0"), "bdbos");
+        assert_eq!(sysfs_name("enp3s0"), "enp3s0");
+        assert_eq!(sysfs_name("vrf-tenant1"), "vrf-tenant1");
     }
 }
