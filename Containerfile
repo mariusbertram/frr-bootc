@@ -121,6 +121,17 @@ COPY files/usr/lib/systemd/system/frr-console-reset-faillock.service /usr/lib/sy
 # either tty. See the comment in each of those two unit files for the
 # full picture, including how a real shell is still reachable (the 'b'
 # key, via /bin/login).
+#
+# NetworkManager-wait-online.service can never succeed on this image and
+# is masked outright rather than left to fail every boot: by design, no
+# interface gets any NetworkManager connection at boot time at all (no
+# DHCP, no baked-in profile) - network-config-sync is what brings
+# anything up, and it only runs later, ordered after NetworkManager.
+# service itself, not after network-online.target. Since nothing here
+# ever satisfies "online" the way this unit checks for, it can only ever
+# run out its full timeout and fail - pure boot delay for units ordered
+# after network-online.target (cloud-init.target among them), with no
+# corresponding benefit.
 RUN chmod 0755 \
         /usr/local/bin/frr-config-sync \
         /usr/local/bin/network-config-sync \
@@ -130,7 +141,7 @@ RUN chmod 0755 \
     && mkdir -p /run/config/frr /run/config/network /run/config/bootc \
     && chown -R frr:frr /etc/frr \
     && chmod -R u=rwX,g=rX,o= /etc/frr \
-    && systemctl mask getty@tty1.service serial-getty@ttyS0.service \
+    && systemctl mask getty@tty1.service serial-getty@ttyS0.service NetworkManager-wait-online.service \
     && systemctl enable \
         frr.service \
         NetworkManager.service \
