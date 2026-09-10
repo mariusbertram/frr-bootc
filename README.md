@@ -218,21 +218,22 @@ failure detection - see `bfdd=yes` in `daemons`), which advertises the
 networks intended for that VRF via a `network` statement.
 
 Tenants can legitimately reuse the same private address ranges across
-VRFs, which is exactly the situation `net.vrf.strict_mode` hardens: it
-closes a kernel-level socket-to-VRF binding ambiguity that can otherwise
-arise in that case, as defense in depth alongside FRR's own `vrf`
-scoping above. It's declared in
-[`files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf`](files/etc/sysctl.d/73-frr-bootc-vrf-strict-mode.conf) -
-the sysctl node only exists once the `vrf` kernel module has loaded, so
-[`files/etc/modules-load.d/vrf.conf`](files/etc/modules-load.d/vrf.conf)
-loads it early at boot (before `systemd-sysctl.service` runs) so the
-static file actually takes effect from boot, before any VRF exists.
-`network-config-sync` also re-applies the same value at runtime after
-every successful sync, as a defensive fallback rather than the primary
-mechanism (best-effort - a `NotFound` write is expected and not logged
-as an error). Doesn't affect the route-leaking design above
-(`routes:`/`route-rules:`) - that's FIB/PBR based, a separate mechanism
-strict mode doesn't touch.
+VRFs; isolation between them comes from each tenant's own VRF/routing
+table plus FRR's own `vrf`-scoped BGP instance above - not from any
+extra kernel-level hardening. An earlier version of this also set
+`net.vrf.strict_mode=1`, reasoning it closed a kernel-level
+socket-to-VRF binding ambiguity as defense in depth. That reasoning was
+wrong: `net.vrf.strict_mode`'s actual documented behavior (see
+`drivers/net/vrf.c`) is a management-plane-only constraint - "at most
+one VRF device may be associated with any given routing table", enforced
+when a VRF device is created/registered, with no effect on data-plane
+forwarding. Enabling it was immediately followed live by one tenant VRF
+losing reachability to Kubernetes-side routes; the most likely mechanism
+is a routing-table-id collision or a VRF-recreation race during an
+`nmstate` apply causing that VRF's table registration to fail outright
+under the new constraint, though the exact trigger wasn't isolated
+before reverting - so it's been removed entirely rather than chased
+further, since its own benefit was speculative to begin with.
 
 For those networks to actually leave via the corresponding tenant VLAN -
 even though they're physically attached to a different VLAN sub-interface
