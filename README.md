@@ -111,6 +111,31 @@ tries again next tick.
   same sync step (see "A Trunk Instead of One NIC per Tenant" below) - no
   separate naming step to sequence around.
 
+  Same gating principle as the FRR side: each state file's content is
+  compared against a cache of what was last successfully applied
+  (`/run/network-config-sync/last-applied/`, tmpfs - empty again after a
+  reboot, so the first tick after boot always applies), and
+  `NetworkState::apply()` is skipped entirely when nothing changed. This
+  was tried once and reverted on the assumption that `nmstate`'s own
+  diff against live state made unconditional reapply harmless - reading
+  `nmstate`'s own source (`query_apply/net_state.rs`) disproves that
+  assumption: `apply()` retrieves current state and re-merges it against
+  desired on *every* call, with no caching of its own, so any interface
+  whose desired state doesn't (yet, or can't) actually converge is
+  reapplied/reactivated via NetworkManager on every single tick forever,
+  regardless of whether the ConfigMap changed - the same
+  "call the apply path unconditionally" pattern that made `frr-reload.py`
+  bounce BGP sessions on the FRR side, just one level down. Reactivating
+  a connection unnecessarily risks bouncing routes/interfaces long
+  enough for something depending on them (like BGP nexthop tracking) to
+  notice. The trade-off: this daemon no longer self-corrects out-of-band
+  drift (e.g. a manual `nmcli`/`ip` change, or `nmstate` itself not
+  converging) on its own - only an actual ConfigMap change re-asserts
+  the desired state. That's an acceptable trade: retrying a structural
+  (non-transient) convergence failure on every tick forever doesn't fix
+  it either - it only pays the disruption cost repeatedly for a fix that
+  never lands.
+
 ## Configuration Format
 
 ### `frr-config` ConfigMap → `/run/config/frr`
