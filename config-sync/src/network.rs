@@ -10,7 +10,37 @@ use crate::{has_extension, is_empty_source, list_names, Logger};
 /// (the mounted `network-config` ConfigMap) via the `nmstate` crate
 /// directly - no `nmstatectl` subprocess, and no NetworkManager
 /// `.nmconnection` keyfile support (nmstate-only, by design).
-pub fn sync(src: &Path, log: &Logger) -> Result<()> {
+///
+/// `cache_dir` holds a copy of the last successfully-applied content of
+/// each state file (keyed by file name) - a poll tick whose content
+/// matches the cached copy byte-for-byte skips `NetworkState::apply()`
+/// entirely rather than calling it unconditionally on every tick. This
+/// was tried once, reverted (assuming `nmstate`'s own diff against live
+/// state made unconditional reapply harmless), and reinstated after that
+/// assumption turned out wrong: reading `nmstate`'s own source
+/// (`query_apply/net_state.rs`), `apply()` retrieves current state and
+/// merges it against desired on *every* call, with no caching of its
+/// own - so any interface whose desired state never actually converges
+/// (e.g. a rename that can't take effect against a device with
+/// dependents already enslaved to it) is a *permanent* mismatch from
+/// `nmstate`'s point of view, reapplied/reactivated via NetworkManager
+/// on every single tick forever, regardless of whether the ConfigMap
+/// changed. Reactivating a connection every `POLL_INTERVAL` for no
+/// reason risks exactly the kind of transient disruption that made
+/// `frr-reload.py` bounce BGP sessions on the FRR side - here it can
+/// bounce a connected route long enough for BGP nexthop tracking to
+/// invalidate paths depending on it. Skipping `apply()` entirely when
+/// the ConfigMap hasn't changed removes that risk outright, at the cost
+/// of this daemon no longer self-correcting out-of-band drift (e.g. a
+/// manual `nmcli`/`ip` change, or `nmstate` itself never achieving
+/// convergence in the first place) on its own - only an actual
+/// ConfigMap change re-asserts the desired state. That trade-off is
+/// deliberate: reapplying unconditionally doesn't fix a `nmstate`-side
+/// convergence failure either when it's a structural mismatch rather
+/// than a transient race `nmstate`'s own internal retry-and-verify loop
+/// would eventually win - retrying forever pays the disruption cost for
+/// a fix that never lands.
+pub fn sync(src: &Path, cache_dir: &Path, log: &Logger) -> Result<()> {
     if is_empty_source(src) {
         log.log(format!(
             "{} is empty or not mounted, nothing to sync",
@@ -35,21 +65,52 @@ pub fn sync(src: &Path, log: &Logger) -> Result<()> {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        log.log(format!("applying nmstate state {name}"));
 
         let yaml = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
+
+        let cache_path = cache_dir.join(&name);
+        if fs::read_to_string(&cache_path).is_ok_and(|cached| cached == yaml) {
+            log.log(format!("{name} unchanged since last apply, skipping"));
+            continue;
+        }
+
+        log.log(format!("applying nmstate state {name}"));
         let state = NetworkState::new_from_yaml(&yaml)
             .with_context(|| format!("failed to parse {name} as an nmstate desired state"))?;
         state
             .apply()
             .with_context(|| format!("failed to apply {name}"))?;
-
         log.log(format!("applied {name} successfully"));
+
+        cache_applied(&cache_path, &yaml, log);
     }
 
     log.log("sync complete");
     Ok(())
+}
+
+/// Best-effort: the state itself already applied successfully by the
+/// time this runs, so a failure to cache it doesn't fail the sync - it
+/// just means the next tick re-applies unnecessarily instead of
+/// skipping, which is exactly today's behavior and therefore never
+/// worse than not having the cache at all.
+fn cache_applied(cache_path: &Path, yaml: &str, log: &Logger) {
+    if let Some(parent) = cache_path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            log.err(format!(
+                "failed to create cache directory {}: {e}",
+                parent.display()
+            ));
+            return;
+        }
+    }
+    if let Err(e) = fs::write(cache_path, yaml) {
+        log.err(format!(
+            "failed to cache applied state at {}: {e}",
+            cache_path.display()
+        ));
+    }
 }
 
 /// Kubernetes ConfigMap mounts present each file as a symlink through a
@@ -83,8 +144,32 @@ mod tests {
     #[test]
     fn empty_source_is_a_noop() {
         let src = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
         let log = Logger::new("test");
-        sync(src.path(), &log).unwrap();
+        sync(src.path(), cache.path(), &log).unwrap();
+    }
+
+    /// The regression this guards: `sync` used to call
+    /// `NetworkState::apply()` unconditionally on every poll tick, even
+    /// when the ConfigMap hadn't changed since the last successful
+    /// apply - the same "reapply on every tick regardless of change"
+    /// pattern that made `frr-reload.py` bounce BGP sessions every
+    /// `POLL_INTERVAL`. This test can't run against a real
+    /// NetworkManager, so it proves the skip indirectly: with the cache
+    /// already holding byte-identical content, `sync` must return
+    /// `Ok(())` without ever reaching `NetworkState::apply()` - if it
+    /// did, this would fail (or hang) in a sandbox with no
+    /// NetworkManager D-Bus service to talk to.
+    #[test]
+    fn cached_unchanged_state_skips_apply() {
+        let src = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let yaml = "interfaces: []\n";
+        fs::write(src.path().join("nmstate.yml"), yaml).unwrap();
+        fs::write(cache.path().join("nmstate.yml"), yaml).unwrap();
+        let log = Logger::new("test");
+
+        sync(src.path(), cache.path(), &log).unwrap();
     }
 
     #[test]
