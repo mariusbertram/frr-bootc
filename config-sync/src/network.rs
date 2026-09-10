@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use nmstate::NetworkState;
@@ -62,6 +64,23 @@ use crate::{has_extension, is_empty_source, list_names, Logger};
 /// converged.
 const SYSFS_NET_DIR: &str = "/sys/class/net";
 
+/// `interfaces_converged`'s check, right after `apply()` returns, can
+/// itself race NetworkManager still bringing an interface up on the
+/// kernel side - confirmed live: every desired-up interface, including
+/// the physical NIC itself, reporting `operstate: down` a mere ~2s after
+/// "applied successfully". `apply()`'s own verify-and-retry loop only
+/// confirms NetworkManager's *own* bookkeeping, not the kernel's; without
+/// retrying the operstate check itself, that race meant deferring a full
+/// `POLL_INTERVAL` (2 minutes) to the next tick for what's actually just
+/// NetworkManager catching up within a couple of seconds. 15 attempts
+/// 1s apart covers a good multiple of that observed race without coming
+/// anywhere near `POLL_INTERVAL`'s cost when it's genuinely not
+/// converging (e.g. a structural mismatch `nmstate` can't resolve) -
+/// that case still correctly falls through to "not caching, retry next
+/// tick".
+const CONVERGENCE_POLL_ATTEMPTS: u32 = 15;
+const CONVERGENCE_POLL_DELAY: Duration = Duration::from_secs(1);
+
 pub fn sync(src: &Path, cache_dir: &Path, log: &Logger) -> Result<()> {
     if is_empty_source(src) {
         log.log(format!(
@@ -105,11 +124,17 @@ pub fn sync(src: &Path, cache_dir: &Path, log: &Logger) -> Result<()> {
             .with_context(|| format!("failed to apply {name}"))?;
         log.log(format!("applied {name} successfully"));
 
-        if interfaces_converged(&state, Path::new(SYSFS_NET_DIR), log) {
+        if wait_for_convergence(
+            &state,
+            Path::new(SYSFS_NET_DIR),
+            log,
+            CONVERGENCE_POLL_ATTEMPTS,
+            CONVERGENCE_POLL_DELAY,
+        ) {
             cache_applied(&cache_path, &yaml, log);
         } else {
             log.log(format!(
-                "{name} applied but not every interface is up yet - not caching, will retry next tick"
+                "{name} applied but not every interface is up yet after {CONVERGENCE_POLL_ATTEMPTS} attempts - not caching, will retry next tick"
             ));
         }
     }
@@ -118,15 +143,18 @@ pub fn sync(src: &Path, cache_dir: &Path, log: &Logger) -> Result<()> {
     Ok(())
 }
 
-/// True only if every interface `state` wants up is actually up on the
+/// Every interface `state` wants up that is *not* actually up on the
 /// live kernel right now (`/sys/class/net/<name>/operstate` == "up"), not
 /// just according to `nmstate`/NetworkManager's own bookkeeping - see
-/// `sync`'s doc comment for why this matters. An interface `nmstate`
-/// hasn't been asked to bring up isn't checked at all, so a document that
-/// only ever touches a subset of interfaces (e.g. adding one tenant VLAN)
-/// doesn't need every *other* interface to happen to be up too.
-fn interfaces_converged(state: &NetworkState, sysfs_net_dir: &Path, log: &Logger) -> bool {
-    let mut all_up = true;
+/// `sync`'s doc comment for why this matters. Empty means fully
+/// converged. An interface `nmstate` hasn't been asked to bring up isn't
+/// checked at all, so a document that only ever touches a subset of
+/// interfaces (e.g. adding one tenant VLAN) doesn't need every *other*
+/// interface to happen to be up too. Pure (no logging, no sleeping) so
+/// `wait_for_convergence` can poll it repeatedly without spamming a log
+/// line per interface per attempt.
+fn not_up_interfaces(state: &NetworkState, sysfs_net_dir: &Path) -> Vec<String> {
+    let mut not_up = Vec::new();
     for iface in state.interfaces.iter() {
         if !iface.is_up() {
             continue;
@@ -134,25 +162,48 @@ fn interfaces_converged(state: &NetworkState, sysfs_net_dir: &Path, log: &Logger
         let path = sysfs_net_dir.join(iface.name()).join("operstate");
         match fs::read_to_string(&path) {
             Ok(operstate) if operstate.trim() == "up" => {}
-            Ok(operstate) => {
-                log.log(format!(
-                    "{} not up yet (operstate: {})",
-                    iface.name(),
-                    operstate.trim()
-                ));
-                all_up = false;
-            }
-            Err(e) => {
-                log.log(format!(
-                    "{} operstate unreadable ({}): {e}",
-                    iface.name(),
-                    path.display()
-                ));
-                all_up = false;
-            }
+            Ok(operstate) => not_up.push(format!(
+                "{} not up yet (operstate: {})",
+                iface.name(),
+                operstate.trim()
+            )),
+            Err(e) => not_up.push(format!(
+                "{} operstate unreadable ({}): {e}",
+                iface.name(),
+                path.display()
+            )),
         }
     }
-    all_up
+    not_up
+}
+
+/// Polls `not_up_interfaces` up to `attempts` times, `delay` apart,
+/// giving NetworkManager a chance to actually finish bringing an
+/// interface up on the kernel side before this tick gives up on it - see
+/// `CONVERGENCE_POLL_ATTEMPTS`'s doc comment for why a single check right
+/// after `apply()` isn't enough. Only logs on the final failing attempt,
+/// not every one, to avoid a log line per interface per attempt.
+fn wait_for_convergence(
+    state: &NetworkState,
+    sysfs_net_dir: &Path,
+    log: &Logger,
+    attempts: u32,
+    delay: Duration,
+) -> bool {
+    for attempt in 1..=attempts {
+        let not_up = not_up_interfaces(state, sysfs_net_dir);
+        if not_up.is_empty() {
+            return true;
+        }
+        if attempt == attempts {
+            for reason in &not_up {
+                log.log(reason.clone());
+            }
+        } else {
+            thread::sleep(delay);
+        }
+    }
+    false
 }
 
 /// Best-effort: the state itself already applied successfully by the
@@ -222,14 +273,13 @@ mod tests {
     }
 
     #[test]
-    fn interfaces_converged_true_when_kernel_reports_up() {
+    fn not_up_interfaces_empty_when_kernel_reports_up() {
         let state = up_interface_state("foo");
         let sysfs = tempfile::tempdir().unwrap();
         fs::create_dir_all(sysfs.path().join("foo")).unwrap();
         fs::write(sysfs.path().join("foo/operstate"), "up\n").unwrap();
-        let log = Logger::new("test");
 
-        assert!(interfaces_converged(&state, sysfs.path(), &log));
+        assert!(not_up_interfaces(&state, sysfs.path()).is_empty());
     }
 
     /// The regression this guards: the very first `apply()` after a boot
@@ -239,38 +289,84 @@ mod tests {
     /// applied" anyway, nothing ever retries it again, since the
     /// ConfigMap content itself never changes.
     #[test]
-    fn interfaces_converged_false_when_kernel_reports_down() {
+    fn not_up_interfaces_lists_interface_when_kernel_reports_down() {
+        let state = up_interface_state("foo");
+        let sysfs = tempfile::tempdir().unwrap();
+        fs::create_dir_all(sysfs.path().join("foo")).unwrap();
+        fs::write(sysfs.path().join("foo/operstate"), "down\n").unwrap();
+
+        assert_eq!(not_up_interfaces(&state, sysfs.path()).len(), 1);
+    }
+
+    #[test]
+    fn not_up_interfaces_lists_interface_when_operstate_missing() {
+        let state = up_interface_state("foo");
+        let sysfs = tempfile::tempdir().unwrap();
+
+        assert_eq!(not_up_interfaces(&state, sysfs.path()).len(), 1);
+    }
+
+    #[test]
+    fn not_up_interfaces_ignores_interfaces_not_desired_up() {
+        let state = NetworkState::new_from_yaml(
+            "interfaces:\n  - name: foo\n    type: ethernet\n    state: down\n",
+        )
+        .unwrap();
+        let sysfs = tempfile::tempdir().unwrap();
+
+        // Nothing in `sysfs` at all - would fail if this interface were
+        // checked, so this only passes because `not_up_interfaces`
+        // correctly skips interfaces the desired state didn't ask to be up.
+        assert!(not_up_interfaces(&state, sysfs.path()).is_empty());
+    }
+
+    /// The regression this guards: the very first `apply()` after a
+    /// boot/redeploy raced NetworkManager still bringing the interface up
+    /// on the kernel side - confirmed live, every interface reporting
+    /// `operstate: down` a mere ~2s after "applied successfully" - and a
+    /// single immediate check (the old `interfaces_converged` call site)
+    /// gave up on that instantly, deferring a full `POLL_INTERVAL` (2
+    /// minutes) for what's actually just NetworkManager catching up
+    /// within a couple of seconds. `wait_for_convergence` must retry
+    /// instead of failing on the first attempt.
+    #[test]
+    fn wait_for_convergence_retries_until_kernel_reports_up() {
+        let state = up_interface_state("foo");
+        let sysfs = tempfile::tempdir().unwrap();
+        let iface_dir = sysfs.path().join("foo");
+        fs::create_dir_all(&iface_dir).unwrap();
+        fs::write(iface_dir.join("operstate"), "down\n").unwrap();
+        let log = Logger::new("test");
+
+        let operstate_path = iface_dir.join("operstate");
+        let updater = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            fs::write(operstate_path, "up\n").unwrap();
+        });
+
+        let converged =
+            wait_for_convergence(&state, sysfs.path(), &log, 50, Duration::from_millis(5));
+        updater.join().unwrap();
+
+        assert!(converged);
+    }
+
+    /// A structural mismatch `nmstate` can never resolve (as opposed to
+    /// the transient race above) must still fall through to "not
+    /// converged" once the retry budget is spent, not retry forever
+    /// within a single tick.
+    #[test]
+    fn wait_for_convergence_gives_up_after_max_attempts() {
         let state = up_interface_state("foo");
         let sysfs = tempfile::tempdir().unwrap();
         fs::create_dir_all(sysfs.path().join("foo")).unwrap();
         fs::write(sysfs.path().join("foo/operstate"), "down\n").unwrap();
         let log = Logger::new("test");
 
-        assert!(!interfaces_converged(&state, sysfs.path(), &log));
-    }
+        let converged =
+            wait_for_convergence(&state, sysfs.path(), &log, 3, Duration::from_millis(1));
 
-    #[test]
-    fn interfaces_converged_false_when_operstate_missing() {
-        let state = up_interface_state("foo");
-        let sysfs = tempfile::tempdir().unwrap();
-        let log = Logger::new("test");
-
-        assert!(!interfaces_converged(&state, sysfs.path(), &log));
-    }
-
-    #[test]
-    fn interfaces_converged_ignores_interfaces_not_desired_up() {
-        let state = NetworkState::new_from_yaml(
-            "interfaces:\n  - name: foo\n    type: ethernet\n    state: down\n",
-        )
-        .unwrap();
-        let sysfs = tempfile::tempdir().unwrap();
-        let log = Logger::new("test");
-
-        // Nothing in `sysfs` at all - would fail if this interface were
-        // checked, so this only passes because `interfaces_converged`
-        // correctly skips interfaces the desired state didn't ask to be up.
-        assert!(interfaces_converged(&state, sysfs.path(), &log));
+        assert!(!converged);
     }
 
     /// The regression this guards: `sync` used to call
