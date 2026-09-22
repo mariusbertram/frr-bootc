@@ -49,6 +49,9 @@ pub fn cpu_count() -> usize {
         .max(1)
 }
 
+/// `Serialize`/`Clone`/`Debug` so a whole `Snapshot` can be carried
+/// across the gather-thread boundary and out through the `--json` mode.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MemInfo {
     pub used: u64,
     pub total: u64,
@@ -77,6 +80,7 @@ pub fn memory() -> Option<MemInfo> {
     })
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DiskInfo {
     pub used: u64,
     pub total: u64,

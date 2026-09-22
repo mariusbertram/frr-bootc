@@ -617,47 +617,67 @@ this repo's own scaling example is "150 BGP-coupled tenants" (see "A
 Trunk Instead of One NIC per Tenant" above), so both lists can genuinely
 get long.
 
-That compact **Overview** is one of three tabs - `1`/`2`/`3` jumps
+That compact **Overview** is one of four tabs - `1`/`2`/`3`/`4` jumps
 straight to one (the same idea as btop's own number-key box switcher), or
-`Tab`/`Shift+Tab`/`←`/`→` cycles - switching to the two detail tabs
-(**Interfaces**, **FRR / BGP**), which list everything with nothing cut
-off (VRF devices themselves are excluded from the Interfaces list - see
-below). `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` move a highlighted selection
-through that tab's list rather than just scrolling blindly (the same keys
-htop's own process list uses - deliberately no vi bindings alongside them,
-one recognizable control scheme, not two overlapping ones), and the view
-scrolls to follow the selection only once it would otherwise go off
-screen. `Enter` opens a popup with that one item's own detail - for an
-interface: MTU, MAC address, which VRF/device it's enslaved to (read from
+`Tab`/`Shift+Tab`/`←`/`→` cycles. The detail tabs (**Interfaces**,
+**FRR / BGP**) list everything with nothing cut off (VRF devices
+themselves are excluded from the Interfaces list - see below), and the
+fourth tab (**Events**) is the state-change log (see below). `↑`/`↓`/
+`PgUp`/`PgDn`/`Home`/`End` move a highlighted selection through a tab's
+list rather than just scrolling blindly (the same keys htop's own process
+list uses - deliberately no vi bindings alongside them, one recognizable
+control scheme, not two overlapping ones), and the view scrolls to follow
+the selection only once it would otherwise go off screen. `Enter` opens a
+popup with that one item's own detail - for an interface: MTU, MAC
+address, which VRF/device it's enslaved to (read from
 `/sys/class/net/<iface>/master`, same relationship `ip -d link show`
-reports as `master vrf-tenant1`), and cumulative rx/tx byte/packet/error/
-drop counters, gathered on demand only for the one interface being looked
-at (see `net::InterfaceDetail`) rather than for every interface on every
-tick. A sub-interface's kernel name is what actually has to be used for
-every one of those `/sys/class/net/...` reads - `ip` *displays* it
-suffixed with its parent (`bdbos@enp3s0`), but that suffix isn't part of
-the real interface name, so `net::sysfs_name` strips it back off first;
-missing that was a real bug (MTU/MAC/master/throughput all silently
-failed to resolve - a missing file, not an error - for every VLAN
-sub-interface, since none of them actually exist under that suffixed
-name in `/sys/class/net/`). VRF devices (`vrf-tenant1`) are filtered out
-of the Interfaces list entirely (`ip -brief link show type vrf` is the
-authoritative source for which devices those are) rather than shown with
-an MTU that reads as broken - the Linux VRF driver's default MTU is
-65535+ (a routing-table selector isn't a real link with a frame-size
-limit of its own), and a VRF already has its own detail view: the FRR/BGP
-tab. There, `Enter` on a VRF shows its individual BGP peers (a dual-stack
-peer shows as two rows, one per AFI, since the sessions can be in
-different states), each
-with its state, remote AS, uptime, and prefixes received/sent - FRR's own
-`pfxRcd`/`pfxSnt` numbers, i.e. what that peer has had imported into this
-VRF's table and exported/advertised to it. `Esc` closes the popup. Each
-tab keeps its own selection and scroll position, so switching away and
-back doesn't lose your place. The footer is a permanent key/action hint
-bar in the same spirit as htop's own `F1Help F2Setup ...` row. Redraws on
-a key press happen immediately rather than waiting for the next refresh
-tick, but the underlying data itself still only refreshes on its own 5s
-cadence either way.
+reports as `master vrf-tenant1`), the current error/drop *rate*, and
+cumulative rx/tx byte/packet/error/drop counters, gathered on demand only
+for the one interface being looked at (see `net::InterfaceDetail`) rather
+than for every interface on every tick. A sub-interface's kernel name is
+what actually has to be used for every one of those `/sys/class/net/...`
+reads - `ip` *displays* it suffixed with its parent (`bdbos@enp3s0`), but
+that suffix isn't part of the real interface name, so `net::sysfs_name`
+strips it back off first; missing that was a real bug
+(MTU/MAC/master/throughput all silently failed to resolve - a missing
+file, not an error - for every VLAN sub-interface, since none of them
+actually exist under that suffixed name in `/sys/class/net/`). VRF
+devices (`vrf-tenant1`) are filtered out of the Interfaces list entirely
+(`ip -brief link show type vrf` is the authoritative source for which
+devices those are) rather than shown with an MTU that reads as broken -
+the Linux VRF driver's default MTU is 65535+ (a routing-table selector
+isn't a real link with a frame-size limit of its own), and a VRF already
+has its own detail view: the FRR/BGP tab. There, `Enter` on a VRF shows
+its individual BGP peers (a dual-stack peer shows as two rows, one per
+AFI, since the sessions can be in different states; sessions that aren't
+Established sort to the top of the popup), each with its state, remote
+AS, uptime, and prefixes received/sent - FRR's own `pfxRcd`/`pfxSnt`
+numbers, i.e. what that peer has had imported into this VRF's table and
+exported/advertised to it - plus the VRF's BFD sessions, whose state
+usually explains a flapping BGP session before BGP itself reacts. In the
+Overview's **Sync Services** panel, `↑`/`↓` selects a sync service and
+`Enter` opens its last journal lines (`journalctl -u <unit> -n 40`) right
+on the console - no `b`-login detour to answer "why is this sync red".
+`Esc` closes any popup. Popups scroll (`↑`/`↓`/`PgUp`/`PgDn` move the
+popup's own content, with a scrollbar at its right edge) - a tenant VRF
+with dozens of BGP peers used to be hard-clipped past the screen edge,
+which is exactly when the tail of the list most needs reading. On the
+Events tab the same keys scroll the log; it auto-follows the newest event
+until you scroll up to read history and resumes once you return to the
+bottom. Each tab keeps its own selection and scroll position, so
+switching away and back doesn't lose your place. The footer is a
+permanent key/action hint bar in the same spirit as htop's own
+`F1Help F2Setup ...` row, and drops its lower-priority hints tier by tier
+on narrow terminals (80 columns, i.e. a serial console, keeps the
+load-bearing ones) rather than clipping a hint mid-word. Redraws on a key
+press happen immediately rather than waiting for the next refresh tick,
+but the underlying data itself still only refreshes on the gather
+thread's 5s cadence either way - gathering runs on a background thread,
+so a stalled vty socket (its read timeout is 10s) or a slow `bootc
+status` used to freeze the whole event loop, keyboard included, with no
+on-screen sign anything was stale; now the UI keeps responding and the
+header shows how stale the data is (`data Ns ago`, red past 2x the
+refresh interval).
 
 - `frr-console-tty1.service` - the graphical/VNC console (`virtctl vnc`)
 - `frr-console-ttyS0.service` - the serial console (`virtctl console`)
@@ -672,7 +692,19 @@ consoles KubeVirt exposes directly.
 
 The dashboard auto-refreshes every 5s, showing:
 
+- a **health verdict** in the header - `healthy`, `WARN (n)` or
+  `CRIT (n)`, aggregated from everything below (FRR down, failed syncs,
+  BGP/BFD sessions down, memory/disk saturation, a pending reboot), so
+  "is anything wrong" is one glance instead of a panel-by-panel scan.
+  The aggregation is deliberately conservative: only unambiguous faults
+  escalate the badge - an admin-down interface or a 0/0 (BGP instance
+  but no neighbors) VRF stays panel-level information
 - uptime, load, memory, disk
+- a rolling **traffic graph** (rx/tx sparklines, ~6 minutes at the 5s
+  cadence) for the interface carrying the most cumulative traffic - in
+  this image's design that is always the one physical trunk every
+  tenant VLAN rides on. The panel yields entirely on short terminals
+  (below ~22 rows)
 - network interfaces (`ip -brief addr`) with up/down state and live
   rx/tx throughput (a delta between two `/sys/class/net/*/statistics`
   samples, so it needs one redraw to warm up - "throughput: -" the first
@@ -681,16 +713,51 @@ The dashboard auto-refreshes every 5s, showing:
 - established-vs-configured BGP peer counts **per VRF** (each tenant gets
   its own VRF and its own BGP instance - see "VRF per Tenant" above - so
   one tenant's session being down doesn't hide behind another's being
-  fine), when `bgpd` is running
+  fine), when `bgpd` is running - with VRFs that have downed sessions
+  sorted to the top and per-VRF RIB/FIB route counts (a RIB/FIB
+  divergence means FRR knows routes the kernel hasn't installed; shown
+  for up to 30 VRFs, past that only the global RIB count - one dashboard
+  tick must not turn into 150 vty round-trips)
+- BFD session state (`show bfd peers json` via the same direct vty
+  socket client, when `bfdd` is running) - BFD is what actually detects
+  the link failures behind `neighbor ... bfd` peering, often before BGP
+  reacts
+- vty **query failures** (a daemon socket not answering, a rejected
+  command, response schema drift) as a muted line in the FRR panel and
+  as events - so a blank BGP section is distinguishable from an empty
+  one
 - health of the three sync services (`frr-config-sync`,
-  `network-config-sync`, `bootc-image-sync`) - FAILED if a unit's last run
-  failed, a warning if its timer isn't active, so a silently-broken sync
-  is visible right on the console instead of only in `journalctl`
-- the current `bootc status` (booted/staged image)
+  `network-config-sync`, `bootc-image-sync`) with the *reason*: "process
+  not running", "status stale (Nm ago)" or the status file's own error
+  line from the last failed attempt - three red rows used to be
+  indistinguishable `FAILED`s; a warning if a timer isn't active
+- the current `bootc status`, parsed (`bootc status --json`, text
+  fallback): booted image/digest, and a persistent `reboot required`
+  warning while a staged update sits unapplied - that's exactly the
+  signal the rolling-reboot decision needs
+- an **event log** (fourth tab): every state transition the dashboard
+  observes between refreshes - interface up/down/address changes, BGP
+  and BFD session flaps, sync health changes with their reason, FRR
+  service start/stop, staged updates and completed reboots - each
+  timestamped. Kept in a bounded ring buffer and appended to
+  `/var/log/frr-console-events.log`, with the tail restored on startup,
+  so history survives the dashboard's own restarts (a `b` login/reboot
+  included). On a VM with no alerting and no log aggregation, this is
+  the only place "since when?" has an answer
+
+Run with stdout not a tty it prints one snapshot and exits - plain text,
+or `--json` for a machine-readable report (health verdict, full
+snapshot, the last 20 events). Both modes exit `0` when the verdict is
+healthy, `1` on warnings and `2` on critical findings, which makes a
+scripted health check possible without a second binary:
+`virtctl console ... | frr-console --json || alert`. `--refresh <secs>`
+(or `FRR_CONSOLE_REFRESH_SECS`) changes the refresh interval.
 
 Viewing it needs no authentication - whoever already has console access to
 the VM (via `virtctl`/`oc` RBAC) is already privileged enough that this
-isn't new exposure. `b` execs a real `/bin/login` (the normal
+isn't new exposure. Reading a sync unit's journal from the Overview (see
+above) is on the same footing - it reads what `journalctl` would show
+anyone already on the console. `b` execs a real `/bin/login` (the normal
 "login:"/password prompt), so an actual shell is still gated on real
 credentials. Exiting that shell ends the `login` process, which the owning
 unit's `Restart=always` immediately answers by relaunching the dashboard

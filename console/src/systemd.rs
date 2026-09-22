@@ -1,7 +1,8 @@
-//! Thin wrappers around `systemctl`. No dbus/zbus dependency: these are
-//! infrequent (once per REFRESH_SECS), and shelling out to the same CLI an
-//! operator would run is a smaller, more obviously-correct surface than
-//! hand-rolling a systemd D-Bus client for three property reads.
+//! Thin wrappers around `systemctl` plus journalctl access. No dbus/zbus
+//! dependency: these are infrequent (once per REFRESH_SECS), and shelling
+//! out to the same CLI an operator would run is a smaller,
+//! more obviously-correct surface than hand-rolling a systemd D-Bus
+//! client for three property reads.
 
 use std::fs;
 use std::process::{Command, Stdio};
@@ -37,10 +38,57 @@ pub fn is_failed(unit: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Why a sync unit is unhealthy - the old `SyncHealth::Failed` carried no
+/// distinction between "the daemon process is gone", "its status file
+/// went stale" and "the last sync attempt reported an error", all three
+/// of which have very different fixes, and the dashboard could only say
+/// "FAILED" plus point at journalctl. The reason text is shown right in
+/// the Sync Services panel instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum SyncHealth {
-    Ok,
-    Failed,
+    /// Process up, status file fresh and reporting success. Carries how
+    /// long ago the last sync attempt ran (the status file's mtime) so
+    /// the panel can show "ok, 2m ago" - "ok" alone can't distinguish a
+    /// sync that ran a minute ago from one that hasn't run since boot.
+    Ok {
+        age_secs: u64,
+    },
+    Failed {
+        reason: String,
+    },
     TimerNotActive,
+}
+
+impl SyncHealth {
+    /// Short status word for the Sync Services table's status column.
+    pub fn status_word(&self) -> &'static str {
+        match self {
+            SyncHealth::Ok { .. } => "ok",
+            SyncHealth::Failed { .. } => "FAILED",
+            SyncHealth::TimerNotActive => "timer not active",
+        }
+    }
+
+    /// The human-readable "why" line for the table's detail column (and
+    /// the health verdict) - for a failure, the actual cause; for Ok, how
+    /// stale the last attempt is.
+    pub fn detail(&self) -> String {
+        match self {
+            SyncHealth::Ok { age_secs } => format!("last attempt {}", fmt_age(*age_secs)),
+            SyncHealth::Failed { reason } => reason.clone(),
+            SyncHealth::TimerNotActive => "timer disabled - it will never run again".to_string(),
+        }
+    }
+}
+
+/// Seconds -> "just now"/"2m"/"1h 3m"-style compact age, used for status
+/// ages and (potentially) anywhere else a duration is shown compactly.
+pub fn fmt_age(secs: u64) -> String {
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        _ => format!("{}h {}m ago", secs / 3600, secs % 3600 / 60),
+    }
 }
 
 /// How to determine a sync unit's health - the two shapes this codebase
@@ -78,11 +126,13 @@ pub fn sync_health(service: &str, kind: &SyncKind) -> SyncHealth {
 /// Ok otherwise.
 fn sync_health_timer(service: &str, timer: &str) -> SyncHealth {
     if is_failed(service) {
-        SyncHealth::Failed
+        SyncHealth::Failed {
+            reason: "last run failed".to_string(),
+        }
     } else if !is_active(timer) {
         SyncHealth::TimerNotActive
     } else {
-        SyncHealth::Ok
+        SyncHealth::Ok { age_secs: 0 }
     }
 }
 
@@ -92,31 +142,85 @@ fn sync_health_timer(service: &str, timer: &str) -> SyncHealth {
 /// its most recent attempt reported success recently.
 fn sync_health_daemon(service: &str, status_file: &str) -> SyncHealth {
     if !is_active(service) {
-        return SyncHealth::Failed;
+        return SyncHealth::Failed {
+            reason: "process not running".to_string(),
+        };
     }
-    if read_recent_ok(status_file) {
-        SyncHealth::Ok
-    } else {
-        SyncHealth::Failed
+    match read_recent_ok(status_file) {
+        StatusRead::Ok { age_secs } => SyncHealth::Ok { age_secs },
+        StatusRead::Missing => SyncHealth::Failed {
+            reason: "status file missing (never synced?)".to_string(),
+        },
+        StatusRead::Stale(age_secs) => SyncHealth::Failed {
+            reason: format!("status stale ({}), daemon may be stuck", fmt_age(age_secs)),
+        },
+        StatusRead::Error(content) => SyncHealth::Failed {
+            // The status file's content IS the daemon's own error line
+            // from its last attempt - the most direct answer to "why is
+            // this red" there is, no journalctl detour needed.
+            reason: content,
+        },
     }
 }
 
-fn read_recent_ok(status_file: &str) -> bool {
+/// The outcome of reading a daemon's status file, each case mapped to a
+/// distinct failure reason by the caller - the point of the enum is that
+/// "missing", "stale" and "reports an error" are three different
+/// problems an operator would triage differently.
+#[derive(Debug)]
+enum StatusRead {
+    Ok { age_secs: u64 },
+    Missing,
+    Stale(u64),
+    Error(String),
+}
+
+fn read_recent_ok(status_file: &str) -> StatusRead {
     let Ok(meta) = fs::metadata(status_file) else {
-        return false;
+        return StatusRead::Missing;
     };
     let Ok(modified) = meta.modified() else {
-        return false;
+        return StatusRead::Missing;
     };
-    if SystemTime::now()
+    let age = SystemTime::now()
         .duration_since(modified)
-        .is_ok_and(|age| age > MAX_STATUS_AGE)
-    {
-        return false;
+        .unwrap_or(Duration::ZERO);
+    if age > MAX_STATUS_AGE {
+        return StatusRead::Stale(age.as_secs());
     }
-    fs::read_to_string(status_file)
-        .map(|s| s.trim() == "ok")
-        .unwrap_or(false)
+    match fs::read_to_string(status_file) {
+        Ok(s) if s.trim() == "ok" => StatusRead::Ok {
+            age_secs: age.as_secs(),
+        },
+        Ok(s) => StatusRead::Error(s.trim().to_string()),
+        Err(_) => StatusRead::Error("status file unreadable".to_string()),
+    }
+}
+
+/// The last `lines` journal lines of a unit, newest last - what the
+/// console's journal popup shows when a sync service is selected. Best
+/// effort: any failure (journalctl missing/broken) yields `None` and the
+/// popup says so rather than erroring. stdout/stderr are explicitly
+/// captured (never inherited) for the same frame-corruption reason every
+/// other subprocess call here nulls or captures its output.
+pub fn recent_journal(unit: &str, lines: usize) -> Option<String> {
+    let out = Command::new("journalctl")
+        .args([
+            "-u",
+            unit,
+            "-n",
+            &lines.to_string(),
+            "--no-pager",
+            "-o",
+            "short",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    Some(text.trim_end().to_string())
 }
 
 #[cfg(test)]
@@ -141,34 +245,76 @@ mod tests {
     }
 
     #[test]
-    fn missing_status_file_is_not_recent_ok() {
+    fn missing_status_file_reports_missing() {
         let path = temp_path("missing");
         let _ = fs::remove_file(&path);
-        assert!(!read_recent_ok(path.to_str().unwrap()));
+        assert!(matches!(
+            read_recent_ok(path.to_str().unwrap()),
+            StatusRead::Missing
+        ));
     }
 
     #[test]
-    fn fresh_ok_status_is_recent_ok() {
+    fn fresh_ok_status_is_ok_with_age() {
         let path = temp_path("fresh-ok");
         fs::write(&path, "ok\n").unwrap();
-        assert!(read_recent_ok(path.to_str().unwrap()));
+        assert!(matches!(
+            read_recent_ok(path.to_str().unwrap()),
+            StatusRead::Ok { .. }
+        ));
         let _ = fs::remove_file(&path);
     }
 
     #[test]
-    fn fresh_error_status_is_not_recent_ok() {
+    fn fresh_error_status_carries_the_error_content() {
         let path = temp_path("fresh-error");
-        fs::write(&path, "error: boom\n").unwrap();
-        assert!(!read_recent_ok(path.to_str().unwrap()));
+        fs::write(&path, "error: vtysh -C failed\n").unwrap();
+        match read_recent_ok(path.to_str().unwrap()) {
+            StatusRead::Error(content) => {
+                assert_eq!(content, "error: vtysh -C failed")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
         let _ = fs::remove_file(&path);
     }
 
     #[test]
-    fn stale_ok_status_is_not_recent_ok() {
+    fn stale_ok_status_reports_stale_with_age() {
         let path = temp_path("stale-ok");
         fs::write(&path, "ok\n").unwrap();
         set_mtime(&path, SystemTime::now() - StdDuration::from_secs(3600));
-        assert!(!read_recent_ok(path.to_str().unwrap()));
+        match read_recent_ok(path.to_str().unwrap()) {
+            StatusRead::Stale(age) => assert!(age >= 3600),
+            other => panic!("expected Stale, got {other:?}"),
+        }
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failure_reasons_are_distinct_per_cause() {
+        let process = SyncHealth::Failed {
+            reason: "process not running".to_string(),
+        };
+        let stale = SyncHealth::Failed {
+            reason: "status stale (6m ago), daemon may be stuck".to_string(),
+        };
+        // The whole point of carrying reasons: three red rows must not be
+        // indistinguishable "FAILED"s anymore.
+        assert_ne!(process.detail(), stale.detail());
+        assert_eq!(
+            SyncHealth::TimerNotActive.detail(),
+            "timer disabled - it will never run again"
+        );
+        assert_eq!(
+            SyncHealth::Ok { age_secs: 120 }.detail(),
+            "last attempt 2m ago"
+        );
+    }
+
+    #[test]
+    fn fmt_age_buckets() {
+        assert_eq!(fmt_age(10), "just now");
+        assert_eq!(fmt_age(120), "2m ago");
+        assert_eq!(fmt_age(3900), "1h 5m ago");
     }
 }
