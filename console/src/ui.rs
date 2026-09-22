@@ -14,13 +14,15 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Table, TableState, Tabs,
+    ScrollbarOrientation, ScrollbarState, Sparkline, Table, TableState, Tabs,
 };
 use ratatui::Frame;
 
+use crate::events::EventLog;
 use crate::frr::BgpPeerDetail;
-use crate::net::{fmt_rate, InterfaceDetail};
-use crate::snapshot::Snapshot;
+use crate::health;
+use crate::net::{fmt_rate, InterfaceDetail, Traffic};
+use crate::snapshot::{BootcStatus, Snapshot};
 use crate::system::fmt_bytes;
 use crate::systemd::SyncHealth;
 
@@ -32,7 +34,8 @@ const MUTED: Color = Color::DarkGray;
 
 /// Overview is the original single-screen layout (compact, "+N more"
 /// truncated) - Interfaces/Frr are full, scrollable listings of the same
-/// data with nothing left out, for whenever there's more to look at than
+/// data with nothing left out, and Events is the state-change log
+/// (see events.rs), for whenever there's more to look at than
 /// "+N more" wants to say (this repo's own scaling example is "150
 /// BGP-coupled tenants" - see the README's "A Trunk Instead of One NIC
 /// per Tenant" section).
@@ -42,9 +45,10 @@ pub enum Tab {
     Overview,
     Interfaces,
     Frr,
+    Events,
 }
 
-const TABS: [Tab; 3] = [Tab::Overview, Tab::Interfaces, Tab::Frr];
+const TABS: [Tab; 4] = [Tab::Overview, Tab::Interfaces, Tab::Frr, Tab::Events];
 
 impl Tab {
     fn title(self) -> &'static str {
@@ -52,6 +56,7 @@ impl Tab {
             Tab::Overview => "Overview",
             Tab::Interfaces => "Interfaces",
             Tab::Frr => "FRR / BGP",
+            Tab::Events => "Events",
         }
     }
 
@@ -70,10 +75,9 @@ impl Tab {
 
 /// Lives across redraws (unlike `Snapshot`, which is rebuilt from
 /// scratch every refresh) - which tab is active, which item is selected
-/// (highlighted) in each of the two detail tabs' own listing, how far
-/// each is scrolled, and whether the selected item's own detail popup
-/// is open. Kept per-tab rather than shared so that switching tabs and
-/// back doesn't lose your place in either one.
+/// (highlighted) in each listing, how far each is scrolled, and whether
+/// a detail popup is open (plus its own scroll). Kept per-tab rather
+/// than shared so that switching tabs and back doesn't lose your place.
 #[derive(Default)]
 pub struct AppState {
     pub tab: Tab,
@@ -81,30 +85,38 @@ pub struct AppState {
     interfaces_selected: usize,
     frr_scroll: u16,
     frr_selected: usize,
+    sync_selected: usize,
     detail_open: bool,
+    detail_scroll: u16,
+    events_scroll: u16,
+    events_follow: bool,
 }
 
 impl AppState {
     pub fn next_tab(&mut self) {
         self.tab = self.tab.next();
-        self.detail_open = false;
+        self.close_detail();
     }
 
     pub fn prev_tab(&mut self) {
         self.tab = self.tab.prev();
-        self.detail_open = false;
+        self.close_detail();
     }
 
     pub fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
-        self.detail_open = false;
+        self.close_detail();
     }
 
+    /// Which list the selection keys drive on the active tab - Overview
+    /// selects sync services (Enter opens their journal), Interfaces/
+    /// Frr select their listings, Events has no selection (it scrolls).
     fn selected_mut(&mut self) -> Option<&mut usize> {
         match self.tab {
-            Tab::Overview => None,
+            Tab::Overview => Some(&mut self.sync_selected),
             Tab::Interfaces => Some(&mut self.interfaces_selected),
             Tab::Frr => Some(&mut self.frr_selected),
+            Tab::Events => None,
         }
     }
 
@@ -112,15 +124,19 @@ impl AppState {
         self.interfaces_selected
     }
 
+    pub fn sync_selected(&self) -> usize {
+        self.sync_selected
+    }
+
     pub fn detail_open(&self) -> bool {
         self.detail_open
     }
 
-    /// A no-op on Overview, which has nothing to select - callers don't
+    /// A no-op on Events, which has nothing to select - callers don't
     /// need to check which tab is active first. The real maximum only
     /// becomes known once the list's actual length is available at
-    /// render time (see interfaces_detail/frr_detail, which clamp down
-    /// to it), same reasoning as the old scroll_to_bottom's u16::MAX.
+    /// render time (see the render functions, which clamp down to it),
+    /// same reasoning as the old scroll_to_bottom's u16::MAX.
     pub fn move_selection(&mut self, delta: i32) {
         let Some(selected) = self.selected_mut() else {
             return;
@@ -145,19 +161,78 @@ impl AppState {
     }
 
     /// Opens the detail popup for whichever item is currently selected -
-    /// a no-op on Overview (nothing to select there in the first place).
+    /// a no-op on Events (nothing to select there in the first place)
+    /// and on an Overview with no sync services to drill into.
     pub fn toggle_detail(&mut self) {
-        if self.tab != Tab::Overview {
-            self.detail_open = !self.detail_open;
+        match self.tab {
+            Tab::Events => {}
+            Tab::Overview if self.sync_selected == usize::MAX => {}
+            _ => {
+                self.detail_open = !self.detail_open;
+                // Every (re)open starts at the top of the popup's
+                // content - inheriting the previous popup's scroll
+                // offset would land the reader mid-list of a different
+                // item.
+                if self.detail_open {
+                    self.detail_scroll = 0;
+                }
+            }
         }
     }
 
     pub fn close_detail(&mut self) {
         self.detail_open = false;
+        self.detail_scroll = 0;
+    }
+
+    /// Popup scrolling - `u16::MAX` is the "jump to the very bottom"
+    /// sentinel (the render pass clamps it to the real content height),
+    /// the same trick `select_last` uses for list selections.
+    pub fn detail_scroll_by(&mut self, delta: i32) {
+        self.detail_scroll = if delta >= 0 {
+            self.detail_scroll.saturating_add(delta as u16)
+        } else {
+            self.detail_scroll
+                .saturating_sub(delta.unsigned_abs() as u16)
+        };
+    }
+
+    pub fn detail_scroll_top(&mut self) {
+        self.detail_scroll = 0;
+    }
+
+    pub fn detail_scroll_bottom(&mut self) {
+        self.detail_scroll = u16::MAX;
+    }
+
+    /// Events-tab scrolling. Scrolling up deliberately suspends
+    /// auto-follow (a new event arriving mid-read must not yank the
+    /// view back to the bottom); reaching the bottom again re-enables
+    /// it (see events_panel).
+    pub fn events_scroll_by(&mut self, delta: i32) {
+        self.events_follow = false;
+        self.events_scroll = if delta >= 0 {
+            self.events_scroll.saturating_add(delta as u16)
+        } else {
+            self.events_scroll
+                .saturating_sub(delta.unsigned_abs() as u16)
+        };
+    }
+
+    pub fn events_to_top(&mut self) {
+        self.events_follow = false;
+        self.events_scroll = 0;
+    }
+
+    pub fn events_to_bottom(&mut self) {
+        self.events_follow = true;
     }
 }
 
-fn panel(title: &str) -> Block<'_> {
+/// `Block<'static>` on purpose: the title text is copied into an owned
+/// `Span`, so callers can build titles from temporaries (e.g. a
+/// `format!`ed traffic panel title) without the block borrowing them.
+fn panel(title: &str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -180,11 +255,31 @@ fn gauge_color(percent: u16) -> Color {
     }
 }
 
-pub fn render(frame: &mut Frame, snap: &Snapshot, state: &mut AppState, refresh_secs: u64) {
+pub fn render(
+    frame: &mut Frame,
+    snap: Option<&Snapshot>,
+    log: &EventLog,
+    state: &mut AppState,
+    refresh_secs: u64,
+    data_age_secs: Option<u64>,
+) {
+    let Some(snap) = snap else {
+        // First moments after startup, before the gather thread's first
+        // snapshot has arrived - say so instead of drawing empty panels
+        // that could be mistaken for "nothing is running".
+        let text = Paragraph::new(Span::styled(
+            " collecting data...",
+            Style::default().fg(MUTED),
+        ))
+        .block(panel("Status"));
+        frame.render_widget(text, frame.area());
+        return;
+    };
+
     let image_height = snap
-        .bootc_status
+        .bootc
         .as_ref()
-        .map_or(0, |s| s.lines().count() as u16 + 2);
+        .map_or(0, |b| bootc_panel_lines(b).len() as u16 + 2);
 
     // Network Interfaces and FRR are the two panels whose natural content
     // size varies a lot (tenant count, VRF count - this repo's own README
@@ -204,6 +299,8 @@ pub fn render(frame: &mut Frame, snap: &Snapshot, state: &mut AppState, refresh_
     // by the same number. The Interfaces/Frr tabs sidestep the whole
     // question by not truncating at all - they scroll instead (see
     // interfaces_detail/frr_detail).
+    let total_height = frame.area().height;
+    let traffic_height = traffic_panel_height(total_height);
     let mut constraints = vec![
         Constraint::Length(3), // header
         Constraint::Length(1), // tab bar
@@ -211,6 +308,9 @@ pub fn render(frame: &mut Frame, snap: &Snapshot, state: &mut AppState, refresh_
     match state.tab {
         Tab::Overview => {
             constraints.push(Constraint::Length(3)); // stats row
+            if let Some(height) = traffic_height {
+                constraints.push(Constraint::Length(height)); // traffic graph
+            }
             constraints.push(Constraint::Fill(3)); // network interfaces
             constraints.push(Constraint::Fill(2)); // FRR
             constraints.push(Constraint::Length(6)); // sync services
@@ -218,7 +318,7 @@ pub fn render(frame: &mut Frame, snap: &Snapshot, state: &mut AppState, refresh_
                 constraints.push(Constraint::Length(image_height));
             }
         }
-        Tab::Interfaces | Tab::Frr => constraints.push(Constraint::Fill(1)),
+        Tab::Interfaces | Tab::Frr | Tab::Events => constraints.push(Constraint::Fill(1)),
     }
     constraints.push(Constraint::Length(1)); // footer
 
@@ -230,38 +330,74 @@ pub fn render(frame: &mut Frame, snap: &Snapshot, state: &mut AppState, refresh_
         area
     };
 
-    header(frame, next(), snap);
+    header(frame, next(), snap, data_age_secs, refresh_secs);
     tab_bar(frame, next(), state.tab);
 
     match state.tab {
         Tab::Overview => {
             stats_row(frame, next(), snap);
+            if traffic_height.is_some() {
+                let area = next();
+                match &snap.traffic {
+                    Some(traffic) => traffic_panel(frame, area, traffic),
+                    None => frame.render_widget(
+                        Paragraph::new(Span::styled(
+                            " (warming up - no throughput samples yet)",
+                            Style::default().fg(MUTED),
+                        ))
+                        .block(panel("Traffic")),
+                        area,
+                    ),
+                }
+            }
             interfaces_table(frame, next(), snap);
             frr_panel(frame, next(), snap);
-            sync_table(frame, next(), snap);
+            sync_table(frame, next(), snap, state);
             if image_height > 0 {
                 image_panel(frame, next(), snap);
             }
+            if state.detail_open {
+                if let Some(unit) = snap.sync_units.get(state.sync_selected) {
+                    let lines: Vec<Line<'static>> = match &snap.selected_sync_journal {
+                        Some(journal) => {
+                            journal.lines().map(|l| Line::from(l.to_string())).collect()
+                        }
+                        None => vec![Line::styled(
+                            "(no journal output)",
+                            Style::default().fg(MUTED),
+                        )],
+                    };
+                    // Anchored over the whole frame - the Overview has
+                    // no single panel a journal belongs to.
+                    render_popup(
+                        frame,
+                        frame.area(),
+                        unit.label,
+                        lines,
+                        &mut state.detail_scroll,
+                    );
+                }
+            }
         }
-        Tab::Interfaces => interfaces_detail(
-            frame,
-            next(),
-            snap,
-            &mut state.interfaces_scroll,
-            &mut state.interfaces_selected,
-            state.detail_open,
-        ),
-        Tab::Frr => frr_detail(
-            frame,
-            next(),
-            snap,
-            &mut state.frr_scroll,
-            &mut state.frr_selected,
-            state.detail_open,
-        ),
+        Tab::Interfaces => interfaces_detail(frame, next(), snap, state),
+        Tab::Frr => frr_detail(frame, next(), snap, state),
+        Tab::Events => events_panel(frame, next(), log, state),
     }
 
     footer(frame, next(), state.tab, state.detail_open, refresh_secs);
+}
+
+/// The traffic panel's height for a given terminal height - 2-row
+/// sparklines when there's room to spare, 1-row ones on a short
+/// terminal, nothing at all below 22 rows (an 80x24 serial console with
+/// every other panel up has no business fitting a graph too; the
+/// detail tabs keep the numbers readable there instead).
+fn traffic_panel_height(total_height: u16) -> Option<u16> {
+    match total_height {
+        0..=21 => None,
+        22..=29 => Some(6),
+        _ => Some(8),
+    }
 }
 
 fn tab_bar(frame: &mut Frame, area: Rect, active: Tab) {
@@ -290,22 +426,45 @@ fn render_scrollbar(frame: &mut Frame, area: Rect, total_rows: u16, visible_rows
     frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
-fn header(frame: &mut Frame, area: Rect, snap: &Snapshot) {
+fn header(
+    frame: &mut Frame,
+    area: Rect,
+    snap: &Snapshot,
+    data_age_secs: Option<u64>,
+    refresh_secs: u64,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT));
-    let line = Line::from(vec![
+    let verdict = health::assess(snap);
+
+    let mut line = Line::from(vec![
         Span::styled(
             format!(" {} ", snap.hostname),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("frr-bootc router console", Style::default().fg(MUTED)),
-        Span::raw("   "),
-        Span::raw(&snap.now),
-        Span::raw("   uptime "),
-        Span::raw(&snap.uptime),
+        status(verdict.badge(), verdict.level.color()),
     ]);
+    // Ordered by how much it matters on a narrow terminal: the verdict
+    // and how stale the data is survive clipping; the static label is
+    // first to go, the clock last.
+    if let Some(age) = data_age_secs {
+        let stale = age > refresh_secs.saturating_mul(2);
+        line.spans.push(Span::raw("  data "));
+        line.spans.push(status(
+            format!("{age}s ago"),
+            if stale { BAD } else { MUTED },
+        ));
+    }
+    line.spans.push(Span::raw("   "));
+    line.spans.push(Span::raw(&snap.now));
+    line.spans.push(Span::raw("   uptime "));
+    line.spans.push(Span::raw(&snap.uptime));
+    line.spans.push(Span::styled(
+        "   frr-bootc router console",
+        Style::default().fg(MUTED),
+    ));
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
@@ -366,6 +525,68 @@ fn render_gauge(frame: &mut Frame, area: Rect, title: &str, data: Option<(u16, S
     }
 }
 
+/// The Overview tab's traffic graph: rolling rx/tx for the interface
+/// carrying the most cumulative traffic (the one physical trunk in this
+/// image's design), one autoscaling sparkline per direction. Two
+/// directions, never one combined curve - on a router the rx/tx
+/// asymmetry *is* the signal.
+fn traffic_panel(frame: &mut Frame, area: Rect, traffic: &Traffic) {
+    // How tall the two spark areas are is decided entirely by the
+    // constraint `traffic_panel_height` picked for the panel - the Fill
+    // splits below turn that into 1 or 2 sparkline rows each, no
+    // separate bookkeeping here.
+    let block = panel(&format!("Traffic ({}, ~6 min, 5s/bar)", traffic.name));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [rx_label, rx_spark, tx_label, tx_spark] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+
+    let rx: Vec<u64> = traffic
+        .series
+        .iter()
+        .map(|&(rx, _)| rx.saturating_mul(8))
+        .collect();
+    let tx: Vec<u64> = traffic
+        .series
+        .iter()
+        .map(|&(_, tx)| tx.saturating_mul(8))
+        .collect();
+
+    for (label_area, spark_area, series, name, color) in [
+        (&rx_label, &rx_spark, &rx, "rx", ACCENT),
+        (&tx_label, &tx_spark, &tx, "tx", OK),
+    ] {
+        let latest = series.last().copied();
+        let peak = series.iter().max().copied();
+        let fmt = |bits: u64| fmt_rate(bits / 8);
+        let mut spans = vec![Span::styled(
+            format!("{name} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )];
+        match (latest, peak) {
+            (Some(latest), Some(peak)) => {
+                spans.push(Span::raw(fmt(latest)));
+                spans.push(Span::styled(
+                    format!("   peak {}", fmt(peak)),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            _ => spans.push(Span::styled("-", Style::default().fg(MUTED))),
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), *label_area);
+        let spark = Sparkline::default()
+            .data(series)
+            .style(Style::default().fg(color));
+        frame.render_widget(spark, *spark_area);
+    }
+}
+
 // How many interfaces (from the front of the list) fit in `budget` data
 // rows, given each takes 1 row normally or 2 if it has an address to
 // show on its own row below - and, unless every one of them fits, 1 more
@@ -403,6 +624,43 @@ fn interfaces_visible(snap: &Snapshot, budget: usize) -> (usize, usize) {
     (0, total)
 }
 
+fn interface_rows(snap: &Snapshot, shown: usize, selected: Option<usize>) -> Vec<Row<'static>> {
+    snap.interfaces[..shown]
+        .iter()
+        .enumerate()
+        .flat_map(|(i, iface)| {
+            let (state_text, color) = if iface.up { ("UP", OK) } else { ("DOWN", BAD) };
+            let rate = match iface.rate {
+                Some((rx, tx)) => format!("rx {} / tx {}", fmt_rate(rx), fmt_rate(tx)),
+                None => "-".to_string(),
+            };
+            let row_style = if Some(i) == selected {
+                Style::default().add_modifier(SELECTED)
+            } else {
+                Style::default()
+            };
+            let main = Row::new(vec![
+                Cell::from(iface.name.clone()),
+                Cell::from(Span::styled(state_text, Style::default().fg(color))),
+                Cell::from(rate),
+            ])
+            .style(row_style);
+            let addr = (!iface.addrs.is_empty()).then(|| {
+                Row::new(vec![
+                    Cell::default(),
+                    Cell::default(),
+                    Cell::from(Span::styled(
+                        iface.addrs.join(" "),
+                        Style::default().fg(MUTED),
+                    )),
+                ])
+                .style(row_style)
+            });
+            std::iter::once(main).chain(addr)
+        })
+        .collect()
+}
+
 fn interfaces_table(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     // area.height includes the block's top/bottom border and the
     // table's own header row - what's left is real data-row capacity.
@@ -417,31 +675,10 @@ fn interfaces_table(frame: &mut Frame, area: Rect, snap: &Snapshot) {
                 Style::default().fg(MUTED),
             ))])
         });
-        snap.interfaces[..shown]
-            .iter()
-            .flat_map(|iface| {
-                let (state_text, color) = if iface.up { ("UP", OK) } else { ("DOWN", BAD) };
-                let rate = match iface.rate {
-                    Some((rx, tx)) => format!("rx {} / tx {}", fmt_rate(rx), fmt_rate(tx)),
-                    None => "-".to_string(),
-                };
-                let main = Row::new(vec![
-                    Cell::from(iface.name.clone()),
-                    Cell::from(Span::styled(state_text, Style::default().fg(color))),
-                    Cell::from(rate),
-                ]);
-                let addr = (!iface.addrs.is_empty()).then(|| {
-                    Row::new(vec![
-                        Cell::default(),
-                        Cell::default(),
-                        Cell::from(Span::styled(
-                            iface.addrs.join(" "),
-                            Style::default().fg(MUTED),
-                        )),
-                    ])
-                });
-                std::iter::once(main).chain(addr)
-            })
+        // No selection on the Overview tab's copy - it's a read-only
+        // summary; selection/drill-down lives on the Interfaces tab.
+        interface_rows(snap, shown, None)
+            .into_iter()
             .chain(extra_row)
             .collect()
     };
@@ -500,6 +737,10 @@ fn frr_panel(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         if let Some(routes) = &snap.frr.route_summary {
             lines.push(Line::from(format!("IPv4 RIB: {routes}")));
         }
+        lines.extend(bfd_summary_lines(snap));
+        if let Some(line) = vty_error_line(snap) {
+            lines.push(line);
+        }
         if !snap.frr.bgp_vrf_peers.is_empty() {
             // Whole "BGP peers" section (heading + rows) has to fit in
             // whatever's left after frr.service/daemons/routes above and
@@ -517,7 +758,7 @@ fn frr_panel(frame: &mut Frame, area: Rect, snap: &Snapshot) {
                     Style::default().fg(MUTED),
                 )));
                 let (shown, extra) = bgp_visible_rows(total_vrfs, section_budget - 1);
-                for (vrf, estab, total) in snap.frr.bgp_vrf_peers.iter().take(shown) {
+                for (vrf, estab, total) in sorted_vrfs(snap).into_iter().take(shown) {
                     // A VRF can have a BGP instance but zero configured
                     // neighbors - shown (unlike the old text-table
                     // parser, which never produced an entry for it at
@@ -525,15 +766,7 @@ fn frr_panel(frame: &mut Frame, area: Rect, snap: &Snapshot) {
                     // "OK" so much as "nothing to report" - MUTED reads
                     // that way, where green would misleadingly imply
                     // every configured peer (there are none) is up.
-                    let color = if *total == 0 {
-                        MUTED
-                    } else if *estab == *total {
-                        OK
-                    } else if *estab == 0 {
-                        BAD
-                    } else {
-                        WARN
-                    };
+                    let color = peer_count_color(estab, total);
                     lines.push(Line::from(vec![
                         Span::raw(format!("  {vrf:<20} ")),
                         status(format!("{estab}/{total} established"), color),
@@ -556,32 +789,125 @@ fn frr_panel(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     frame.render_widget(Paragraph::new(lines).block(panel("FRR")), area);
 }
 
-fn sync_table(frame: &mut Frame, area: Rect, snap: &Snapshot) {
+/// The Overview FRR panel sorts problems to the top, same as the FRR
+/// tab - with 150 VRFs, the one red row must not sit behind 149 green
+/// ones below the fold.
+/// Borrows the VRF list rather than cloning it - this runs on every
+/// redraw (key presses included), not just every refresh tick, and the
+/// snapshot already owns the data.
+fn sorted_vrfs(snap: &Snapshot) -> Vec<(&str, u32, u32)> {
+    let mut vrfs: Vec<(&str, u32, u32)> = snap
+        .frr
+        .bgp_vrf_peers
+        .iter()
+        .map(|(vrf, estab, total)| (vrf.as_str(), *estab, *total))
+        .collect();
+    vrfs.sort_by(|a, b| (rank_vrf(a.1, a.2), a.0).cmp(&(rank_vrf(b.1, b.2), b.0)));
+    vrfs
+}
+
+/// The muted `vty: ...` line for both FRR panels - the first couple of
+/// this tick's query failures, with a "+N more" rollup. Kept out of the
+/// health verdict on purpose (see `FrrStatus::query_errors`): observability
+/// loss is reported where you're looking, it doesn't claim the router is
+/// broken.
+fn vty_error_line(snap: &Snapshot) -> Option<Line<'static>> {
+    let errors = &snap.frr.query_errors;
+    if errors.is_empty() {
+        return None;
+    }
+    let shown: Vec<&str> = errors.iter().take(2).map(String::as_str).collect();
+    let mut text = format!("vty: {}", shown.join("; "));
+    let rest = errors.len() - shown.len();
+    if rest > 0 {
+        text.push_str(&format!(" (+{rest} more)"));
+    }
+    Some(Line::styled(text, Style::default().fg(MUTED)))
+}
+
+/// Sort key: VRFs with downed sessions first (rank 0), fully
+/// established next, "0/0 nothing configured" last - the interesting
+/// rows lead, the "nothing to report" rows trail.
+fn rank_vrf(estab: u32, total: u32) -> u8 {
+    if total == 0 {
+        2
+    } else if estab == total {
+        1
+    } else {
+        0
+    }
+}
+
+fn peer_count_color(estab: u32, total: u32) -> Color {
+    if total == 0 {
+        MUTED
+    } else if estab == total {
+        OK
+    } else if estab == 0 {
+        BAD
+    } else {
+        WARN
+    }
+}
+
+/// The `BFD: N/N up` line for the Overview panel and the FRR tab's
+/// summary - present only when bfdd reported sessions at all, so a VM
+/// without BFD configured doesn't grow a permanently-zero line.
+fn bfd_summary_lines(snap: &Snapshot) -> Vec<Line<'static>> {
+    if snap.frr.bfd_peers.is_empty() {
+        return Vec::new();
+    }
+    let up = snap
+        .frr
+        .bfd_peers
+        .iter()
+        .filter(|p| !p.status.eq_ignore_ascii_case("down"))
+        .count();
+    let total = snap.frr.bfd_peers.len();
+    let color = if up == total { OK } else { BAD };
+    vec![Line::from(vec![
+        Span::raw("BFD: "),
+        status(format!("{up}/{total} up"), color),
+    ])]
+}
+
+fn sync_table(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &mut AppState) {
+    if !snap.sync_units.is_empty() {
+        state.sync_selected = state.sync_selected.min(snap.sync_units.len() - 1);
+    }
+
     let rows: Vec<Row> = snap
         .sync_units
         .iter()
-        .map(|unit| match &unit.health {
-            SyncHealth::Failed => Row::new(vec![
+        .enumerate()
+        .map(|(i, unit)| {
+            let (word, color) = match &unit.health {
+                SyncHealth::Failed { .. } => ("FAILED", BAD),
+                SyncHealth::TimerNotActive => ("timer not active", WARN),
+                SyncHealth::Ok { .. } => ("ok", OK),
+            };
+            let row_style = if i == state.sync_selected {
+                Style::default().add_modifier(SELECTED)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
                 Cell::from(unit.label),
-                Cell::from(Span::styled("FAILED", Style::default().fg(BAD))),
+                Cell::from(Span::styled(word, Style::default().fg(color))),
                 Cell::from(Span::styled(
-                    format!("journalctl -u {}", unit.service),
+                    unit.health.detail(),
                     Style::default().fg(MUTED),
                 )),
-            ]),
-            SyncHealth::TimerNotActive => Row::new(vec![
-                Cell::from(unit.label),
-                Cell::from(Span::styled("timer not active", Style::default().fg(WARN))),
-                Cell::default(),
-            ]),
-            SyncHealth::Ok => Row::new(vec![
-                Cell::from(unit.label),
-                Cell::from(Span::styled("ok", Style::default().fg(OK))),
-                Cell::default(),
-            ]),
+            ])
+            .style(row_style)
         })
         .collect();
 
+    let title = if state.sync_selected == usize::MAX {
+        "Sync Services".to_string()
+    } else {
+        "Sync Services (Enter: journal)".to_string()
+    };
     let table = Table::new(
         rows,
         [
@@ -594,14 +920,14 @@ fn sync_table(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         Row::new(["Sync Service", "Status", "Detail"])
             .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
     )
-    .block(panel("Sync Services"));
+    .block(panel(&title));
     frame.render_widget(table, area);
 }
 
 /// Adjusts `*scroll` (if needed) so that row `row` falls within the
 /// visible window - scrolls up if it's above, down if it's below,
-/// leaves it alone if it's already visible. Shared by interfaces_detail
-/// and frr_detail to keep the selected row on screen as it moves.
+/// leaves it alone if it's already visible. Shared by the detail tabs'
+/// listings to keep the selected row on screen as it moves.
 fn ensure_visible(scroll: &mut u16, row: u16, visible_rows: u16) {
     if row < *scroll {
         *scroll = row;
@@ -617,14 +943,8 @@ const SELECTED: Modifier = Modifier::REVERSED;
 /// selectable counterpart, with Enter opening a detail popup for
 /// whichever interface is currently highlighted (see
 /// interface_detail_popup).
-fn interfaces_detail(
-    frame: &mut Frame,
-    area: Rect,
-    snap: &Snapshot,
-    scroll: &mut u16,
-    selected: &mut usize,
-    detail_open: bool,
-) {
+fn interfaces_detail(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &mut AppState) {
+    let selected = &mut state.interfaces_selected;
     if !snap.interfaces.is_empty() {
         *selected = (*selected).min(snap.interfaces.len() - 1);
     } else {
@@ -635,43 +955,12 @@ fn interfaces_detail(
     let rows: Vec<Row> = if snap.interfaces.is_empty() {
         vec![Row::new(vec![Cell::from("(none)")])]
     } else {
-        snap.interfaces
-            .iter()
-            .enumerate()
-            .flat_map(|(i, iface)| {
-                if i == *selected {
-                    selected_row = row_count_so_far(&snap.interfaces[..i]);
-                }
-                let (state_text, color) = if iface.up { ("UP", OK) } else { ("DOWN", BAD) };
-                let rate = match iface.rate {
-                    Some((rx, tx)) => format!("rx {} / tx {}", fmt_rate(rx), fmt_rate(tx)),
-                    None => "-".to_string(),
-                };
-                let row_style = if i == *selected {
-                    Style::default().add_modifier(SELECTED)
-                } else {
-                    Style::default()
-                };
-                let main = Row::new(vec![
-                    Cell::from(iface.name.clone()),
-                    Cell::from(Span::styled(state_text, Style::default().fg(color))),
-                    Cell::from(rate),
-                ])
-                .style(row_style);
-                let addr = (!iface.addrs.is_empty()).then(|| {
-                    Row::new(vec![
-                        Cell::default(),
-                        Cell::default(),
-                        Cell::from(Span::styled(
-                            iface.addrs.join(" "),
-                            Style::default().fg(MUTED),
-                        )),
-                    ])
-                    .style(row_style)
-                });
-                std::iter::once(main).chain(addr)
-            })
-            .collect()
+        for (i, _) in snap.interfaces.iter().enumerate() {
+            if i == *selected {
+                selected_row = row_count_so_far(&snap.interfaces[..i]);
+            }
+        }
+        interface_rows(snap, snap.interfaces.len(), Some(*selected))
     };
 
     // area.height includes the block's top/bottom border and the
@@ -679,8 +968,10 @@ fn interfaces_detail(
     // same accounting as interfaces_table above.
     let visible_rows = area.height.saturating_sub(3);
     let total_rows = rows.len() as u16;
-    ensure_visible(scroll, selected_row, visible_rows);
-    *scroll = (*scroll).min(total_rows.saturating_sub(visible_rows));
+    ensure_visible(&mut state.interfaces_scroll, selected_row, visible_rows);
+    state.interfaces_scroll = state
+        .interfaces_scroll
+        .min(total_rows.saturating_sub(visible_rows));
 
     let title = format!("Network Interfaces ({} total)", snap.interfaces.len());
     let table = Table::new(
@@ -697,13 +988,25 @@ fn interfaces_detail(
     )
     .block(panel(&title));
 
-    let mut table_state = TableState::default().with_offset(*scroll as usize);
+    let mut table_state = TableState::default().with_offset(state.interfaces_scroll as usize);
     frame.render_stateful_widget(table, area, &mut table_state);
-    render_scrollbar(frame, area, total_rows, visible_rows, *scroll);
+    render_scrollbar(
+        frame,
+        area,
+        total_rows,
+        visible_rows,
+        state.interfaces_scroll,
+    );
 
-    if detail_open {
-        if let Some(iface) = snap.interfaces.get(*selected) {
-            interface_detail_popup(frame, area, iface, snap.selected_interface_detail.as_ref());
+    if state.detail_open {
+        if let Some(iface) = snap.interfaces.get(state.interfaces_selected) {
+            interface_detail_popup(
+                frame,
+                area,
+                iface,
+                snap.selected_interface_detail.as_ref(),
+                &mut state.detail_scroll,
+            );
         }
     }
 }
@@ -731,7 +1034,23 @@ fn popup_area(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(x, y, width, height)
 }
 
-fn render_popup(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {
+/// A scrollable popup: content longer than fits is reachable with the
+/// scroll keys (see AppState::detail_scroll_by) instead of being
+/// silently clipped - a tenant VRF with dozens of BGP peers used to
+/// simply lose its tail beyond the fold. `scroll` is clamped here
+/// against the real content height, so the `u16::MAX` "bottom" sentinel
+/// works and an over-long offset from a previously-shown popup can't
+/// overshoot.
+fn render_popup(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line<'static>>,
+    scroll: &mut u16,
+) {
+    let content_height = lines.len() as u16;
+    let height = (content_height + 2).clamp(3, area.height.saturating_sub(2));
+    let inner_height = height.saturating_sub(2);
     let width = lines
         .iter()
         .map(Line::width)
@@ -739,24 +1058,33 @@ fn render_popup(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'sta
         .unwrap_or(0)
         .clamp(30, area.width.saturating_sub(4) as usize) as u16
         + 4;
-    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let popup = popup_area(area, width, height);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new(lines).block(panel(title)), popup);
+
+    let max_scroll = content_height.saturating_sub(inner_height);
+    *scroll = (*scroll).min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel(title))
+            .scroll((*scroll, 0)),
+        popup,
+    );
+    render_scrollbar(frame, popup, content_height, inner_height, *scroll);
 }
 
 /// Detail for one interface (Enter, on the Interfaces tab): MTU, MAC,
 /// which VRF/device it's enslaved to (relevant for a tenant's VLAN
-/// sub-interface - see "VRF per Tenant" in the README), and cumulative
-/// (not just current-rate) rx/tx counters including errors/drops.
-/// `detail` is `None` only very briefly - it's populated on the same
-/// refresh cycle that opens the popup (see snapshot::gather) - or if
-/// every read under /sys/class/net/<iface> failed outright.
+/// sub-interface - see "VRF per Tenant" in the README), current
+/// error/drop rates, and cumulative (not just current-rate) rx/tx
+/// counters. `detail` is `None` only very briefly - it's populated on
+/// the same refresh cycle that opens the popup (see snapshot::gather) -
+/// or if every read under /sys/class/net/<iface> failed outright.
 fn interface_detail_popup(
     frame: &mut Frame,
     area: Rect,
     iface: &crate::net::Interface,
     detail: Option<&InterfaceDetail>,
+    scroll: &mut u16,
 ) {
     let (state_text, color) = if iface.up { ("UP", OK) } else { ("DOWN", BAD) };
     let mut lines = vec![Line::from(vec![
@@ -773,6 +1101,14 @@ fn interface_detail_popup(
             "Throughput: rx {} / tx {}",
             fmt_rate(rx),
             fmt_rate(tx)
+        )));
+    }
+    if let Some((rx, tx)) = iface.err_rate {
+        // Rates, not counters: "is it dropping right now". Zero rates
+        // stay visible rather than hidden - on a busy trunk, "0/s" is
+        // itself the finding worth glancing at.
+        lines.push(Line::from(format!(
+            "Error/drop rate: rx {rx}/s / tx {tx}/s"
         )));
     }
 
@@ -816,28 +1152,40 @@ fn interface_detail_popup(
         )),
     }
 
-    render_popup(frame, area, &format!(" {} ", iface.name), lines);
+    render_popup(frame, area, &format!(" {} ", iface.name), lines, scroll);
 }
 
-/// Every VRF's BGP peer count, no truncation - `frr_panel` above is the
-/// Overview tab's compact, "+N more" version. Enter opens a popup with
-/// that VRF's individual peers (see vrf_detail_popup) - the aggregate
-/// established/total counts shown here are exactly the sums of what's
-/// in that popup.
-fn frr_detail(
-    frame: &mut Frame,
-    area: Rect,
-    snap: &Snapshot,
-    scroll: &mut u16,
-    selected: &mut usize,
-    detail_open: bool,
-) {
+/// Every VRF's BGP peer count, no truncation - `frr_panel` above is
+/// the Overview tab's compact, "+N more" version. Enter opens a popup
+/// with that VRF's individual peers (see vrf_detail_popup) - the
+/// aggregate established/total counts shown here are exactly the sums
+/// of what's in that popup. VRFs with downed sessions sort to the top
+/// (see sorted_vrfs), so the one problem tenant is the first row, not
+/// row 137 of 150.
+fn frr_detail(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &mut AppState) {
     let block = panel("FRR / BGP (all VRFs)");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let bfd_lines = bfd_summary_lines(snap);
+    let vty_error = vty_error_line(snap);
+    // Exact line count of the summary block below (frr.service line,
+    // plus - only while the service is up - the BFD line and whatever
+    // daemons/RIB lines will actually render, plus the vty error line
+    // whenever there are failures). A Length that's shorter than the
+    // content would silently clip its last line, e.g. the RIB count on
+    // a VM with BFD.
+    let summary_height = 1
+        + u16::from(vty_error.is_some())
+        + if snap.frr_service_active {
+            bfd_lines.len() as u16
+                + u16::from(!snap.frr.daemons.is_empty())
+                + u16::from(snap.frr.route_summary.is_some())
+        } else {
+            0
+        };
     let [summary_area, table_area] =
-        Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(inner);
+        Layout::vertical([Constraint::Length(summary_height), Constraint::Fill(1)]).areas(inner);
 
     let (state_text, color) = if snap.frr_service_active {
         ("active", OK)
@@ -848,6 +1196,10 @@ fn frr_detail(
         Span::raw("frr.service: "),
         status(state_text, color),
     ])];
+    summary.extend(bfd_lines);
+    if let Some(line) = vty_error {
+        summary.push(line);
+    }
     if snap.frr_service_active {
         if !snap.frr.daemons.is_empty() {
             summary.push(Line::from(format!("daemons: {}", snap.frr.daemons)));
@@ -858,44 +1210,47 @@ fn frr_detail(
     }
     frame.render_widget(Paragraph::new(summary), summary_area);
 
-    if !snap.frr.bgp_vrf_peers.is_empty() {
-        *selected = (*selected).min(snap.frr.bgp_vrf_peers.len() - 1);
+    let vrfs = sorted_vrfs(snap);
+    if !vrfs.is_empty() {
+        state.frr_selected = state.frr_selected.min(vrfs.len() - 1);
     } else {
-        *selected = 0;
+        state.frr_selected = 0;
     }
 
     let rows: Vec<Row> = if !snap.frr_service_active {
         Vec::new()
-    } else if snap.frr.bgp_vrf_peers.is_empty() {
+    } else if vrfs.is_empty() {
         vec![Row::new(vec![Cell::from("(no BGP peers)")])]
     } else {
-        snap.frr
-            .bgp_vrf_peers
-            .iter()
+        vrfs.iter()
             .enumerate()
             .map(|(i, (vrf, estab, total))| {
                 // See frr_panel's own comment on why 0/0 is MUTED, not
                 // the OK "every configured peer is up" green.
-                let color = if *total == 0 {
-                    MUTED
-                } else if *estab == *total {
-                    OK
-                } else if *estab == 0 {
-                    BAD
-                } else {
-                    WARN
+                let color = peer_count_color(*estab, *total);
+                let route_cell = match snap.frr.vrf_routes.get(*vrf) {
+                    Some(&(rib, fib)) => {
+                        let style = if fib < rib {
+                            Style::default().fg(WARN)
+                        } else {
+                            Style::default().fg(OK)
+                        };
+                        Cell::from(Span::styled(format!("{rib}/{fib}"), style))
+                    }
+                    None => Cell::from(Span::styled("-", Style::default().fg(MUTED))),
                 };
-                let row_style = if i == *selected {
+                let row_style = if i == state.frr_selected {
                     Style::default().add_modifier(SELECTED)
                 } else {
                     Style::default()
                 };
                 Row::new(vec![
-                    Cell::from(vrf.clone()),
+                    Cell::from(*vrf),
                     Cell::from(Span::styled(
                         format!("{estab}/{total} established"),
                         Style::default().fg(color),
                     )),
+                    route_cell,
                 ])
                 .style(row_style)
             })
@@ -907,22 +1262,49 @@ fn frr_detail(
     // tab, summary section included.
     let visible_rows = table_area.height.saturating_sub(1);
     let total_rows = rows.len() as u16;
-    ensure_visible(scroll, *selected as u16, visible_rows);
-    *scroll = (*scroll).min(total_rows.saturating_sub(visible_rows));
+    ensure_visible(
+        &mut state.frr_scroll,
+        state.frr_selected as u16,
+        visible_rows,
+    );
+    state.frr_scroll = state
+        .frr_scroll
+        .min(total_rows.saturating_sub(visible_rows));
 
-    let table = Table::new(rows, [Constraint::Length(24), Constraint::Min(20)]).header(
-        Row::new(["VRF", "BGP Peers"])
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(24),
+            Constraint::Length(18),
+            Constraint::Min(20),
+        ],
+    )
+    .header(
+        Row::new(["VRF", "BGP Peers", "Routes (RIB/FIB)"])
             .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
     );
-    let mut table_state = TableState::default().with_offset(*scroll as usize);
+    let mut table_state = TableState::default().with_offset(state.frr_scroll as usize);
     frame.render_stateful_widget(table, table_area, &mut table_state);
-    render_scrollbar(frame, table_area, total_rows, visible_rows, *scroll);
+    render_scrollbar(
+        frame,
+        table_area,
+        total_rows,
+        visible_rows,
+        state.frr_scroll,
+    );
 
-    if detail_open && snap.frr_service_active {
-        if let Some((vrf, _, _)) = snap.frr.bgp_vrf_peers.get(*selected) {
+    if state.detail_open && snap.frr_service_active {
+        if let Some(&(vrf, _, _)) = vrfs.get(state.frr_selected) {
             let empty = Vec::new();
             let peers = snap.frr.bgp_vrf_peer_detail.get(vrf).unwrap_or(&empty);
-            vrf_detail_popup(frame, area, vrf, peers);
+            vrf_detail_popup(
+                frame,
+                area,
+                vrf,
+                peers,
+                &snap.frr.bfd_peers,
+                &mut state.detail_scroll,
+            );
         }
     }
 }
@@ -934,12 +1316,31 @@ fn frr_detail(
 /// `pfxRcd`/`pfxSnt` are exactly how many prefixes this peer has sent
 /// this router (imported into this VRF's table) and been sent by it
 /// (exported/advertised), respectively - FRR's own BGP RIB numbers, not
-/// a separate route dump.
-fn vrf_detail_popup(frame: &mut Frame, area: Rect, vrf: &str, peers: &[BgpPeerDetail]) {
-    let lines = if peers.is_empty() {
+/// a separate route dump. Sessions that aren't Established sort to the
+/// top so the problem is the first row of the popup, and the VRF's BFD
+/// sessions (if any) follow - a BFD-down line explains a BGP session
+/// that's flapping or about to.
+fn vrf_detail_popup(
+    frame: &mut Frame,
+    area: Rect,
+    vrf: &str,
+    peers: &[BgpPeerDetail],
+    bfd_peers: &[crate::frr::BfdPeerDetail],
+    scroll: &mut u16,
+) {
+    let mut sorted: Vec<&BgpPeerDetail> = peers.iter().collect();
+    sorted.sort_by(|a, b| {
+        (a.state != "Established", &a.peer, &a.afi).cmp(&(
+            b.state != "Established",
+            &b.peer,
+            &b.afi,
+        ))
+    });
+
+    let mut lines: Vec<Line<'static>> = if sorted.is_empty() {
         vec![Line::styled("(no BGP peers)", Style::default().fg(MUTED))]
     } else {
-        peers
+        sorted
             .iter()
             .flat_map(|p| {
                 let color = if p.state == "Established" { OK } else { BAD };
@@ -962,14 +1363,122 @@ fn vrf_detail_popup(frame: &mut Frame, area: Rect, vrf: &str, peers: &[BgpPeerDe
             })
             .collect()
     };
-    render_popup(frame, area, &format!(" {vrf} "), lines);
+
+    let vrf_bfd: Vec<&crate::frr::BfdPeerDetail> =
+        bfd_peers.iter().filter(|b| b.vrf == vrf).collect();
+    if !vrf_bfd.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled("BFD sessions:", Style::default().fg(MUTED)));
+        for b in vrf_bfd {
+            let down = b.status.eq_ignore_ascii_case("down");
+            let uptime = b.uptime.as_deref().unwrap_or("-");
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {:<20} ", b.peer)),
+                status(
+                    if down { "down" } else { "up" },
+                    if down { BAD } else { OK },
+                ),
+                Span::styled(format!("   up {uptime}"), Style::default().fg(MUTED)),
+            ]));
+        }
+    }
+
+    render_popup(frame, area, &format!(" {vrf} "), lines, scroll);
+}
+
+/// The state-change log (see events.rs) - newest at the bottom like any
+/// log, auto-following the tail until the reader scrolls up to study
+/// history (and re-following once they scroll back down to the bottom,
+/// see AppState::events_scroll_by).
+fn events_panel(frame: &mut Frame, area: Rect, log: &EventLog, state: &mut AppState) {
+    let block = panel("Event Log (state changes since boot)");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<Line<'static>> = if log.events().is_empty() {
+        vec![Line::styled("(no events yet)", Style::default().fg(MUTED))]
+    } else {
+        log.events()
+            .iter()
+            .map(|e| {
+                Line::from(vec![
+                    Span::styled(format!("[{}] ", e.time), Style::default().fg(MUTED)),
+                    Span::styled(e.text.clone(), Style::default().fg(e.level.color())),
+                ])
+            })
+            .collect()
+    };
+
+    let total = lines.len() as u16;
+    let visible = inner.height;
+    if state.events_follow {
+        state.events_scroll = total.saturating_sub(visible);
+    } else {
+        state.events_scroll = state.events_scroll.min(total.saturating_sub(visible));
+    }
+    // Scrolled back down to the tail: resume auto-follow.
+    if state.events_scroll >= total.saturating_sub(visible) {
+        state.events_follow = true;
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).scroll((state.events_scroll, 0)),
+        inner,
+    );
+    render_scrollbar(frame, inner, total, visible, state.events_scroll);
+}
+
+fn bootc_panel_lines(bootc: &BootcStatus) -> Vec<Line<'static>> {
+    let short_image = |image: &Option<String>| {
+        image
+            .as_deref()
+            .and_then(|i| i.rsplit('/').next())
+            .unwrap_or("?")
+            .to_string()
+    };
+    let short_digest = |digest: &Option<String>| {
+        digest
+            .as_deref()
+            .map(|d| d.trim_start_matches("sha256:").chars().take(12).collect())
+            .unwrap_or_else(|| "?".to_string())
+    };
+
+    let mut lines = Vec::new();
+    if bootc.booted_digest.is_some() || bootc.booted_image.is_some() {
+        lines.push(Line::from(format!(
+            "booted: {} ({})",
+            short_image(&bootc.booted_image),
+            short_digest(&bootc.booted_digest),
+        )));
+        if bootc.reboot_pending() {
+            lines.push(Line::from(vec![
+                Span::raw(format!(
+                    "staged: {} ({}) - ",
+                    short_image(&bootc.staged_image),
+                    short_digest(&bootc.staged_digest),
+                )),
+                status("reboot required", WARN),
+            ]));
+        }
+    }
+    // Raw text fallback - whatever the structured parse couldn't answer,
+    // `bootc status`'s own output still shows, as before.
+    if let Some(raw) = &bootc.raw {
+        for line in raw.lines() {
+            lines.push(Line::from(line.to_string()));
+        }
+    }
+    lines
 }
 
 fn image_panel(frame: &mut Frame, area: Rect, snap: &Snapshot) {
-    let Some(status) = &snap.bootc_status else {
+    let Some(bootc) = &snap.bootc else {
         return;
     };
-    let lines: Vec<Line> = status.lines().map(Line::from).collect();
+    let lines = bootc_panel_lines(bootc);
+    if lines.is_empty() {
+        return;
+    }
     frame.render_widget(
         Paragraph::new(lines).block(panel("System Image (bootc)")),
         area,
@@ -981,32 +1490,81 @@ fn image_panel(frame: &mut Frame, area: Rect, snap: &Snapshot) {
 /// the same visual language as htop's permanently-visible
 /// `F1Help F2Setup ...` row, with number keys picking a tab the way
 /// btop's own box switcher uses its number row.
+///
+/// Hints carry a priority *tier*: when the combined line doesn't fit the
+/// terminal width (80 columns on a serial console is the floor this must
+/// work at), the lowest-priority tier is dropped whole, then the next -
+/// a truncated hint that reads as present-but-clipped would be worse
+/// than a missing one. Tier 0 is load-bearing (tabs, shell), 1 is
+/// navigation detail, 2 is the refresh annotation.
+const fn hint_tier(
+    key: &'static str,
+    label: &'static str,
+    tier: u8,
+) -> (&'static str, &'static str, u8) {
+    (key, label, tier)
+}
+
 fn footer(frame: &mut Frame, area: Rect, tab: Tab, detail_open: bool, refresh_secs: u64) {
     let key_style = Style::default().fg(Color::Black).bg(ACCENT);
     let label_style = Style::default().fg(MUTED);
-    let hint = |k: &'static str, label: &'static str| {
-        [
-            Span::styled(k, key_style),
-            Span::styled(label, label_style),
-            Span::raw(" "),
-        ]
+
+    let mut hints: Vec<(&'static str, &'static str, u8)> = vec![
+        hint_tier("1", "Overview", 0),
+        hint_tier("2", "Interfaces", 0),
+        hint_tier("3", "FRR/BGP", 0),
+        hint_tier("4", "Events", 0),
+    ];
+    match tab {
+        Tab::Events => hints.extend([
+            hint_tier("\u{2191}\u{2193}", "Scroll", 1),
+            hint_tier("End", "Follow", 1),
+        ]),
+        _ if detail_open => hints.extend([
+            hint_tier("\u{2191}\u{2193}", "Scroll", 1),
+            hint_tier("Esc", "Close", 0),
+        ]),
+        Tab::Overview => hints.extend([
+            hint_tier("\u{2191}\u{2193}", "Select", 1),
+            hint_tier("Enter", "Journal", 1),
+            hint_tier("PgUp/PgDn", "Page", 1),
+        ]),
+        _ => hints.extend([
+            hint_tier("\u{2191}\u{2193}", "Select", 1),
+            hint_tier("PgUp/PgDn", "Page", 1),
+            hint_tier("Enter", "Detail", 0),
+        ]),
+    }
+    hints.push(hint_tier("b", "Shell", 0));
+
+    let width_of = |max_tier: u8| -> usize {
+        hints
+            .iter()
+            .filter(|&&(_, _, tier)| tier <= max_tier)
+            .map(|&(k, l, _)| k.chars().count() + 1 + l.chars().count() + 1)
+            .sum::<usize>()
+            + if max_tier >= 2 {
+                format!("  (every {refresh_secs}s)").len()
+            } else {
+                0
+            }
     };
+    let mut max_tier = 2u8;
+    while max_tier > 0 && width_of(max_tier) > area.width as usize {
+        max_tier -= 1;
+    }
 
     let mut spans = Vec::new();
-    spans.extend(hint("1", "Overview"));
-    spans.extend(hint("2", "Interfaces"));
-    spans.extend(hint("3", "FRR/BGP"));
-    if tab != Tab::Overview {
-        spans.extend(hint("\u{2191}\u{2193}", "Select"));
-        spans.extend(hint("PgUp/PgDn", "Page"));
-        if detail_open {
-            spans.extend(hint("Esc", "Close detail"));
-        } else {
-            spans.extend(hint("Enter", "Detail"));
+    for &(key, label, tier) in &hints {
+        if tier > max_tier {
+            continue;
         }
+        spans.push(Span::styled(key, key_style));
+        spans.push(Span::styled(format!("{label} "), label_style));
     }
-    spans.extend(hint("b", "Shell"));
-    spans.push(Span::raw(format!("  (every {refresh_secs}s)")));
+    if max_tier >= 2 {
+        spans.push(Span::raw(format!(" (every {refresh_secs}s)")));
+    }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1019,7 +1577,8 @@ mod tests {
 
     use std::collections::BTreeMap;
 
-    use crate::frr::FrrStatus;
+    use crate::frr::{BfdPeerDetail, FrrStatus};
+    use crate::health::Level;
     use crate::net::Interface;
 
     fn fake_snapshot(n_interfaces: usize) -> Snapshot {
@@ -1037,6 +1596,7 @@ mod tests {
                     up: true,
                     addrs: Vec::new(),
                     rate: None,
+                    err_rate: None,
                 })
                 .collect(),
             selected_interface_detail: None,
@@ -1046,10 +1606,27 @@ mod tests {
                 route_summary: None,
                 bgp_vrf_peers: Vec::new(),
                 bgp_vrf_peer_detail: BTreeMap::new(),
+                vrf_routes: BTreeMap::new(),
+                bfd_peers: Vec::new(),
+                query_errors: Vec::new(),
             },
             sync_units: Vec::new(),
-            bootc_status: None,
+            bootc: None,
+            traffic: None,
+            selected_sync_journal: None,
         }
+    }
+
+    fn draw(
+        terminal: &mut Terminal<TestBackend>,
+        snap: &Snapshot,
+        log: &EventLog,
+        state: &mut AppState,
+    ) -> String {
+        terminal
+            .draw(|frame| render(frame, Some(snap), log, state, 5, Some(2)))
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
     }
 
     /// Every visible cell's symbol, concatenated - good enough to assert
@@ -1084,11 +1661,9 @@ mod tests {
             tab: Tab::Interfaces,
             ..Default::default()
         };
+        let log = EventLog::new(100, None);
 
-        terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
-            .unwrap();
-        let text = buffer_text(terminal.backend().buffer());
+        let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(text.contains("eth0"), "eth0 should be visible unscrolled");
 
         // Moving the selection within the already-visible window (7 data
@@ -1096,10 +1671,7 @@ mod tests {
         // viewport only follows the selection once it would otherwise
         // go off screen.
         state.move_selection(5);
-        terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
-            .unwrap();
-        let text = buffer_text(terminal.backend().buffer());
+        let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(
             text.contains("eth0") && text.contains("eth5"),
             "eth0..eth5 should both still be visible after move_selection(5) within the same window"
@@ -1108,10 +1680,7 @@ mod tests {
         // Moving past the visible window must scroll to follow the
         // selection.
         state.move_selection(5); // now selecting eth10
-        terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
-            .unwrap();
-        let text = buffer_text(terminal.backend().buffer());
+        let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(
             !text.contains("eth0"),
             "eth0 should have scrolled off once the selection moved past the visible window"
@@ -1125,10 +1694,7 @@ mod tests {
         // select_last's own comment on why usize::MAX is the sentinel
         // for that), not panic on an out-of-range TableState offset.
         state.select_last();
-        terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
-            .unwrap();
-        let text = buffer_text(terminal.backend().buffer());
+        let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(
             text.contains("eth29"),
             "the last interface should be visible once scrolled to the bottom"
@@ -1144,10 +1710,8 @@ mod tests {
             tab: Tab::Frr,
             ..Default::default()
         };
-        terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
-            .unwrap();
-        let text = buffer_text(terminal.backend().buffer());
+        let log = EventLog::new(100, None);
+        let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(text.contains("inactive"));
     }
 
@@ -1157,18 +1721,14 @@ mod tests {
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = AppState::default();
+        let log = EventLog::new(100, None);
 
-        terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
-            .unwrap();
-        assert!(buffer_text(terminal.backend().buffer()).contains("Sync Services"));
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(text.contains("Sync Services"));
 
         state.next_tab();
         assert_eq!(state.tab, Tab::Interfaces);
-        terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
-            .unwrap();
-        let text = buffer_text(terminal.backend().buffer());
+        let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(text.contains("Network Interfaces (3 total)"));
         assert!(!text.contains("Sync Services"));
     }
@@ -1183,29 +1743,23 @@ mod tests {
             tab: Tab::Interfaces,
             ..Default::default()
         };
+        let log = EventLog::new(100, None);
 
         // Not open yet - none of the popup-only content should appear.
-        terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
-            .unwrap();
-        assert!(!buffer_text(terminal.backend().buffer()).contains("Cumulative counters"));
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(!text.contains("Cumulative counters"));
 
         state.move_selection(1); // select eth1, the one with an address
         state.toggle_detail();
         assert!(state.detail_open());
-        terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
-            .unwrap();
-        let text = buffer_text(terminal.backend().buffer());
+        let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(text.contains("eth1"), "popup should be titled after eth1");
         assert!(text.contains("10.0.0.5/30"));
 
         state.close_detail();
         assert!(!state.detail_open());
-        terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
-            .unwrap();
-        assert!(!buffer_text(terminal.backend().buffer()).contains("Cumulative counters"));
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(!text.contains("Cumulative counters"));
     }
 
     #[test]
@@ -1231,15 +1785,75 @@ mod tests {
             tab: Tab::Frr,
             ..Default::default()
         };
+        let log = EventLog::new(100, None);
 
         state.toggle_detail();
-        terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
-            .unwrap();
-        let text = buffer_text(terminal.backend().buffer());
+        let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(text.contains("vrf-tenant1"));
         assert!(text.contains("198.51.100.10"));
         assert!(text.contains("prefixes in/out 12/3"));
+    }
+
+    // The regression this covers: a popup used to be hard-clipped at the
+    // available height with no way to reach the rest - a VRF with dozens
+    // of peers simply lost everything past the fold. Now the tail is
+    // reachable by scrolling, and the "bottom" sentinel clamps exactly
+    // to the last peer.
+    #[test]
+    fn vrf_popup_scrolls_when_peers_exceed_the_screen() {
+        let mut snap = fake_snapshot(0);
+        snap.frr_service_active = true;
+        snap.frr.bgp_vrf_peers = vec![("vrf-tenant1".to_string(), 30, 30)];
+        snap.frr.bgp_vrf_peer_detail.insert(
+            "vrf-tenant1".to_string(),
+            (0..30)
+                .map(|i| BgpPeerDetail {
+                    peer: format!("198.51.100.{i}"),
+                    afi: "ipv4Unicast".to_string(),
+                    state: "Established".to_string(),
+                    remote_as: Some(65000),
+                    uptime: Some("01:23:45".to_string()),
+                    pfx_rcd: "1".to_string(),
+                    pfx_snt: "1".to_string(),
+                })
+                .collect(),
+        );
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            tab: Tab::Frr,
+            ..Default::default()
+        };
+        let log = EventLog::new(100, None);
+
+        state.set_tab(Tab::Frr);
+        state.toggle_detail();
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(
+            text.contains("198.51.100.0"),
+            "the first peer must be visible at the top of the popup"
+        );
+        assert!(
+            !text.contains("198.51.100.9 "),
+            "the tail peer cannot fit on this small backend - it must be scrolled to"
+        );
+
+        state.detail_scroll_bottom();
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        // Peers sort by address *string*, so the tail of the list is
+        // "... .4 .5 .6 .7 .8 .9" - the last visible peer is .9.
+        assert!(
+            text.contains("198.51.100.9 "),
+            "after scrolling to the bottom the last peer must be visible"
+        );
+        assert!(
+            text.contains("198.51.100.8 "),
+            "the popup should be showing the tail of the list now"
+        );
+        assert!(
+            !text.contains("198.51.100.0 "),
+            "the first peer should have scrolled off"
+        );
     }
 
     #[test]
@@ -1251,17 +1865,273 @@ mod tests {
             tab: Tab::Interfaces,
             ..Default::default()
         };
+        let log = EventLog::new(100, None);
 
         state.select_last();
-        terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
-            .unwrap();
-        assert!(buffer_text(terminal.backend().buffer()).contains("eth4"));
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(text.contains("eth4"));
 
         state.select_first();
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(text.contains("eth0"));
+    }
+
+    #[test]
+    fn overview_selects_sync_services_and_opens_their_journal() {
+        let mut snap = fake_snapshot(0);
+        snap.sync_units = vec![
+            crate::snapshot::SyncUnit {
+                label: "FRR config sync",
+                service: "frr-config-sync.service",
+                health: SyncHealth::Failed {
+                    reason: "status stale (6m ago)".to_string(),
+                },
+            },
+            crate::snapshot::SyncUnit {
+                label: "Network config sync",
+                service: "network-config-sync.service",
+                health: SyncHealth::Ok { age_secs: 30 },
+            },
+        ];
+        snap.selected_sync_journal =
+            Some("Sep 22 12:00:00 test frr-config-sync[1]: ok".to_string());
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::default();
+        let log = EventLog::new(100, None);
+
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(text.contains("status stale"));
+        assert!(text.contains("last attempt just now"));
+
+        state.move_selection(1); // select the second (Ok) unit
+        state.toggle_detail();
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(
+            text.contains("frr-config-sync[1]: ok"),
+            "the journal popup should show the gathered journal lines"
+        );
+
+        state.close_detail();
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(!text.contains("frr-config-sync[1]: ok"));
+    }
+
+    #[test]
+    fn frr_tab_sorts_problem_vrfs_first_and_shows_routes() {
+        let mut snap = fake_snapshot(0);
+        snap.frr_service_active = true;
+        snap.frr.bgp_vrf_peers = vec![
+            ("aaa-ok".to_string(), 2, 2),
+            ("zzz-broken".to_string(), 1, 2),
+            ("mmm-idle".to_string(), 0, 0),
+        ];
+        snap.frr
+            .vrf_routes
+            .insert("zzz-broken".to_string(), (10, 8));
+        snap.frr.vrf_routes.insert("aaa-ok".to_string(), (5, 5));
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            tab: Tab::Frr,
+            ..Default::default()
+        };
+        let log = EventLog::new(100, None);
+
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        let broken_pos = text.find("zzz-broken").unwrap();
+        let ok_pos = text.find("aaa-ok").unwrap();
+        let idle_pos = text.find("mmm-idle").unwrap();
+        assert!(
+            broken_pos < ok_pos && ok_pos < idle_pos,
+            "down-sessions VRF must sort first, established next, idle 0/0 last"
+        );
+        assert!(text.contains("10/8"), "RIB/FIB counts should be shown");
+        assert!(text.contains("Routes (RIB/FIB)"));
+    }
+
+    #[test]
+    fn events_tab_renders_the_log_and_follows_the_tail() {
+        let mut snap = fake_snapshot(0);
+        snap.sync_units = vec![crate::snapshot::SyncUnit {
+            label: "FRR config sync",
+            service: "frr-config-sync.service",
+            health: SyncHealth::Ok { age_secs: 10 },
+        }];
+        let mut log = EventLog::new(100, None);
+        log.record(Level::Warn, "12:00:01", "interface eth-trunk went DOWN");
+        log.record(Level::Ok, "12:00:30", "interface eth-trunk came UP");
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            tab: Tab::Events,
+            ..Default::default()
+        };
+
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(text.contains("Event Log"));
+        assert!(text.contains("went DOWN"));
+        assert!(text.contains("came UP"));
+
+        // Scrolling up suspends follow; returning to the bottom resumes it.
+        state.events_scroll_by(-1);
+        assert!(!state.events_follow);
+        state.events_to_bottom();
+        assert!(state.events_follow);
+    }
+
+    #[test]
+    fn traffic_panel_renders_series_and_rates() {
+        let mut snap = fake_snapshot(0);
+        snap.traffic = Some(Traffic {
+            name: "eth-trunk".to_string(),
+            // 125 MB/s = 1 Gbit/s - the label shows network units (bits).
+            series: vec![(0, 0), (125_000_000, 125_000_000)],
+        });
+        let backend = TestBackend::new(100, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::default();
+        let log = EventLog::new(100, None);
+
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(
+            text.contains("Traffic (eth-trunk"),
+            "panel title with the trunk's name"
+        );
+        assert!(text.contains("1.0 Gbit/s"), "current rate label");
+        assert!(text.contains("peak"));
+    }
+
+    #[test]
+    fn traffic_panel_disappears_on_short_terminals() {
+        let mut snap = fake_snapshot(0);
+        snap.traffic = Some(Traffic {
+            name: "eth-trunk".to_string(),
+            series: vec![(1000, 1000)],
+        });
+        // 20 rows: under the 22-row floor from traffic_panel_height.
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::default();
+        let log = EventLog::new(100, None);
+
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(
+            !text.contains("Traffic (eth-trunk"),
+            "no room for the graph at this height - it must yield entirely"
+        );
+    }
+
+    #[test]
+    fn header_shows_the_health_verdict_and_data_age() {
+        let mut snap = fake_snapshot(0);
+        snap.frr_service_active = false; // -> CRIT
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::default();
+        let log = EventLog::new(100, None);
+
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(text.contains("CRIT (1)"));
+        assert!(text.contains("data 2s ago"));
+
+        // Healthy snapshot: badge flips to "healthy".
+        let mut snap = fake_snapshot(0);
+        snap.frr_service_active = true;
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(text.contains("healthy"));
+    }
+
+    #[test]
+    fn footer_drops_low_tier_hints_before_important_ones_on_narrow_terms() {
+        let snap = fake_snapshot(0);
+        // Wide enough for everything:
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::default();
+        let log = EventLog::new(100, None);
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(
+            text.contains("every 5s"),
+            "wide terminal keeps the refresh note"
+        );
+
+        // 60 columns: the refresh note (tier 2) and paging/journal hints
+        // (tier 1) must give way, but the tab keys and shell hint (tier 0)
+        // must survive.
+        let backend = TestBackend::new(60, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(!text.contains("every 5s"));
+        assert!(text.contains("Shell"));
+        assert!(text.contains("Events"));
+    }
+
+    #[test]
+    fn bootc_panel_shows_reboot_required_for_staged_updates() {
+        let mut snap = fake_snapshot(0);
+        snap.bootc = Some(BootcStatus {
+            booted_image: Some("ghcr.io/mariusbertram/frr-bootc:latest".to_string()),
+            booted_digest: Some("sha256:aaaa1111bbbb".to_string()),
+            staged_image: Some("ghcr.io/mariusbertram/frr-bootc:latest".to_string()),
+            staged_digest: Some("sha256:cccc3333dddd".to_string()),
+            raw: None,
+        });
+        let backend = TestBackend::new(100, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::default();
+        let log = EventLog::new(100, None);
+
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(text.contains("booted: frr-bootc:latest (aaaa1111bbbb)"));
+        assert!(text.contains("reboot required"));
+        assert!(text.contains("staged: frr-bootc:latest (cccc3333dddd)"));
+    }
+
+    #[test]
+    fn frr_summary_shows_bfd_when_sessions_exist() {
+        let mut snap = fake_snapshot(0);
+        snap.frr_service_active = true;
+        snap.frr.bfd_peers = vec![
+            BfdPeerDetail {
+                peer: "198.51.100.1".to_string(),
+                vrf: "default".to_string(),
+                status: "up".to_string(),
+                uptime: Some("1h 1m".to_string()),
+            },
+            BfdPeerDetail {
+                peer: "198.51.100.2".to_string(),
+                vrf: "default".to_string(),
+                status: "down".to_string(),
+                uptime: Some("5s".to_string()),
+            },
+        ];
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            tab: Tab::Frr,
+            ..Default::default()
+        };
+        let log = EventLog::new(100, None);
+
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(
+            text.contains("BFD: 1/2 up"),
+            "BFD summary line with a red count"
+        );
+    }
+
+    #[test]
+    fn collecting_data_placeholder_renders_before_the_first_snapshot() {
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::default();
+        let log = EventLog::new(100, None);
         terminal
-            .draw(|frame| render(frame, &snap, &mut state, 5))
+            .draw(|frame| render(frame, None, &log, &mut state, 5, None))
             .unwrap();
-        assert!(buffer_text(terminal.backend().buffer()).contains("eth0"));
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("collecting data"));
     }
 }

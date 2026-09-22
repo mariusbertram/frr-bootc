@@ -14,11 +14,18 @@
 //! iterations; here it's just fields on a struct that lives as long as the
 //! process does.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::process::Command;
 use std::time::Instant;
 
+/// How many throughput samples are kept per interface for the Overview
+/// tab's traffic graph. 72 at the default 5s refresh is a ~6 minute
+/// window, and 72 bars fit the panel width on an 80-column serial
+/// console (76 inner columns) without resampling.
+const TRAFFIC_HISTORY: usize = 72;
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Interface {
     pub name: String,
     pub up: bool,
@@ -26,19 +33,66 @@ pub struct Interface {
     /// (rx bytes/sec, tx bytes/sec) - `None` until a second sample has been
     /// taken for this interface, i.e. never on the very first tick.
     pub rate: Option<(u64, u64)>,
+    /// (rx, tx) error+drop events per second over the same window as
+    /// `rate` - `None` on the very first tick too. Cumulative counters
+    /// (in `InterfaceDetail`) say "has ever dropped a packet"; this rate
+    /// says "is dropping *right now*", which is the version that means
+    /// congestion/overrun on a trunk that has been up for weeks.
+    pub err_rate: Option<(u64, u64)>,
 }
 
 struct Sample {
     rx: u64,
     tx: u64,
+    rx_err: u64,
+    tx_err: u64,
+    rx_drop: u64,
+    tx_drop: u64,
     at: Instant,
 }
 
+/// Rolling per-interface throughput history, (rx, tx) in bytes/sec, one
+/// entry per refresh tick - the data behind the Overview traffic graph.
+struct IfaceHistory {
+    series: VecDeque<(u64, u64)>,
+}
+
+/// The traffic graph's data: the interface it's drawn for and its
+/// rolling (rx, tx) series in bytes/sec, oldest first.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Traffic {
+    pub name: String,
+    pub series: Vec<(u64, u64)>,
+}
+
+impl Traffic {
+    /// Latest (rx, tx) bytes/sec, if any sample exists yet.
+    pub fn latest(&self) -> Option<(u64, u64)> {
+        self.series.last().copied()
+    }
+
+    /// Peak (rx, tx) bytes/sec within the window - the autoscaling
+    /// sparkline's implicit scale, shown as a label so the graph stays
+    /// readable after a burst.
+    pub fn peak(&self) -> Option<(u64, u64)> {
+        self.series.iter().fold(None, |acc, &(rx, tx)| match acc {
+            Some((prx, ptx)) => Some((prx.max(rx), ptx.max(tx))),
+            None => Some((rx, tx)),
+        })
+    }
+}
+
+/// (throughput, error/drop) rate pair per direction - factored out
+/// purely so `sample_rate`'s signature stays readable.
+type RatePair = (Option<(u64, u64)>, Option<(u64, u64)>);
+
 /// Holds the previous byte-counter sample per interface so `list()` can
-/// compute a rate on every call after the first.
+/// compute a rate on every call after the first, plus the rolling
+/// per-interface history the traffic graph draws from.
 #[derive(Default)]
 pub struct ThroughputSampler {
     prev: HashMap<String, Sample>,
+    history: HashMap<String, IfaceHistory>,
 }
 
 impl ThroughputSampler {
@@ -65,23 +119,61 @@ impl ThroughputSampler {
             }
             let up = fields.next() == Some("UP");
             let addrs: Vec<String> = fields.map(str::to_string).collect();
-            let rate = self.sample_rate(name);
+            let (rate, err_rate) = self.sample_rate(name);
             interfaces.push(Interface {
                 name: name.to_string(),
                 up,
                 addrs,
                 rate,
+                err_rate,
             });
         }
         interfaces
     }
 
-    fn sample_rate(&mut self, name: &str) -> Option<(u64, u64)> {
-        let rx = read_counter(name, "rx_bytes")?;
-        let tx = read_counter(name, "tx_bytes")?;
+    /// The traffic graph's series: the interface carrying the most
+    /// cumulative traffic (in this image's design that is always the one
+    /// physical trunk - every tenant's VLAN sub-interface rides on it)
+    /// and its rolling history. Keyed by what's actually been sampled
+    /// rather than an assumed "eth-trunk" name: before the first
+    /// successful nmstate apply the device still has its kernel name.
+    pub fn traffic(&self) -> Option<Traffic> {
+        let name = self
+            .prev
+            .iter()
+            .max_by_key(|(_, s)| s.rx.saturating_add(s.tx))
+            .map(|(name, _)| name.clone())?;
+        let series = self.history_of(&name)?;
+        Some(Traffic { name, series })
+    }
+
+    /// Copy of one interface's rolling history, oldest first - empty
+    /// until at least two samples have been taken for it (no rates
+    /// before that, so no history entries either).
+    pub fn history_of(&self, name: &str) -> Option<Vec<(u64, u64)>> {
+        let history = self.history.get(name)?;
+        Some(history.series.iter().copied().collect())
+    }
+
+    /// (throughput rate, error+drop rate) over the window since the
+    /// previous sample. Also the one place history entries are pushed:
+    /// a rate only exists for a real ~REFRESH_SECS-apart sample pair, so
+    /// the graph gets exactly one bar per refresh tick - key-mash
+    /// redraws (sub-second, rate `None` below) must not insert
+    /// zero-width pseudo-samples that would silently stretch the window.
+    fn sample_rate(&mut self, name: &str) -> RatePair {
+        let rx = read_counter(name, "rx_bytes");
+        let tx = read_counter(name, "tx_bytes");
+        let (Some(rx), Some(tx)) = (rx, tx) else {
+            return (None, None);
+        };
+        let rx_err = read_counter(name, "rx_errors").unwrap_or(0);
+        let tx_err = read_counter(name, "tx_errors").unwrap_or(0);
+        let rx_drop = read_counter(name, "rx_dropped").unwrap_or(0);
+        let tx_drop = read_counter(name, "tx_dropped").unwrap_or(0);
         let now = Instant::now();
 
-        let rate = self.prev.get(name).and_then(|prev| {
+        let outcome = self.prev.get(name).and_then(|prev| {
             let elapsed = now.duration_since(prev.at).as_secs_f64();
             // A key mash on 'b'/any-key redraws far faster than a real 5s
             // tick; without this floor a near-zero elapsed time would
@@ -89,14 +181,46 @@ impl ThroughputSampler {
             if elapsed < 1.0 {
                 return None;
             }
-            let rx_rate = (rx.saturating_sub(prev.rx) as f64 / elapsed) as u64;
-            let tx_rate = (tx.saturating_sub(prev.tx) as f64 / elapsed) as u64;
-            Some((rx_rate, tx_rate))
+            let rate = (
+                (rx.saturating_sub(prev.rx) as f64 / elapsed) as u64,
+                (tx.saturating_sub(prev.tx) as f64 / elapsed) as u64,
+            );
+            let err_rate = (
+                ((rx_err.saturating_sub(prev.rx_err) + rx_drop.saturating_sub(prev.rx_drop)) as f64
+                    / elapsed) as u64,
+                ((tx_err.saturating_sub(prev.tx_err) + tx_drop.saturating_sub(prev.tx_drop)) as f64
+                    / elapsed) as u64,
+            );
+            Some((rate, err_rate))
         });
 
-        self.prev
-            .insert(name.to_string(), Sample { rx, tx, at: now });
-        rate
+        self.prev.insert(
+            name.to_string(),
+            Sample {
+                rx,
+                tx,
+                rx_err,
+                tx_err,
+                rx_drop,
+                tx_drop,
+                at: now,
+            },
+        );
+
+        if let Some((rate, err_rate)) = outcome {
+            let history = self
+                .history
+                .entry(name.to_string())
+                .or_insert_with(|| IfaceHistory {
+                    series: VecDeque::with_capacity(TRAFFIC_HISTORY),
+                });
+            history.series.push_back(rate);
+            while history.series.len() > TRAFFIC_HISTORY {
+                history.series.pop_front();
+            }
+            return (Some(rate), Some(err_rate));
+        }
+        (None, None)
     }
 }
 
@@ -132,6 +256,7 @@ fn read_counter(name: &str, stat: &str) -> Option<u64> {
 /// per Tenant" section), each with its own VLAN sub-interface, gathering
 /// all of this for every one of them on every 5s tick would add up for
 /// no benefit - nothing shows this except the one open detail view.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct InterfaceDetail {
     pub mtu: Option<u32>,
     pub mac: Option<String>,
@@ -251,5 +376,21 @@ mod tests {
         assert_eq!(sysfs_name("bdbos@enp3s0"), "bdbos");
         assert_eq!(sysfs_name("enp3s0"), "enp3s0");
         assert_eq!(sysfs_name("vrf-tenant1"), "vrf-tenant1");
+    }
+
+    #[test]
+    fn traffic_peak_and_latest_read_the_series_ends() {
+        let traffic = Traffic {
+            name: "eth-trunk".to_string(),
+            series: vec![(10, 5), (30, 100), (20, 50)],
+        };
+        assert_eq!(traffic.latest(), Some((20, 50)));
+        assert_eq!(traffic.peak(), Some((30, 100)));
+        let empty = Traffic {
+            name: "eth-trunk".to_string(),
+            series: Vec::new(),
+        };
+        assert_eq!(empty.latest(), None);
+        assert_eq!(empty.peak(), None);
     }
 }

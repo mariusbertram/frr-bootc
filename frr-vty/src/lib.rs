@@ -18,10 +18,20 @@ use std::time::Duration;
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Upper bound on how many response bytes `execute` will buffer before
+/// giving up. Legitimate responses top out in the tens-of-KB range even
+/// with this repo's 150-tenant scaling example; without a cap, anything
+/// on the other end that keeps producing bytes without ever sending the
+/// terminator (a daemon gone wrong; these sockets are root/frr-owned,
+/// so this is defense in depth, not a trust boundary) would grow the
+/// buffer for as long as the read keeps returning data.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 pub struct VtyClient {
     stream: UnixStream,
 }
 
+#[derive(Debug)]
 pub struct VtyResponse {
     pub output: String,
     pub status: u8,
@@ -50,8 +60,18 @@ impl VtyClient {
 
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
+        // Index of the first byte not yet scanned for the terminator -
+        // scanning restarts 3 bytes before the previous end, NOT at 0:
+        // a terminator whose three zeros end exactly at the old buffer's
+        // end was scanned before but rejected only because the status
+        // byte wasn't received yet, so that position must be rescanned
+        // once the new bytes arrive. (Resuming at all - instead of
+        // re-scanning the whole buffer per read - is what keeps a large
+        // response from going quadratic.)
+        let mut scanned_until = 0usize;
         loop {
-            if let Some(terminator_start) = find_terminator(&buf) {
+            if let Some(offset) = find_terminator(&buf[scanned_until..]) {
+                let terminator_start = scanned_until + offset;
                 let status = buf[terminator_start + 3];
                 let output = String::from_utf8_lossy(&buf[..terminator_start]).into_owned();
                 return Ok(VtyResponse { output, status });
@@ -64,7 +84,16 @@ impl VtyClient {
                     "vty socket closed before sending a response terminator",
                 ));
             }
+            scanned_until = buf.len().saturating_sub(3);
             buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > MAX_RESPONSE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "vty response exceeded {MAX_RESPONSE_BYTES} bytes without a terminator"
+                    ),
+                ));
+            }
         }
     }
 }
@@ -170,5 +199,53 @@ mod tests {
         let resp = client.execute("end").unwrap();
         assert!(resp.success());
         assert_eq!(resp.output, "");
+    }
+
+    #[test]
+    fn terminator_straddling_a_read_boundary_is_still_found() {
+        let (client_sock, mut server_sock) = StdUnixStream::pair().unwrap();
+
+        thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            let _ = server_sock.read(&mut buf).unwrap();
+            server_sock.write_all(b"payload").unwrap();
+            // Exactly one zero byte short of a full terminator - the
+            // next read completes it. A resume-scan that starts too late
+            // (e.g. only 2 bytes back) would miss this terminator.
+            server_sock.write_all(&[0, 0]).unwrap();
+            thread::sleep(Duration::from_millis(20));
+            server_sock.write_all(&[0, 0]).unwrap();
+        });
+
+        let mut client = VtyClient {
+            stream: client_sock,
+        };
+        let resp = client.execute("show version").unwrap();
+        assert!(resp.success());
+        assert_eq!(resp.output, "payload");
+    }
+
+    #[test]
+    fn oversized_response_is_rejected_instead_of_buffered_forever() {
+        let (client_sock, mut server_sock) = StdUnixStream::pair().unwrap();
+
+        thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            let _ = server_sock.read(&mut buf).unwrap();
+            // More than MAX_RESPONSE_BYTES of junk, never followed by a
+            // terminator - the client must abort, not buffer it all.
+            let junk = vec![b'x'; MAX_RESPONSE_BYTES + 1];
+            let mut sent = 0;
+            while sent < junk.len() {
+                sent += server_sock.write(&junk[sent..]).unwrap();
+            }
+        });
+
+        let mut client = VtyClient {
+            stream: client_sock,
+        };
+        let err = client.execute("show version").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeded"));
     }
 }
