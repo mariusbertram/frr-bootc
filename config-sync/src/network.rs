@@ -1,10 +1,12 @@
 use std::fs;
+use std::io;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use nmstate::NetworkState;
 
-use crate::{has_extension, is_empty_source, list_names, Logger};
+use crate::{has_extension, is_empty_source, list_names, Logger, Runner};
 
 /// Applies nmstate desired-state documents (`*.yml`/`*.yaml`) from `src`
 /// (the mounted `network-config` ConfigMap) via the `nmstate` crate
@@ -62,12 +64,13 @@ use crate::{has_extension, is_empty_source, list_names, Logger};
 /// converged.
 const SYSFS_NET_DIR: &str = "/sys/class/net";
 
-pub fn sync(src: &Path, cache_dir: &Path, log: &Logger) -> Result<()> {
+pub fn sync(src: &Path, cache_dir: &Path, runner: &impl Runner, log: &Logger) -> Result<()> {
     if is_empty_source(src) {
         log.log(format!(
             "{} is empty or not mounted, nothing to sync",
             src.display()
         ));
+        notify_ready(runner, log);
         return Ok(());
     }
 
@@ -80,6 +83,9 @@ pub fn sync(src: &Path, cache_dir: &Path, log: &Logger) -> Result<()> {
 
     let mut statefiles = statefile_paths(src)?;
     statefiles.sort();
+
+    let mut applied_any = false;
+    let mut all_converged = true;
 
     for path in &statefiles {
         let name = path
@@ -107,14 +113,117 @@ pub fn sync(src: &Path, cache_dir: &Path, log: &Logger) -> Result<()> {
 
         if interfaces_converged(&state, Path::new(SYSFS_NET_DIR), log) {
             cache_applied(&cache_path, &yaml, log);
+            applied_any = true;
         } else {
             log.log(format!(
                 "{name} applied but not every interface is up yet - not caching, will retry next tick"
             ));
+            all_converged = false;
         }
     }
 
+    // Trigger an FRR reload if new network configuration was applied and
+    // all interfaces converged, so FRR's Zebra and BGP daemons bind to any newly
+    // created interfaces/VRFs and pick up new connected routes immediately.
+    if applied_any && all_converged {
+        reload_frr_if_running(runner, log);
+    }
+
+    // Notify systemd (READY=1) once interfaces have converged (or on unchanged ticks),
+    // so dependent units like frr.service (After=network-config-sync.service) can start.
+    if all_converged {
+        notify_ready(runner, log);
+    }
+
     log.log("sync complete");
+    Ok(())
+}
+
+/// Reloads FRR if frr.service is currently active on the host.
+/// Uses `systemctl try-reload-or-restart frr.service`:
+/// if FRR is running, it reloads via frr-reload.py without dropping existing sessions;
+/// if FRR is not running (e.g. at early boot), systemctl takes no action and returns success.
+pub fn reload_frr_if_running(runner: &impl Runner, log: &Logger) {
+    log.log("notifying FRR of network changes (systemctl try-reload-or-restart frr.service)");
+    match runner.run("systemctl", &["try-reload-or-restart", "frr.service"]) {
+        Ok(out) if out.status.success() => {
+            log.log("FRR reload triggered successfully");
+        }
+        Ok(out) => {
+            log.err(format!(
+                "failed to reload FRR (exit status {}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Err(e) => {
+            log.err(format!(
+                "failed to spawn systemctl try-reload-or-restart: {e}"
+            ));
+        }
+    }
+}
+
+/// Notifies systemd of readiness (`READY=1`) so dependent units (such as frr.service,
+/// which is ordered `After=network-config-sync.service`) can safely start.
+///
+/// Sends `READY=1` directly to `$NOTIFY_SOCKET` if set (supporting both filesystem paths
+/// and Linux abstract sockets). Falls back to `systemd-notify --ready` if needed.
+pub fn notify_ready(runner: &impl Runner, log: &Logger) {
+    if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
+        if !socket_path.is_empty() {
+            if let Err(e) = send_notify_socket(&socket_path, b"READY=1\n") {
+                log.log(format!(
+                    "direct sd_notify failed: {e}, falling back to systemd-notify"
+                ));
+            } else {
+                log.log("notified systemd: READY=1");
+                return;
+            }
+        }
+    }
+
+    if let Ok(out) = runner.run("systemd-notify", &["--ready"]) {
+        if out.status.success() {
+            log.log("notified systemd via systemd-notify: READY=1");
+        }
+    }
+}
+
+fn send_notify_socket(path: &str, msg: &[u8]) -> io::Result<()> {
+    use std::os::unix::net::UnixDatagram;
+
+    let sock = UnixDatagram::unbound()?;
+    if let Some(abstract_path) = path.strip_prefix('@') {
+        let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = abstract_path.as_bytes();
+        if bytes.len() + 1 > sun.sun_path.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "NOTIFY_SOCKET path too long",
+            ));
+        }
+        for (i, &b) in bytes.iter().enumerate() {
+            sun.sun_path[i + 1] = b as libc::c_char;
+        }
+        let addr_len = std::mem::size_of::<libc::sa_family_t>() + 1 + bytes.len();
+        let ret = unsafe {
+            libc::sendto(
+                sock.as_raw_fd(),
+                msg.as_ptr() as *const libc::c_void,
+                msg.len(),
+                0,
+                &sun as *const libc::sockaddr_un as *const libc::sockaddr,
+                addr_len as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    } else {
+        sock.send_to(msg, Path::new(path))?;
+    }
     Ok(())
 }
 
@@ -205,13 +314,31 @@ fn statefile_paths(src: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::FakeRunner;
 
     #[test]
-    fn empty_source_is_a_noop() {
+    fn empty_source_is_a_noop_and_notifies_ready() {
         let src = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
         let log = Logger::new("test");
-        sync(src.path(), cache.path(), &log).unwrap();
+        sync(src.path(), cache.path(), &runner, &log).unwrap();
+        assert!(runner.calls().contains(&"systemd-notify".to_string()));
+    }
+
+    #[test]
+    fn reload_frr_invokes_try_reload_or_restart() {
+        let runner = FakeRunner::new();
+        let log = Logger::new("test");
+        reload_frr_if_running(&runner, &log);
+        assert_eq!(runner.calls(), vec!["systemctl".to_string()]);
+        assert_eq!(
+            runner.call_args("systemctl"),
+            vec![vec![
+                "try-reload-or-restart".to_string(),
+                "frr.service".to_string()
+            ]]
+        );
     }
 
     fn up_interface_state(name: &str) -> NetworkState {
@@ -291,9 +418,13 @@ mod tests {
         let yaml = "interfaces: []\n";
         fs::write(src.path().join("nmstate.yml"), yaml).unwrap();
         fs::write(cache.path().join("nmstate.yml"), yaml).unwrap();
+        let runner = FakeRunner::new();
         let log = Logger::new("test");
 
-        sync(src.path(), cache.path(), &log).unwrap();
+        sync(src.path(), cache.path(), &runner, &log).unwrap();
+
+        assert!(runner.calls().contains(&"systemd-notify".to_string()));
+        assert!(!runner.calls().contains(&"systemctl".to_string()));
     }
 
     #[test]

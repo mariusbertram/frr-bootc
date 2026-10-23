@@ -243,6 +243,83 @@ fn expect_word(s: &str, word: &str) -> Option<usize> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_utils {
+    use super::*;
+    use std::cell::RefCell;
+    use std::process::{ExitStatus, Output};
+
+    pub(crate) struct FakeRunner {
+        pub(crate) calls: RefCell<Vec<(String, Vec<String>)>>,
+        pub(crate) responses: RefCell<Vec<(String, io::Result<Output>)>>,
+    }
+
+    impl FakeRunner {
+        pub(crate) fn new() -> Self {
+            FakeRunner {
+                calls: RefCell::new(Vec::new()),
+                responses: RefCell::new(Vec::new()),
+            }
+        }
+
+        pub(crate) fn on(self, cmd: &str, output: Output) -> Self {
+            self.responses
+                .borrow_mut()
+                .push((cmd.to_string(), Ok(output)));
+            self
+        }
+
+        pub(crate) fn calls(&self) -> Vec<String> {
+            self.calls
+                .borrow()
+                .iter()
+                .map(|(cmd, _)| cmd.clone())
+                .collect()
+        }
+
+        pub(crate) fn call_args(&self, cmd: &str) -> Vec<Vec<String>> {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|(c, _)| c == cmd)
+                .map(|(_, args)| args.clone())
+                .collect()
+        }
+    }
+
+    pub(crate) fn ok_output(stdout: &str) -> Output {
+        success_output(stdout, true)
+    }
+
+    pub(crate) fn fail_output(stdout: &str) -> Output {
+        success_output(stdout, false)
+    }
+
+    fn success_output(stdout: &str, ok: bool) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output {
+            status: ExitStatus::from_raw(if ok { 0 } else { 1 << 8 }),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    impl Runner for FakeRunner {
+        fn run(&self, cmd: &str, args: &[&str]) -> io::Result<Output> {
+            self.calls.borrow_mut().push((
+                cmd.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            ));
+            let mut responses = self.responses.borrow_mut();
+            if let Some(pos) = responses.iter().position(|(c, _)| c == cmd) {
+                let (_, result) = responses.remove(pos);
+                return result;
+            }
+            Ok(ok_output(""))
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

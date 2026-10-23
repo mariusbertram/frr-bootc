@@ -112,6 +112,7 @@ COPY files/usr/lib/systemd/system/bootc-image-sync.timer /usr/lib/systemd/system
 COPY files/usr/lib/systemd/system/frr-console-tty1.service /usr/lib/systemd/system/frr-console-tty1.service
 COPY files/usr/lib/systemd/system/frr-console-ttyS0.service /usr/lib/systemd/system/frr-console-ttyS0.service
 COPY files/usr/lib/systemd/system/frr-console-reset-faillock.service /usr/lib/systemd/system/frr-console-reset-faillock.service
+COPY files/usr/lib/systemd/system/frr.service.d/10-network-config-sync.conf /usr/lib/systemd/system/frr.service.d/10-network-config-sync.conf
 
 # frr-console-tty1.service/frr-console-ttyS0.service (enabled below) take
 # over the console outright, Talos-Linux style - mask the getty units they

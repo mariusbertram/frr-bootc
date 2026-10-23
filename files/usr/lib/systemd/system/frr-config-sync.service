@@ -1,6 +1,8 @@
 [Unit]
 Description=Sync FRR configuration from the mounted frr-config ConfigMap
 RequiresMountsFor=/run/config/frr
+Wants=network-config-sync.service
+After=network-config-sync.service
 
 [Service]
 Type=simple

@@ -1,7 +1,7 @@
 //! Applies network configuration from the mounted "network-config"
 //! ConfigMap (`/run/config/network`, a read-only virtiofs mount) via the
 //! `nmstate` crate. Runs as a persistent daemon
-//! (`network-config-sync.service`, `Type=simple`, `Wants=`/`After=
+//! (`network-config-sync.service`, `Type=notify`, `Wants=`/`After=
 //! NetworkManager.service`, no `.timer`) that re-applies on its own
 //! internal [`config_sync::POLL_INTERVAL`] - see
 //! [`config_sync::network::sync`] for what one iteration actually does.
@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use config_sync::{Lock, Logger};
+use config_sync::{Lock, Logger, SystemRunner};
 
 const LOCK_PATH: &str = "/run/network-config-sync.lock";
 const STATUS_PATH: &str = "/run/network-config-sync.status";
@@ -47,6 +47,6 @@ fn main() -> ExitCode {
     let _lock = lock;
 
     config_sync::run_forever(Path::new(STATUS_PATH), &log, || {
-        config_sync::network::sync(Path::new(SRC), Path::new(CACHE_DIR), &log)
+        config_sync::network::sync(Path::new(SRC), Path::new(CACHE_DIR), &SystemRunner, &log)
     })
 }
