@@ -274,69 +274,7 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::process::{ExitStatus, Output};
-
-    struct FakeRunner {
-        calls: RefCell<Vec<(String, Vec<String>)>>,
-        responses: RefCell<Vec<(String, io::Result<Output>)>>,
-    }
-
-    impl FakeRunner {
-        fn new() -> Self {
-            FakeRunner {
-                calls: RefCell::new(Vec::new()),
-                responses: RefCell::new(Vec::new()),
-            }
-        }
-
-        fn on(self, cmd: &str, output: Output) -> Self {
-            self.responses
-                .borrow_mut()
-                .push((cmd.to_string(), Ok(output)));
-            self
-        }
-
-        fn calls(&self) -> Vec<String> {
-            self.calls
-                .borrow()
-                .iter()
-                .map(|(cmd, _)| cmd.clone())
-                .collect()
-        }
-    }
-
-    fn ok_output(stdout: &str) -> Output {
-        success_output(stdout, true)
-    }
-
-    fn fail_output(stdout: &str) -> Output {
-        success_output(stdout, false)
-    }
-
-    fn success_output(stdout: &str, ok: bool) -> Output {
-        use std::os::unix::process::ExitStatusExt;
-        Output {
-            status: ExitStatus::from_raw(if ok { 0 } else { 1 << 8 }),
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: Vec::new(),
-        }
-    }
-
-    impl Runner for FakeRunner {
-        fn run(&self, cmd: &str, args: &[&str]) -> io::Result<Output> {
-            self.calls.borrow_mut().push((
-                cmd.to_string(),
-                args.iter().map(|s| s.to_string()).collect(),
-            ));
-            let mut responses = self.responses.borrow_mut();
-            if let Some(pos) = responses.iter().position(|(c, _)| c == cmd) {
-                let (_, result) = responses.remove(pos);
-                return result;
-            }
-            Ok(ok_output(""))
-        }
-    }
+    use crate::test_utils::{fail_output, ok_output, FakeRunner};
 
     fn write_file(dir: &Path, name: &str, contents: &str) {
         fs::write(dir.join(name), contents).unwrap();

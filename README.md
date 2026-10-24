@@ -29,12 +29,12 @@ documents how it's deployed at scale.
         ▼                            ▼
  frr-config-sync.service     network-config-sync.service
  (persistent daemon,         (persistent daemon,
-  polls internally, no        polls internally, no
-  .timer; see below)          .timer; see below)
+  polls internally, no        Type=notify, polls
+  .timer; see below)          internally, no .timer)
    → /etc/frr/*                 → nmstate crate .apply() on *.yml/*.yaml
-   → vtysh -C (validation)
-   → frr-reload.py (live)
-   → on daemons change:
+   → vtysh -C (validation)      → verifies interfaces operstate == "up"
+   → frr-reload.py (live)       → notifies systemd (READY=1)
+   → on daemons change:         → reloads FRR on network change
      systemctl restart frr
 ```
 
@@ -135,6 +135,26 @@ tries again next tick.
   (non-transient) convergence failure on every tick forever doesn't fix
   it either - it only pays the disruption cost repeatedly for a fix that
   never lands.
+
+### Startup Synchronization with FRR
+
+To prevent a race condition at boot where FRR starts before network interfaces,
+VRFs, and connected routes exist (which causes BGP next-hop tracking to flag
+neighbor routes as unreachable and fail socket binding):
+
+- `network-config-sync.service` is configured as `Type=notify`. It signals
+  `READY=1` to systemd only after its initial sync finishes and desired interfaces
+  have converged (`operstate == "up"`).
+- `frr.service` has a systemd drop-in
+  (`files/usr/lib/systemd/system/frr.service.d/10-network-config-sync.conf`) with
+  `After=network-config-sync.service` and `Wants=network-config-sync.service`,
+  guaranteeing that FRR only starts after all interfaces and VRF routing tables are
+  up.
+- In addition, whenever `network-config-sync` successfully applies a new or
+  modified nmstate state at runtime, it calls
+  `systemctl try-reload-or-restart frr.service` so that FRR immediately binds to any
+  newly created interfaces/VRFs and resolves neighbor routes without manual
+  intervention.
 
 ## Configuration Format
 

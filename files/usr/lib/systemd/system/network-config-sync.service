@@ -5,7 +5,7 @@ Wants=NetworkManager.service
 After=NetworkManager.service
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/usr/local/bin/network-config-sync
 Restart=always
 RestartSec=5
