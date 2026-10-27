@@ -677,16 +677,20 @@ exported/advertised to it - plus the VRF's BFD sessions, whose state
 usually explains a flapping BGP session before BGP itself reacts. Inside
 that popup, `\u{2191}`/`\u{2193}` highlights a peer (the view scrolls to
 follow, same navigation model as the list tabs) and `a` opens that one
-peer's **advertised prefixes** - its Adj-RIB-Out, straight from
-`show bgp [vrf <vrf>] <afi> neighbors <peer> advertised-routes json` via
-the same direct vty socket client, one prefix per line with its AS path.
-That's the per-prefix answer behind the `pfxSnt` count: whether e.g. the
-BPATG prefixes actually leave the router over the upstream peering is
-visible right on the console, without a `b`-login + `vtysh` detour - and
+peer's **advertised prefixes** (`a`, its Adj-RIB-Out) or **received
+prefixes** (`r`, its Adj-RIB-In) - straight from
+`show bgp [vrf <vrf>] <afi> neighbors <peer> {advertised,received}-routes json`
+via the same direct vty socket client, one prefix per line with its AS
+path. That's the per-prefix answer behind the `pfxSnt`/`pfxRcd` counts:
+whether e.g. the BPATG prefixes actually leave the router over the
+upstream peering is visible right on the console (and, with `r`, whether
+the peer's side ever sent them in the first place - the worker-side
+half of the same question), without a `b`-login + `vtysh` detour - and
 an established session whose Adj-RIB-Out is *empty* renders as exactly
 that finding (a route-map/prefix-list or a missing `network` statement
-is suppressing the advertisement), not as a blank popup; a failed query
-renders the failure instead. The data is gathered on demand for the one
+is suppressing the advertisement), an empty Adj-RIB-In as the peer
+never having sent anything in that address family, never as a blank
+popup; a failed query renders the failure instead. The data is gathered on demand for the one
 peer being looked at only (same round-trip budgeting as the per-VRF
 route counts), arrives on the next refresh tick, and `Esc` steps back to
 the VRF popup. In the
@@ -753,8 +757,9 @@ The dashboard auto-refreshes every 5s, showing:
   divergence means FRR knows routes the kernel hasn't installed; shown
   for up to 30 VRFs, past that only the global RIB count - one dashboard
   tick must not turn into 150 vty round-trips), and - inside the VRF
-  popup, on demand - the selected peer's advertised prefixes (its
-  Adj-RIB-Out), so "which prefixes go out over which peering" has a
+  popup, on demand - the selected peer's advertised and received
+  prefixes (its Adj-RIB-Out/In), so "which prefixes go out over which
+  peering - and did the ones expected back ever arrive" has a
   per-prefix answer on the console
 - BFD session state (`show bfd peers json` via the same direct vty
   socket client, when `bfdd` is running) - BFD is what actually detects

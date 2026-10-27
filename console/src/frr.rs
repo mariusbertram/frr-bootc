@@ -95,14 +95,35 @@ pub struct BfdPeerDetail {
     pub uptime: Option<String>,
 }
 
-/// One prefix in a peer's Adj-RIB-Out - what this router has selected to
-/// advertise to that peer. `pfxSnt` in the BGP summary is only a count;
-/// this is the list behind it, which is what answering "warum sieht der
-/// Upstream die BPATG-Präfixe nicht" actually needs (an empty list with
-/// an established session points straight at a route-map/prefix-list
-/// or a missing `network` statement, not at the session itself).
+/// Which direction of a peer's prefix tables a query/popups is about.
+/// `Advertised` is the Adj-RIB-Out (what this router sends the peer),
+/// `Received` the Adj-RIB-In (what the peer sends this router) - the
+/// pair that separates "we suppress it" from "it never arrived".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Default)]
+pub enum RouteDirection {
+    #[default]
+    Advertised,
+    Received,
+}
+
+impl RouteDirection {
+    pub fn word(self) -> &'static str {
+        match self {
+            RouteDirection::Advertised => "advertised",
+            RouteDirection::Received => "received",
+        }
+    }
+}
+
+/// One prefix in a peer's Adj-RIB-In/Out. `pfxRcd`/`pfxSnt` in the BGP
+/// summary are only counts; this is the list behind them, which is what
+/// answering "warum sieht der Upstream die BPATG-Präfixe nicht" actually
+/// needs (an empty Adj-RIB-Out with an established session points at a
+/// route-map/prefix-list suppressing the export; an empty Adj-RIB-In
+/// points at the peer's side - it never sent the route in the first
+/// place, e.g. a MetalLB pool with no service holding the prefix).
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct BgpAdvPrefix {
+pub struct BgpPeerPrefix {
     pub prefix: String,
     /// AS path as FRR prints it (`aspath.string`), e.g. "65001 65100" -
     /// an empty path (locally originated) is `None`.
@@ -116,20 +137,21 @@ pub struct BgpAdvPrefix {
     pub best: bool,
 }
 
-/// The answer to one advertised-routes query, gathered on demand for
-/// the single peer being looked at (see `Selection::advertised` and
-/// `snapshot::gather` - never for every peer on every tick, for the
+/// The answer to one advertised-/received-routes query, gathered on
+/// demand for the single peer being looked at (see `Selection::routes`
+/// and `snapshot::gather` - never for every peer on every tick, for the
 /// same 150-tenant round-trip-budget reasoning as `gather_vrf_routes`).
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct AdvertisedRoutes {
+pub struct PeerRoutes {
+    pub direction: RouteDirection,
     pub vrf: String,
     pub peer: String,
     pub afi: String,
-    pub prefixes: Vec<BgpAdvPrefix>,
-    /// Transport/parse failure for this query, if any - "no routes
-    /// advertised" (empty list, no error) and "couldn't ask" are
-    /// different findings, same distinction `FrrStatus::query_errors`
-    /// makes for the periodic queries.
+    pub prefixes: Vec<BgpPeerPrefix>,
+    /// Transport/parse failure for this query, if any - "no routes"
+    /// (empty list, no error) and "couldn't ask" are different
+    /// findings, same distinction `FrrStatus::query_errors` makes for
+    /// the periodic queries.
     pub error: Option<String>,
 }
 
@@ -165,54 +187,58 @@ fn is_safe_peer_addr(peer: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.'))
 }
 
-/// Asks bgpd for one peer's Adj-RIB-Out (`show bgp [vrf <vrf>] <afi>
-/// neighbors <peer> advertised-routes json`) - the per-peer, per-prefix
-/// breakdown behind the summary's `pfxSnt` count. The default VRF uses
-/// the command form without a `vrf` clause (the form every FRR version
-/// this image runs accepts); named VRFs use `vrf <name>`. Failures are
-/// carried in `error` rather than treated as "nothing advertised": an
-/// established session with an empty result list is itself the finding
-/// (a route-map/prefix-list or missing `network` statement is filtering
-/// the advertisements), and it must not be conflated with a query that
-/// never got answered.
-pub fn advertised_prefixes(vrf: &str, peer: &str, afi: &str) -> AdvertisedRoutes {
-    let mut result = AdvertisedRoutes {
+/// Asks bgpd for one peer's Adj-RIB-Out or Adj-RIB-In (`show bgp
+/// [vrf <vrf>] <afi> neighbors <peer> advertised-routes json` or the
+/// `received-routes` form) - the per-peer, per-prefix breakdown behind
+/// the summary's `pfxSnt`/`pfxRcd` counts. The default VRF uses the
+/// command form without a `vrf` clause (the form every FRR version this
+/// image runs accepts); named VRFs use `vrf <name>`. Failures are
+/// carried in `error` rather than treated as "nothing": an established
+/// session with an empty result list is itself the finding (for
+/// advertised: a route-map/prefix-list is suppressing the export; for
+/// received: the peer never sent the route), and it must not be
+/// conflated with a query that never got answered.
+pub fn peer_prefixes(direction: RouteDirection, vrf: &str, peer: &str, afi: &str) -> PeerRoutes {
+    let mut result = PeerRoutes {
+        direction,
         vrf: vrf.to_string(),
         peer: peer.to_string(),
         afi: afi.to_string(),
         prefixes: Vec::new(),
         error: None,
     };
+    let what = direction.word();
     let Some(cli_afi) = afi_to_cli(afi) else {
-        result.error = Some(format!("advertised-routes: unsupported AFI \"{afi}\""));
+        result.error = Some(format!("{what}-routes: unsupported AFI \"{afi}\""));
         return result;
     };
     if !is_safe_vrf_name(vrf) {
         result.error = Some(format!(
-            "advertised-routes: skipping VRF with unexpected name ({vrf})"
+            "{what}-routes: skipping VRF with unexpected name ({vrf})"
         ));
         return result;
     }
     if !is_safe_peer_addr(peer) {
         result.error = Some(format!(
-            "advertised-routes: skipping peer with unexpected address ({peer})"
+            "{what}-routes: skipping peer with unexpected address ({peer})"
         ));
         return result;
     }
 
     let cmd = if vrf == "default" {
-        format!("show bgp {cli_afi} neighbors {peer} advertised-routes json")
+        format!("show bgp {cli_afi} neighbors {peer} {what}-routes json")
     } else {
-        format!("show bgp vrf {vrf} {cli_afi} neighbors {peer} advertised-routes json")
+        format!("show bgp vrf {vrf} {cli_afi} neighbors {peer} {what}-routes json")
     };
     let query = query(Path::new(BGPD_SOCKET), &cmd);
-    let (prefixes, parse_error) = parse_advertised_routes(&query.output);
+    let (prefixes, parse_error) = parse_peer_routes(&query.output);
     result.prefixes = prefixes;
     result.error = query.error.or(parse_error);
     result
 }
 
-/// Parses the advertised-routes JSON into a prefix-sorted list.
+/// Parses the advertised-/received-routes JSON into a prefix-sorted
+/// list.
 /// Expected shape is `{"routes": {"<prefix>": {"paths": [...]}}}`
 /// (plus whatever top-level metadata this FRR version adds, ignored);
 /// a bare routes object without the `routes` wrapper is tolerated the
@@ -224,16 +250,16 @@ pub fn advertised_prefixes(vrf: &str, peer: &str, afi: &str) -> AdvertisedRoutes
 /// a peer with no session in this AFI, an unknown-command rejection on
 /// an older FRR build) surfaces as an error carrying bgpd's own first
 /// line - that text is the diagnosis.
-type AdvParsed = (Vec<BgpAdvPrefix>, Option<String>);
+type PeerRoutesParsed = (Vec<BgpPeerPrefix>, Option<String>);
 
-fn parse_advertised_routes(json: &str) -> AdvParsed {
+fn parse_peer_routes(json: &str) -> PeerRoutesParsed {
     if json.trim().is_empty() {
         return (Vec::new(), None);
     }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
         return (
             Vec::new(),
-            Some(format!("advertised-routes: {}", first_line(json))),
+            Some(format!("peer-routes: {}", first_line(json))),
         );
     };
     let routes = match value.get("routes") {
@@ -242,7 +268,7 @@ fn parse_advertised_routes(json: &str) -> AdvParsed {
         Some(_) => {
             return (
                 Vec::new(),
-                Some("advertised-routes: routes is not an object - schema drift?".to_string()),
+                Some("peer-routes: routes is not an object - schema drift?".to_string()),
             )
         }
         // No "routes" wrapper: accept the object itself if it looks like
@@ -255,10 +281,7 @@ fn parse_advertised_routes(json: &str) -> AdvParsed {
             None => {
                 return (
                     Vec::new(),
-                    Some(
-                        "advertised-routes: response has no routes object - schema drift?"
-                            .to_string(),
-                    ),
+                    Some("peer-routes: response has no routes object - schema drift?".to_string()),
                 )
             }
         },
@@ -286,7 +309,7 @@ fn parse_advertised_routes(json: &str) -> AdvParsed {
             .and_then(|b| b.get("overall"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        out.push(BgpAdvPrefix {
+        out.push(BgpPeerPrefix {
             prefix: prefix.clone(),
             aspath,
             origin,
@@ -1034,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn advertised_routes_parse_paths_aspath_origin_and_bestpath() {
+    fn peer_routes_parse_paths_aspath_origin_and_bestpath() {
         let json = r#"{
             "neighborAddress": "198.51.100.10",
             "routes": {
@@ -1047,7 +1070,7 @@ mod tests {
                 ]}
             }
         }"#;
-        let (prefixes, error) = parse_advertised_routes(json);
+        let (prefixes, error) = parse_peer_routes(json);
         assert!(error.is_none());
         assert_eq!(prefixes.len(), 2);
         // Numeric run comparison: 10.128 sorts after 10.0, not before.
@@ -1061,49 +1084,49 @@ mod tests {
     }
 
     #[test]
-    fn advertised_routes_empty_is_a_valid_answer() {
+    fn peer_routes_empty_is_a_valid_answer() {
         // The case this whole view exists for: session up, nothing being
         // advertised - an empty Adj-RIB-Out, not an error.
-        let (prefixes, error) = parse_advertised_routes(r#"{"routes": {}}"#);
+        let (prefixes, error) = parse_peer_routes(r#"{"routes": {}}"#);
         assert!(prefixes.is_empty() && error.is_none());
 
-        let (prefixes, error) = parse_advertised_routes(r#"{"routes": null}"#);
+        let (prefixes, error) = parse_peer_routes(r#"{"routes": null}"#);
         assert!(prefixes.is_empty() && error.is_none());
 
-        let (prefixes, error) = parse_advertised_routes("");
+        let (prefixes, error) = parse_peer_routes("");
         assert!(prefixes.is_empty() && error.is_none());
     }
 
     #[test]
-    fn advertised_routes_vty_errors_surface_as_errors() {
+    fn peer_routes_vty_errors_surface_as_errors() {
         // A peer with no session in this AFI (or an older FRR without
         // the command) answers with a `% ...` line, not JSON - bgpd's
         // own words become the diagnosis.
         let (prefixes, error) =
-            parse_advertised_routes("% Neighbor 198.51.100.10 has no session in this AFI\n");
+            parse_peer_routes("% Neighbor 198.51.100.10 has no session in this AFI\n");
         assert!(prefixes.is_empty());
         assert!(error.is_some());
         assert!(error.unwrap().contains("no session"));
     }
 
     #[test]
-    fn advertised_routes_schema_drift_is_reported() {
-        let (prefixes, error) = parse_advertised_routes(r#"{"unexpected": 1}"#);
+    fn peer_routes_schema_drift_is_reported() {
+        let (prefixes, error) = parse_peer_routes(r#"{"unexpected": 1}"#);
         assert!(prefixes.is_empty());
         assert_eq!(
             error.as_deref(),
-            Some("advertised-routes: response has no routes object - schema drift?")
+            Some("peer-routes: response has no routes object - schema drift?")
         );
 
-        let (prefixes, error) = parse_advertised_routes(r#"{"routes": [1, 2]}"#);
+        let (prefixes, error) = parse_peer_routes(r#"{"routes": [1, 2]}"#);
         assert!(prefixes.is_empty());
         assert!(error.is_some());
     }
 
     #[test]
-    fn advertised_routes_tolerate_a_bare_routes_object() {
+    fn peer_routes_tolerate_a_bare_routes_object() {
         let json = r#"{"10.0.0.0/24": {"paths": [{"aspath": {"string": "65001"}}]}}"#;
-        let (prefixes, error) = parse_advertised_routes(json);
+        let (prefixes, error) = parse_peer_routes(json);
         assert!(error.is_none());
         assert_eq!(prefixes.len(), 1);
         assert_eq!(prefixes[0].prefix, "10.0.0.0/24");

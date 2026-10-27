@@ -209,7 +209,7 @@ mod tests {
             bootc: None,
             traffic: None,
             selected_sync_journal: None,
-            selected_advertised: None,
+            selected_peer_routes: None,
         }
     }
 

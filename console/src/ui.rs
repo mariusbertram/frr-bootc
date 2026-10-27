@@ -19,7 +19,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::events::EventLog;
-use crate::frr::{AdvertisedRoutes, BgpPeerDetail};
+use crate::frr::{BgpPeerDetail, PeerRoutes, RouteDirection};
 use crate::health;
 use crate::net::{fmt_rate, InterfaceDetail, Traffic};
 use crate::snapshot::{BootcStatus, Snapshot};
@@ -91,13 +91,16 @@ pub struct AppState {
     events_scroll: u16,
     events_follow: bool,
     /// Which peer is highlighted inside the open VRF popup (FRR tab) -
-    /// the subject of the `a` advertised-prefixes popup. Clamped to the
-    /// real peer count at render time, same as the list selections.
+    /// the subject of the `a`/`r` routes popups. Clamped to the real
+    /// peer count at render time, same as the list selections.
     peer_selected: usize,
-    /// The advertised-prefixes popup is open (inside the VRF popup) -
-    /// while set, the scroll keys drive that popup's content and `Esc`
-    /// returns to the VRF popup instead of closing everything.
-    adv_open: bool,
+    /// The routes popup is open (inside the VRF popup) - while set, the
+    /// scroll keys drive that popup's content and `Esc` returns to the
+    /// VRF popup instead of closing everything.
+    routes_open: bool,
+    /// Which direction the open routes popup is about - re-openable
+    /// with the other key without closing it first.
+    routes_direction: RouteDirection,
 }
 
 impl AppState {
@@ -183,7 +186,7 @@ impl AppState {
                 // item - and never inherits a nested popup either.
                 if self.detail_open {
                     self.detail_scroll = 0;
-                    self.adv_open = false;
+                    self.routes_open = false;
                 }
             }
         }
@@ -191,7 +194,7 @@ impl AppState {
 
     pub fn close_detail(&mut self) {
         self.detail_open = false;
-        self.adv_open = false;
+        self.routes_open = false;
         self.detail_scroll = 0;
     }
 
@@ -218,35 +221,39 @@ impl AppState {
         self.peer_selected = usize::MAX;
     }
 
-    /// Opens the advertised-prefixes (Adj-RIB-Out) popup for the
-    /// currently highlighted peer - a no-op outside the FRR tab's VRF
-    /// popup. The data arrives with the next gather tick (see
-    /// `Selection::advertised`); until then the popup says so rather
-    /// than pretending an empty answer.
-    pub fn open_advertised(&mut self) {
+    /// Opens the routes popup for the currently highlighted peer -
+    /// `Advertised` (Adj-RIB-Out, `a`) or `Received` (Adj-RIB-In, `r`) -
+    /// a no-op outside the FRR tab's VRF popup. The data arrives with
+    /// the next gather tick (see `Selection::routes`); until then the
+    /// popup says so rather than pretending an empty answer.
+    pub fn open_routes(&mut self, direction: RouteDirection) {
         if self.detail_open && self.tab == Tab::Frr {
-            self.adv_open = true;
+            self.routes_open = true;
+            self.routes_direction = direction;
             self.detail_scroll = 0;
         }
     }
 
     /// Returns to the VRF popup without closing it.
-    pub fn close_advertised(&mut self) {
-        self.adv_open = false;
+    pub fn close_routes(&mut self) {
+        self.routes_open = false;
         self.detail_scroll = 0;
     }
 
-    pub fn advertised_open(&self) -> bool {
-        self.adv_open
+    pub fn routes_open(&self) -> bool {
+        self.routes_open
     }
 
-    /// The (vrf, peer, afi) the advertised-prefixes popup is currently
+    /// The (direction, vrf, peer, afi) the routes popup is currently
     /// asking about - what `update_selection` (main.rs) turns into the
     /// gather thread's on-demand query. Uses the same sort orders the
     /// render pass uses (sorted_vrfs / sorted_peer_list), so what gets
     /// queried is exactly what's highlighted on screen.
-    pub fn selected_peer(&self, snap: &Snapshot) -> Option<(String, String, String)> {
-        if !self.detail_open || !self.adv_open || self.tab != Tab::Frr {
+    pub fn selected_peer(
+        &self,
+        snap: &Snapshot,
+    ) -> Option<(RouteDirection, String, String, String)> {
+        if !self.detail_open || !self.routes_open || self.tab != Tab::Frr {
             return None;
         }
         let vrfs = sorted_vrfs(snap);
@@ -258,7 +265,12 @@ impl AppState {
         }
         let selected = self.peer_selected.min(sorted.len() - 1);
         let peer = &sorted[selected];
-        Some((vrf.to_string(), peer.peer.clone(), peer.afi.clone()))
+        Some((
+            self.routes_direction,
+            vrf.to_string(),
+            peer.peer.clone(),
+            peer.afi.clone(),
+        ))
     }
 
     /// Popup scrolling - `u16::MAX` is the "jump to the very bottom"
@@ -1396,15 +1408,16 @@ fn frr_detail(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &mut AppSta
                 &mut state.detail_scroll,
                 state.peer_selected.min(peers.len().saturating_sub(1)),
             );
-            if state.adv_open {
-                if let Some((vrf, peer, afi)) = state.selected_peer(snap) {
-                    advertised_popup(
+            if state.routes_open() {
+                if let Some((direction, vrf, peer, afi)) = state.selected_peer(snap) {
+                    routes_popup(
                         frame,
                         area,
+                        direction,
                         &vrf,
                         &peer,
                         &afi,
-                        snap.selected_advertised.as_ref(),
+                        snap.selected_peer_routes.as_ref(),
                         &mut state.detail_scroll,
                     );
                 }
@@ -1476,7 +1489,7 @@ fn vrf_detail_popup(
 
     if !sorted.is_empty() {
         lines.push(Line::styled(
-            "a: advertised prefixes of the selected peer",
+            "a: advertised / r: received prefixes of the selected peer",
             Style::default().fg(MUTED),
         ));
     }
@@ -1523,32 +1536,38 @@ fn sorted_peer_list(peers: &[BgpPeerDetail]) -> Vec<&BgpPeerDetail> {
     sorted
 }
 
-/// The Adj-RIB-Out of the selected peer - one line per advertised
-/// prefix with its AS path, so "which prefixes go out over which
-/// peering" is answerable without `b`-login + vtysh. An established
-/// session with an empty list is the finding itself (a route-map /
-/// prefix-list or a missing `network` statement is suppressing the
-/// advertisement - e.g. tenant prefixes never reaching the upstream
-/// neighbor), and it renders as exactly that, not as a failure. A query
+/// The Adj-RIB-Out (`a`) or Adj-RIB-In (`r`) of the selected peer - one
+/// line per prefix with its AS path, so "which prefixes go out over
+/// which peering" and its inverse ("did the route the upstream should
+/// send us ever arrive") are answerable without `b`-login + vtysh. An
+/// established session with an empty list is the finding itself, and
+/// its wording depends on the direction: for advertised, a route-map /
+/// prefix-list (or, in this image's import-based design, a route that
+/// was never imported into the VRF) is suppressing the export; for
+/// received, the peer never sent the route - e.g. the worker side's
+/// BGP advertisement never included the prefix, the exact upstream
+/// half of "warum sieht der Upstream die BPATG-Präfixe nicht". A query
 /// failure renders the failure, not an empty success. Until the gather
 /// tick that carries the data lands, a muted "collecting" line says
 /// so - an empty answer that was never asked would be a lie.
-fn advertised_popup(
+fn routes_popup(
     frame: &mut Frame,
     area: Rect,
+    direction: RouteDirection,
     vrf: &str,
     peer: &str,
     afi: &str,
-    advertised: Option<&AdvertisedRoutes>,
+    routes: Option<&PeerRoutes>,
     scroll: &mut u16,
 ) {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    // A snapshot's advertised data can be one selection behind (the key
+    // A snapshot's routes data can be one selection behind (the key
     // arrives over the Selection mutex, the answer over the next tick) -
-    // data that isn't about the peer in the title renders as
+    // data that isn't about the peer/direction in the title renders as
     // "collecting", never as an answer about a different peering.
-    let advertised = advertised.filter(|adv| adv.vrf == vrf && adv.peer == peer && adv.afi == afi);
-    match advertised {
+    let routes = routes
+        .filter(|r| r.direction == direction && r.vrf == vrf && r.peer == peer && r.afi == afi);
+    match routes {
         None => lines.push(Line::styled(
             " (collecting - ready on the next refresh tick)",
             Style::default().fg(MUTED),
@@ -1564,18 +1583,20 @@ fn advertised_popup(
                     Style::default().fg(MUTED),
                 ));
             } else if adv.prefixes.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::raw(" "),
-                    status("advertises nothing", WARN),
-                ]));
-                lines.push(Line::styled(
-                    "  session is up - a route-map/prefix-list or a",
-                    Style::default().fg(MUTED),
-                ));
-                lines.push(Line::styled(
-                    "  missing network statement is suppressing this.",
-                    Style::default().fg(MUTED),
-                ));
+                let (headline, explain) = match direction {
+                    RouteDirection::Advertised => (
+                        "advertises nothing",
+                        "  session is up - a route-map/prefix-list or a\n  missing network statement is suppressing this.",
+                    ),
+                    RouteDirection::Received => (
+                        "sent nothing",
+                        "  session is up - the peer is not sending any\n  prefixes in this address family (check its\n  export policy / whether it holds the route at all).",
+                    ),
+                };
+                lines.push(Line::from(vec![Span::raw(" "), status(headline, WARN)]));
+                for line in explain.lines() {
+                    lines.push(Line::styled(line.to_string(), Style::default().fg(MUTED)));
+                }
             } else {
                 for p in &adv.prefixes {
                     let aspath = p.aspath.as_deref().unwrap_or("(locally originated)");
@@ -1590,7 +1611,7 @@ fn advertised_popup(
             }
         }
     }
-    let title = format!(" advertised: {peer} ({afi}) ");
+    let title = format!(" {}: {peer} ({afi}) ", direction.word());
     render_popup(frame, area, &title, lines, scroll, None);
 }
 
@@ -1731,6 +1752,7 @@ fn footer(frame: &mut Frame, area: Rect, tab: Tab, detail_open: bool, refresh_se
         Tab::Frr if detail_open => hints.extend([
             hint_tier("\u{2191}\u{2193}", "Peer", 1),
             hint_tier("a", "Advertised", 1),
+            hint_tier("r", "Received", 1),
             hint_tier("Esc", "Close", 0),
         ]),
         _ if detail_open => hints.extend([
@@ -1827,7 +1849,7 @@ mod tests {
             bootc: None,
             traffic: None,
             selected_sync_journal: None,
-            selected_advertised: None,
+            selected_peer_routes: None,
         }
     }
 
@@ -2073,12 +2095,13 @@ mod tests {
     }
 
     // The feature this whole change is about: `a` on a highlighted peer
-    // opens that peer's Adj-RIB-Out - the per-prefix answer to "warum
-    // sieht der Upstream die BPATG-Präfixe nicht" that pfxSnt's bare
-    // count can't give. All three answer shapes render distinctly:
-    // prefixes, "advertises nothing", and the collecting placeholder
-    // for the tick the data arrives on. Esc steps back to the VRF popup
-    // instead of closing it.
+    // opens that peer's Adj-RIB-Out, `r` its Adj-RIB-In - the
+    // per-prefix answer to "warum sieht der Upstream die BPATG-Präfixe
+    // nicht" and its inverse that pfxSnt/pfxRcd's bare counts can't
+    // give. All answer shapes render distinctly: prefixes, "advertises
+    // nothing"/"sent nothing", and the collecting placeholder for the
+    // tick the data arrives on. Esc steps back to the VRF popup instead
+    // of closing it.
     #[test]
     fn a_opens_the_selected_peers_advertised_prefixes() {
         let mut snap = fake_snapshot(0);
@@ -2107,18 +2130,19 @@ mod tests {
                 },
             ],
         );
-        snap.selected_advertised = Some(crate::frr::AdvertisedRoutes {
+        snap.selected_peer_routes = Some(crate::frr::PeerRoutes {
+            direction: crate::frr::RouteDirection::Advertised,
             vrf: "vrf-tenant1".to_string(),
             peer: "198.51.100.10".to_string(),
             afi: "ipv4Unicast".to_string(),
             prefixes: vec![
-                crate::frr::BgpAdvPrefix {
+                crate::frr::BgpPeerPrefix {
                     prefix: "10.0.0.0/24".to_string(),
                     aspath: None,
                     origin: Some("IGP".to_string()),
                     best: true,
                 },
-                crate::frr::BgpAdvPrefix {
+                crate::frr::BgpPeerPrefix {
                     prefix: "10.128.0.0/16".to_string(),
                     aspath: Some("65001 65100".to_string()),
                     origin: Some("IGP".to_string()),
@@ -2138,15 +2162,15 @@ mod tests {
         state.toggle_detail();
         let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(
-            text.contains("a: advertised prefixes"),
-            "the VRF popup carries the `a` hint"
+            text.contains("a: advertised / r: received prefixes"),
+            "the VRF popup carries both hints"
         );
         assert!(
-            !text.contains("- advertised"),
+            !text.contains("advertised: 198"),
             "before `a` is pressed the Adj-RIB-Out popup must not be on screen"
         );
 
-        state.open_advertised();
+        state.open_routes(crate::frr::RouteDirection::Advertised);
         let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(
             text.contains("advertised: 198.51.100.10 (ipv4Unicast)"),
@@ -2161,19 +2185,111 @@ mod tests {
         // selection behind - renders as collecting, never as a wrong
         // answer about a different peering.
         let mut other = snap.clone();
-        other.selected_advertised.as_mut().unwrap().peer = "2001:db8:100::1".to_string();
+        other.selected_peer_routes.as_mut().unwrap().peer = "2001:db8:100::1".to_string();
         let text = draw(&mut terminal, &other, &log, &mut state);
         assert!(text.contains("collecting"));
 
         // Esc steps back to the VRF popup, which still shows the peers.
-        state.close_advertised();
+        state.close_routes();
         let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(text.contains("prefixes in/out 12/2"));
         assert!(!text.contains("advertised: 198.51.100.10"));
     }
 
+    // `r` is the inverse view: what the peer sent *us*. An empty
+    // Adj-RIB-In on an established session means the peer's export
+    // never included the route - e.g. the worker-side BGP
+    // advertisement behind a tenant's service prefix was never
+    // configured, exactly the upstream half of the BPATG question.
     #[test]
-    fn advertised_popup_renders_empty_and_error_answers_distinctly() {
+    fn r_opens_the_selected_peers_received_prefixes() {
+        let mut snap = fake_snapshot(0);
+        snap.frr_service_active = true;
+        snap.frr.bgp_vrf_peers = vec![("vrf-tenant1".to_string(), 1, 1)];
+        snap.frr.bgp_vrf_peer_detail.insert(
+            "vrf-tenant1".to_string(),
+            vec![BgpPeerDetail {
+                peer: "25.120.26.129".to_string(),
+                afi: "ipv4Unicast".to_string(),
+                state: "Established".to_string(),
+                remote_as: Some(4200113170),
+                uptime: None,
+                pfx_rcd: "3".to_string(),
+                pfx_snt: "0".to_string(),
+            }],
+        );
+        snap.selected_peer_routes = Some(crate::frr::PeerRoutes {
+            direction: crate::frr::RouteDirection::Received,
+            vrf: "vrf-tenant1".to_string(),
+            peer: "25.120.26.129".to_string(),
+            afi: "ipv4Unicast".to_string(),
+            prefixes: vec![
+                crate::frr::BgpPeerPrefix {
+                    prefix: "28.38.97.224/27".to_string(),
+                    aspath: Some("4200113170".to_string()),
+                    origin: Some("IGP".to_string()),
+                    best: true,
+                },
+                crate::frr::BgpPeerPrefix {
+                    prefix: "25.164.97.224/27".to_string(),
+                    aspath: Some("4200113170".to_string()),
+                    origin: Some("IGP".to_string()),
+                    best: true,
+                },
+            ],
+            error: None,
+        });
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            tab: Tab::Frr,
+            ..Default::default()
+        };
+        let log = EventLog::new(100, None);
+
+        state.toggle_detail();
+        state.open_routes(crate::frr::RouteDirection::Received);
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        // The popup's width follows its content, so a short AS path
+        // can clip the title's AFI suffix - the peer and the direction
+        // are what must be unambiguous.
+        assert!(
+            text.contains("received: 25.120.26.129"),
+            "popup titled after the peer with the received direction"
+        );
+        assert!(text.contains("28.38.97.224/27"));
+        assert!(text.contains("4200113170"));
+        assert!(
+            !text.contains("advertises nothing"),
+            "received prefixes render as a list, not the advertised-empty finding"
+        );
+
+        // Advertised data must NOT satisfy the received popup - the
+        // direction is part of the match key.
+        let mut adv_data = snap.clone();
+        adv_data.selected_peer_routes.as_mut().unwrap().direction =
+            crate::frr::RouteDirection::Advertised;
+        let text = draw(&mut terminal, &adv_data, &log, &mut state);
+        assert!(text.contains("collecting"));
+
+        // Empty received on an established session: "sent nothing",
+        // with the peer-side explanation.
+        let mut empty = snap.clone();
+        empty.selected_peer_routes = Some(crate::frr::PeerRoutes {
+            direction: crate::frr::RouteDirection::Received,
+            vrf: "vrf-tenant1".to_string(),
+            peer: "25.120.26.129".to_string(),
+            afi: "ipv4Unicast".to_string(),
+            prefixes: Vec::new(),
+            error: None,
+        });
+        let text = draw(&mut terminal, &empty, &log, &mut state);
+        assert!(text.contains("sent nothing"));
+        assert!(text.contains("peer is not sending"));
+    }
+
+    #[test]
+    fn routes_popup_renders_empty_and_error_answers_distinctly() {
         let mut snap = fake_snapshot(0);
         snap.frr_service_active = true;
         snap.frr.bgp_vrf_peers = vec![("vrf-tenant1".to_string(), 1, 1)];
@@ -2197,11 +2313,12 @@ mod tests {
         };
         let log = EventLog::new(100, None);
         state.toggle_detail();
-        state.open_advertised();
+        state.open_routes(crate::frr::RouteDirection::Advertised);
 
         // Established session, zero advertised prefixes - the finding
         // itself, not an error.
-        snap.selected_advertised = Some(crate::frr::AdvertisedRoutes {
+        snap.selected_peer_routes = Some(crate::frr::PeerRoutes {
+            direction: crate::frr::RouteDirection::Advertised,
             vrf: "vrf-tenant1".to_string(),
             peer: "198.51.100.10".to_string(),
             afi: "ipv4Unicast".to_string(),
@@ -2214,7 +2331,8 @@ mod tests {
 
         // A failed query renders the failure, never as an empty success.
         let mut broken = snap.clone();
-        broken.selected_advertised = Some(crate::frr::AdvertisedRoutes {
+        broken.selected_peer_routes = Some(crate::frr::PeerRoutes {
+            direction: crate::frr::RouteDirection::Advertised,
             vrf: "vrf-tenant1".to_string(),
             peer: "198.51.100.10".to_string(),
             afi: "ipv4Unicast".to_string(),
@@ -2227,7 +2345,7 @@ mod tests {
 
         // No data yet (the tick it arrives on hasn't landed).
         let mut pending = snap.clone();
-        pending.selected_advertised = None;
+        pending.selected_peer_routes = None;
         let text = draw(&mut terminal, &pending, &log, &mut state);
         assert!(text.contains("collecting"));
     }
@@ -2280,7 +2398,7 @@ mod tests {
                 ..Default::default()
             };
             s.toggle_detail();
-            s.open_advertised();
+            s.open_routes(crate::frr::RouteDirection::Advertised);
             s
         };
 
@@ -2290,6 +2408,7 @@ mod tests {
         assert_eq!(
             state.selected_peer(&snap),
             Some((
+                crate::frr::RouteDirection::Advertised,
                 "vrf-tenant1".to_string(),
                 "198.51.100.10".to_string(),
                 "ipv4Unicast".to_string()

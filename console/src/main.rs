@@ -70,6 +70,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use events::EventLog;
+use frr::RouteDirection;
 use net::ThroughputSampler;
 use snapshot::{Selection, Snapshot};
 use ui::{AppState, Tab};
@@ -297,7 +298,7 @@ fn handle_key(code: KeyCode, state: &mut AppState, terminal: &mut Term) -> KeyRe
         // reachable by holding Down" must work here too, so the
         // selection drives the scroll (see vrf_detail_popup), not the
         // other way around.
-        if state.advertised_open() {
+        if state.routes_open() {
             match code {
                 KeyCode::Down => state.detail_scroll_by(1),
                 KeyCode::Up => state.detail_scroll_by(-1),
@@ -305,7 +306,15 @@ fn handle_key(code: KeyCode, state: &mut AppState, terminal: &mut Term) -> KeyRe
                 KeyCode::PageUp => state.detail_scroll_by(-10),
                 KeyCode::Home => state.detail_scroll_top(),
                 KeyCode::End => state.detail_scroll_bottom(),
-                KeyCode::Enter | KeyCode::Esc => state.close_advertised(),
+                // `a`/`r` re-open the popup with the other direction
+                // without stepping back to the VRF popup first.
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    state.open_routes(RouteDirection::Advertised)
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    state.open_routes(RouteDirection::Received)
+                }
+                KeyCode::Enter | KeyCode::Esc => state.close_routes(),
                 KeyCode::Char('b') | KeyCode::Char('B') => return login(terminal),
                 _ => {}
             }
@@ -327,7 +336,10 @@ fn handle_key(code: KeyCode, state: &mut AppState, terminal: &mut Term) -> KeyRe
             KeyCode::Home if state.tab == Tab::Frr => state.peer_select_first(),
             KeyCode::End if state.tab == Tab::Frr => state.peer_select_last(),
             KeyCode::Char('a') | KeyCode::Char('A') if state.tab == Tab::Frr => {
-                state.open_advertised();
+                state.open_routes(RouteDirection::Advertised);
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') if state.tab == Tab::Frr => {
+                state.open_routes(RouteDirection::Received);
             }
             KeyCode::Down => state.detail_scroll_by(1),
             KeyCode::Up => state.detail_scroll_by(-1),
@@ -441,11 +453,11 @@ fn update_selection(selection: &Arc<Mutex<Selection>>, state: &AppState, snap: O
                         .get(state.sync_selected())
                         .map(|unit| unit.service.to_string());
                 }
-                // The advertised-prefixes popup's subject - None as soon
-                // as it closes (or its peer changes), so the very next
-                // tick stops paying for the extra vty round-trip.
+                // The routes popup's subject - None as soon as it
+                // closes (or its peer/direction changes), so the very
+                // next tick stops paying for the extra vty round-trip.
                 Tab::Frr => {
-                    sel.advertised = state.selected_peer(snap);
+                    sel.routes = state.selected_peer(snap);
                 }
                 _ => {}
             }
@@ -641,19 +653,25 @@ fn print_plain(snap: &Snapshot, verdict: &health::Verdict, log: &EventLog) {
                 }
             }
         }
-        // The advertised-prefixes popup is interactive-only, but the
-        // one-shot mode's whole point is answering questions without
-        // the TUI - so its answer (the selected peer's Adj-RIB-Out)
-        // prints here too, prefixed with the peer it's about, and a
-        // query failure prints as one instead of silently nothing.
-        if let Some(adv) = &snap.selected_advertised {
-            println!("  advertised to {} ({}, {}):", adv.peer, adv.afi, adv.vrf);
-            if let Some(error) = &adv.error {
+        // The routes popup is interactive-only, but the one-shot
+        // mode's whole point is answering questions without the TUI -
+        // so its answer (the selected peer's Adj-RIB-In/Out) prints
+        // here too, prefixed with the peer it's about, and a query
+        // failure prints as one instead of silently nothing.
+        if let Some(routes) = &snap.selected_peer_routes {
+            println!(
+                "  {} to/from {} ({}, {}):",
+                routes.direction.word(),
+                routes.peer,
+                routes.afi,
+                routes.vrf
+            );
+            if let Some(error) = &routes.error {
                 println!("    query failed: {error}");
-            } else if adv.prefixes.is_empty() {
-                println!("    (nothing advertised)");
+            } else if routes.prefixes.is_empty() {
+                println!("    (no {} prefixes)", routes.direction.word());
             } else {
-                for p in &adv.prefixes {
+                for p in &routes.prefixes {
                     let aspath = p.aspath.as_deref().unwrap_or("(locally originated)");
                     println!("    {:<20} via {aspath}", p.prefix);
                 }
