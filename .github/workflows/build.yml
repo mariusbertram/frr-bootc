@@ -155,6 +155,21 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # With the buildx version the docker-container driver now
+          # ships, provenance attestations are on by default, which makes
+          # the pushed object (and this step's digest output) an OCI
+          # *index* wrapping the image manifest. The containerdisk job
+          # below pulls exactly that digest into podman's store, but
+          # bootc-image-builder resolves the reference to the inner
+          # *manifest* digest and then fails with "could not find image
+          # with digest ... in local store" - the store only has the
+          # index under the pulled digest. Disabling the attestation
+          # pushes a plain manifest, so the digest the two jobs pass
+          # between them is the one bootc-image-builder actually looks
+          # for. (This broke between the 2026-09-22 and 2026-10-24 main
+          # builds with no repo change in between - a runner-side
+          # buildx upgrade flipped the default.)
+          provenance: false
 
   # Converts the bootc image just pushed above into a qcow2 disk (via
   # bootc-image-builder) and publishes it wrapped as a containerDisk image -
