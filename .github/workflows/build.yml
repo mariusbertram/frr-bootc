@@ -59,11 +59,14 @@ jobs:
       - name: Render TUI screenshots
         run: cargo run --release --locked -- --screenshots screenshots
 
+      # Path is workspace-root-relative even though the steps above ran
+      # with working-directory: console - upload-artifact's path is
+      # always resolved from the workspace root.
       - name: Upload TUI screenshots
         uses: actions/upload-artifact@v4
         with:
           name: tui-screenshots
-          path: screenshots/*.svg
+          path: console/screenshots/*.svg
           retention-days: 14
           if-no-files-found: error
 
