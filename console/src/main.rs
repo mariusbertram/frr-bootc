@@ -679,13 +679,16 @@ fn print_plain(snap: &Snapshot, verdict: &health::Verdict, log: &EventLog) {
         // here too, prefixed with the peer it's about, and a query
         // failure prints as one instead of silently nothing.
         if let Some(routes) = &snap.selected_peer_routes {
-            println!(
-                "  {} to/from {} ({}, {}):",
-                routes.direction.word(),
-                routes.peer,
-                routes.afi,
-                routes.vrf
-            );
+            let what = match routes.direction {
+                RouteDirection::Advertised => "we send to",
+                RouteDirection::Received => "they send us (from)",
+            };
+            let afi = match routes.afi.as_str() {
+                "ipv4Unicast" => "IPv4",
+                "ipv6Unicast" => "IPv6",
+                other => other,
+            };
+            println!("  {what} {} ({afi}, {}):", routes.peer, routes.vrf);
             if let Some(error) = &routes.error {
                 println!("    query failed: {error}");
             } else if routes.prefixes.is_empty() {

@@ -1461,7 +1461,7 @@ fn vrf_detail_popup(
                     Style::default()
                 };
                 let heading = Line::from(vec![
-                    Span::raw(format!("{:<20} {:<12} ", p.peer, p.afi)),
+                    Span::raw(format!("{:<20} {:<6} ", p.peer, afi_plain(&p.afi))),
                     status(p.state.clone(), color),
                 ])
                 .style(sel_style);
@@ -1471,7 +1471,7 @@ fn vrf_detail_popup(
                 let uptime = p.uptime.as_deref().unwrap_or("-");
                 let detail = Line::styled(
                     format!(
-                        "  AS {as_text}   up {uptime}   prefixes in/out {}/{}",
+                        "  AS {as_text}   up {uptime}   they teach us {} / we offer {}",
                         p.pfx_rcd, p.pfx_snt
                     ),
                     Style::default().fg(MUTED),
@@ -1483,7 +1483,7 @@ fn vrf_detail_popup(
 
     if !sorted.is_empty() {
         lines.push(Line::styled(
-            "a: advertised / r: received prefixes of the selected peer",
+            "a: routes we send / r: routes they send (selected peer)",
             Style::default().fg(MUTED),
         ));
     }
@@ -1512,6 +1512,18 @@ fn vrf_detail_popup(
     // when there's nothing to select.
     let follow = (!sorted.is_empty()).then_some(selected_row);
     render_popup(frame, area, &format!(" {vrf} "), lines, scroll, follow);
+}
+
+/// FRR's AFI/SAFI JSON names translated to the one word an SRE needs -
+/// "IPv4"/"IPv6" - with the raw value as fallback for anything exotic
+/// (l2vpnEvpn and friends show up verbatim rather than being
+/// mistranslated).
+fn afi_plain(afi: &str) -> &str {
+    match afi {
+        "ipv4Unicast" => "IPv4",
+        "ipv6Unicast" => "IPv6",
+        other => other,
+    }
 }
 
 /// The sort order shared by the popup render and `selected_peer`'s
@@ -1573,14 +1585,19 @@ fn routes_popup(
                     Style::default().fg(MUTED),
                 ));
             } else if adv.prefixes.is_empty() {
+                // Plain-language findings: the words name the symptom
+                // (who isn't sending what), the parens carry the
+                // technical search keyword for whoever digs deeper -
+                // the reader shouldn't need to know what a route-map
+                // is to know where to look next.
                 let (headline, explain) = match key.direction {
                     RouteDirection::Advertised => (
-                        "advertises nothing",
-                        "  session is up - a route-map/prefix-list or a\n  missing network statement is suppressing this.",
+                        "we send them nothing",
+                        "  the session is up, but no routes leave this\n  router toward the peer. Most likely a filter\n  (route-map / prefix-list) on our side, or the\n  route was never offered to BGP at all.",
                     ),
                     RouteDirection::Received => (
-                        "sent nothing",
-                        "  session is up - the peer is not sending any\n  prefixes in this address family (check its\n  export policy / whether it holds the route at all).",
+                        "they send us nothing",
+                        "  the session is up, but the peer offers us no\n  routes here. Check the peer's side - its\n  filters, or whether it even owns/announces\n  the route you expect.",
                     ),
                 };
                 lines.push(Line::from(vec![Span::raw(" "), status(headline, WARN)]));
@@ -1601,7 +1618,14 @@ fn routes_popup(
             }
         }
     }
-    let title = format!(" {}: {} ({}) ", key.direction.word(), key.peer, key.afi);
+    let title = match key.direction {
+        RouteDirection::Advertised => {
+            format!(" we send to {} ({}) ", key.peer, afi_plain(&key.afi))
+        }
+        RouteDirection::Received => {
+            format!(" they send us: {} ({}) ", key.peer, afi_plain(&key.afi))
+        }
+    };
     render_popup(frame, area, &title, lines, scroll, None);
 }
 
@@ -1741,8 +1765,8 @@ fn footer(frame: &mut Frame, area: Rect, tab: Tab, detail_open: bool, refresh_se
         ]),
         Tab::Frr if detail_open => hints.extend([
             hint_tier("\u{2191}\u{2193}", "Peer", 1),
-            hint_tier("a", "Advertised", 1),
-            hint_tier("r", "Received", 1),
+            hint_tier("a", "WeSend", 1),
+            hint_tier("r", "TheySend", 1),
             hint_tier("Esc", "Close", 0),
         ]),
         _ if detail_open => hints.extend([
@@ -2017,7 +2041,7 @@ mod tests {
         let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(text.contains("vrf-tenant1"));
         assert!(text.contains("198.51.100.10"));
-        assert!(text.contains("prefixes in/out 12/3"));
+        assert!(text.contains("they teach us 12 / we offer 3"));
     }
 
     // The regression this covers: a popup used to be hard-clipped at the
@@ -2152,7 +2176,7 @@ mod tests {
         state.toggle_detail();
         let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(
-            text.contains("a: advertised / r: received prefixes"),
+            text.contains("routes we send"),
             "the VRF popup carries both hints"
         );
         assert!(
@@ -2163,7 +2187,7 @@ mod tests {
         state.open_routes(crate::frr::RouteDirection::Advertised);
         let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(
-            text.contains("advertised: 198.51.100.10 (ipv4Unicast)"),
+            text.contains("we send to 198.51.100.10 (IPv4)"),
             "popup titled after the selected peer and its AFI"
         );
         assert!(text.contains("10.0.0.0/24"));
@@ -2182,8 +2206,8 @@ mod tests {
         // Esc steps back to the VRF popup, which still shows the peers.
         state.close_routes();
         let text = draw(&mut terminal, &snap, &log, &mut state);
-        assert!(text.contains("prefixes in/out 12/2"));
-        assert!(!text.contains("advertised: 198.51.100.10"));
+        assert!(text.contains("they teach us 12 / we offer 2"));
+        assert!(!text.contains("we send to 198.51.100.10"));
     }
 
     // `r` is the inverse view: what the peer sent *us*. An empty
@@ -2244,13 +2268,13 @@ mod tests {
         // can clip the title's AFI suffix - the peer and the direction
         // are what must be unambiguous.
         assert!(
-            text.contains("received: 25.120.26.129"),
+            text.contains("they send us: 25.120.26.129"),
             "popup titled after the peer with the received direction"
         );
         assert!(text.contains("28.38.97.224/27"));
         assert!(text.contains("4200113170"));
         assert!(
-            !text.contains("advertises nothing"),
+            !text.contains("we send them nothing"),
             "received prefixes render as a list, not the advertised-empty finding"
         );
 
@@ -2274,8 +2298,8 @@ mod tests {
             error: None,
         });
         let text = draw(&mut terminal, &empty, &log, &mut state);
-        assert!(text.contains("sent nothing"));
-        assert!(text.contains("peer is not sending"));
+        assert!(text.contains("they send us nothing"));
+        assert!(text.contains("peer offers us no"));
     }
 
     #[test]
@@ -2316,8 +2340,8 @@ mod tests {
             error: None,
         });
         let text = draw(&mut terminal, &snap, &log, &mut state);
-        assert!(text.contains("advertises nothing"));
-        assert!(text.contains("route-map/prefix-list"));
+        assert!(text.contains("we send them nothing"));
+        assert!(text.contains("route was never offered"));
 
         // A failed query renders the failure, never as an empty success.
         let mut broken = snap.clone();
