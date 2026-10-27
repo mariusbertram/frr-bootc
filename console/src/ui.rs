@@ -19,7 +19,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::events::EventLog;
-use crate::frr::{BgpPeerDetail, PeerRoutes, RouteDirection};
+use crate::frr::{BgpPeerDetail, PeerQueryKey, PeerRoutes, RouteDirection};
 use crate::health;
 use crate::net::{fmt_rate, InterfaceDetail, Traffic};
 use crate::snapshot::{BootcStatus, Snapshot};
@@ -249,10 +249,7 @@ impl AppState {
     /// gather thread's on-demand query. Uses the same sort orders the
     /// render pass uses (sorted_vrfs / sorted_peer_list), so what gets
     /// queried is exactly what's highlighted on screen.
-    pub fn selected_peer(
-        &self,
-        snap: &Snapshot,
-    ) -> Option<(RouteDirection, String, String, String)> {
+    pub fn selected_peer(&self, snap: &Snapshot) -> Option<PeerQueryKey> {
         if !self.detail_open || !self.routes_open || self.tab != Tab::Frr {
             return None;
         }
@@ -265,12 +262,12 @@ impl AppState {
         }
         let selected = self.peer_selected.min(sorted.len() - 1);
         let peer = &sorted[selected];
-        Some((
-            self.routes_direction,
-            vrf.to_string(),
-            peer.peer.clone(),
-            peer.afi.clone(),
-        ))
+        Some(PeerQueryKey {
+            direction: self.routes_direction,
+            vrf: vrf.to_string(),
+            peer: peer.peer.clone(),
+            afi: peer.afi.clone(),
+        })
     }
 
     /// Popup scrolling - `u16::MAX` is the "jump to the very bottom"
@@ -1409,14 +1406,11 @@ fn frr_detail(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &mut AppSta
                 state.peer_selected.min(peers.len().saturating_sub(1)),
             );
             if state.routes_open() {
-                if let Some((direction, vrf, peer, afi)) = state.selected_peer(snap) {
+                if let Some(key) = state.selected_peer(snap) {
                     routes_popup(
                         frame,
                         area,
-                        direction,
-                        &vrf,
-                        &peer,
-                        &afi,
+                        &key,
                         snap.selected_peer_routes.as_ref(),
                         &mut state.detail_scroll,
                     );
@@ -1553,10 +1547,7 @@ fn sorted_peer_list(peers: &[BgpPeerDetail]) -> Vec<&BgpPeerDetail> {
 fn routes_popup(
     frame: &mut Frame,
     area: Rect,
-    direction: RouteDirection,
-    vrf: &str,
-    peer: &str,
-    afi: &str,
+    key: &PeerQueryKey,
     routes: Option<&PeerRoutes>,
     scroll: &mut u16,
 ) {
@@ -1565,8 +1556,7 @@ fn routes_popup(
     // arrives over the Selection mutex, the answer over the next tick) -
     // data that isn't about the peer/direction in the title renders as
     // "collecting", never as an answer about a different peering.
-    let routes = routes
-        .filter(|r| r.direction == direction && r.vrf == vrf && r.peer == peer && r.afi == afi);
+    let routes = routes.filter(|r| key.matches(r));
     match routes {
         None => lines.push(Line::styled(
             " (collecting - ready on the next refresh tick)",
@@ -1583,7 +1573,7 @@ fn routes_popup(
                     Style::default().fg(MUTED),
                 ));
             } else if adv.prefixes.is_empty() {
-                let (headline, explain) = match direction {
+                let (headline, explain) = match key.direction {
                     RouteDirection::Advertised => (
                         "advertises nothing",
                         "  session is up - a route-map/prefix-list or a\n  missing network statement is suppressing this.",
@@ -1611,7 +1601,7 @@ fn routes_popup(
             }
         }
     }
-    let title = format!(" {}: {peer} ({afi}) ", direction.word());
+    let title = format!(" {}: {} ({}) ", key.direction.word(), key.peer, key.afi);
     render_popup(frame, area, &title, lines, scroll, None);
 }
 
@@ -2407,12 +2397,12 @@ mod tests {
         // render and query key is the point, whichever peer that is.
         assert_eq!(
             state.selected_peer(&snap),
-            Some((
-                crate::frr::RouteDirection::Advertised,
-                "vrf-tenant1".to_string(),
-                "198.51.100.10".to_string(),
-                "ipv4Unicast".to_string()
-            )),
+            Some(crate::frr::PeerQueryKey {
+                direction: crate::frr::RouteDirection::Advertised,
+                vrf: "vrf-tenant1".to_string(),
+                peer: "198.51.100.10".to_string(),
+                afi: "ipv4Unicast".to_string()
+            }),
             "the highlighted row and the queried peer must agree"
         );
     }

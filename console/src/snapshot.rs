@@ -7,7 +7,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use crate::frr::{self, FrrStatus, PeerRoutes, RouteDirection};
+use crate::frr::{self, FrrStatus, PeerQueryKey, PeerRoutes};
 use crate::net::{Interface, InterfaceDetail, ThroughputSampler};
 use crate::system::{self, DiskInfo, MemInfo};
 use crate::systemd::{self, SyncHealth, SyncKind};
@@ -118,12 +118,12 @@ const SYNC_UNITS: &[(&str, &str, SyncKind)] = &[
 pub struct Selection {
     pub interface: Option<String>,
     pub sync_service: Option<String>,
-    /// (direction, vrf, peer, afi) of the peer whose routes popup is
-    /// open - the key the gathered `selected_peer_routes` data must
-    /// match, carried through the snapshot boundary so the UI can tell
-    /// "this popup's data" from "the previous popup's data that hasn't
-    /// been replaced yet".
-    pub routes: Option<(RouteDirection, String, String, String)>,
+    /// The identity of the peer whose routes popup is open - the key
+    /// the gathered `selected_peer_routes` data must match, carried
+    /// through the snapshot boundary so the UI can tell "this popup's
+    /// data" from "the previous popup's data that hasn't been replaced
+    /// yet".
+    pub routes: Option<PeerQueryKey>,
 }
 
 /// `selection`: whatever popups are currently open (see `Selection`) -
@@ -147,7 +147,7 @@ pub fn gather(
     let selected_peer_routes = selection
         .routes
         .as_ref()
-        .map(|(dir, vrf, peer, afi)| frr::peer_prefixes(*dir, vrf, peer, afi));
+        .map(|key| frr::peer_prefixes(key.direction, &key.vrf, &key.peer, &key.afi));
 
     Snapshot {
         hostname: system::hostname(),

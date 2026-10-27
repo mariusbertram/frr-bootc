@@ -115,6 +115,27 @@ impl RouteDirection {
     }
 }
 
+/// Which peer's which prefix table a query/popup is about - the full
+/// identity a gathered `PeerRoutes` answer must match, so a stale answer
+/// (one selection behind, arriving over a different tick) can never
+/// render as an answer about a different peering/direction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PeerQueryKey {
+    pub direction: RouteDirection,
+    pub vrf: String,
+    pub peer: String,
+    pub afi: String,
+}
+
+impl PeerQueryKey {
+    pub fn matches(&self, routes: &PeerRoutes) -> bool {
+        routes.direction == self.direction
+            && routes.vrf == self.vrf
+            && routes.peer == self.peer
+            && routes.afi == self.afi
+    }
+}
+
 /// One prefix in a peer's Adj-RIB-In/Out. `pfxRcd`/`pfxSnt` in the BGP
 /// summary are only counts; this is the list behind them, which is what
 /// answering "warum sieht der Upstream die BPATG-Präfixe nicht" actually
