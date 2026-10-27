@@ -50,6 +50,26 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --locked
 
+      # Renders the TUI as SVG files (see console/src/screenshots.rs) so
+      # the dashboard's layout is reviewable without a VM - one file per
+      # scene (Overview, FRR popup, advertised-prefixes popup, Events,
+      # plus both at the 80x24 serial-console floor). Uploaded as an
+      # artifact on every run, PRs included: layout regressions show up
+      # in review instead of on a console at 2am.
+      - name: Render TUI screenshots
+        run: cargo run --release --locked -- --screenshots screenshots
+
+      # Path is workspace-root-relative even though the steps above ran
+      # with working-directory: console - upload-artifact's path is
+      # always resolved from the workspace root.
+      - name: Upload TUI screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-screenshots
+          path: console/screenshots/*.svg
+          retention-days: 14
+          if-no-files-found: error
+
   # frr-vty is a path dependency of both config-sync and console (see its
   # own Cargo.toml comments) - checked out out here.
   frr-vty-check:

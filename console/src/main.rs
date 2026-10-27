@@ -47,6 +47,7 @@ mod events;
 mod frr;
 mod health;
 mod net;
+mod screenshots;
 mod snapshot;
 mod system;
 mod systemd;
@@ -91,11 +92,16 @@ struct Config {
     json: bool,
     refresh: Duration,
     refresh_secs: u64,
+    /// `--screenshots <dir>`: render the TUI as SVG files into <dir>
+    /// and exit - a build-pipeline artifact mode (see screenshots.rs),
+    /// not something anyone runs interactively.
+    screenshots: Option<std::path::PathBuf>,
 }
 
 fn parse_config() -> Config {
     let mut json = false;
     let mut refresh_secs = None;
+    let mut screenshots = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -103,9 +109,16 @@ fn parse_config() -> Config {
             "--refresh" => {
                 refresh_secs = args.next().and_then(|v| v.parse().ok());
             }
+            "--screenshots" => {
+                screenshots = args.next().map(std::path::PathBuf::from);
+                if screenshots.is_none() {
+                    eprintln!("--screenshots requires a directory argument");
+                    std::process::exit(64);
+                }
+            }
             other => {
                 eprintln!(
-                    "unknown argument: {other} (usage: frr-console [--json] [--refresh <secs>])"
+                    "unknown argument: {other} (usage: frr-console [--json] [--refresh <secs>] [--screenshots <dir>])"
                 );
                 std::process::exit(64);
             }
@@ -123,11 +136,18 @@ fn parse_config() -> Config {
         json,
         refresh: Duration::from_secs(refresh_secs),
         refresh_secs,
+        screenshots,
     }
 }
 
 fn main() {
     let config = parse_config();
+
+    if let Some(dir) = &config.screenshots {
+        let written = screenshots::render_all(dir);
+        println!("wrote {written} screenshot(s) to {}", dir.display());
+        return;
+    }
 
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         run_once(&config);
@@ -284,6 +304,28 @@ enum KeyResult {
 }
 
 fn handle_key(code: KeyCode, state: &mut AppState, terminal: &mut Term) -> KeyResult {
+    // While `/`-filter input is active, key presses build the filter
+    // string - navigation must not move underneath the typing hand.
+    // Enter keeps the filter, Esc clears it (then, in popups, the next
+    // Esc steps back out as usual - clearing what you typed before
+    // leaving is the less destructive reading of "I'm done here").
+    if state.filter_input() {
+        match code {
+            KeyCode::Enter => state.end_filter_input(),
+            KeyCode::Esc => {
+                state.end_filter_input();
+                // Esc during input means "discard" - clear, not keep.
+                while state.filter() != "" {
+                    state.pop_filter_char();
+                }
+            }
+            KeyCode::Backspace => state.pop_filter_char(),
+            KeyCode::Char(c) => state.push_filter_char(c),
+            _ => {}
+        }
+        return KeyResult::Handled;
+    }
+
     // While a detail popup is open it owns the scroll keys - moving the
     // underlying selection instead would silently swap the popup to a
     // different item (its content is looked up from the selection), the
@@ -356,6 +398,13 @@ fn handle_key(code: KeyCode, state: &mut AppState, terminal: &mut Term) -> KeyRe
 
     match code {
         KeyCode::Char('b') | KeyCode::Char('B') => return login(terminal),
+        // `/` filters whichever listing is on screen - the FRR tab's
+        // VRF list (30+ tenants) or, inside the popups, the prefix
+        // list (per-/32 worker routes make those long). Works with the
+        // VRF popup open or closed; the routes popups inherit it.
+        KeyCode::Char('/') if state.tab == Tab::Frr => {
+            state.start_filter_input();
+        }
         // Number keys jump straight to a tab (btop's own way
         // of switching its boxes) - Tab/Shift+Tab and Left/
         // Right cycle, for anyone who'd rather not look down
@@ -659,13 +708,16 @@ fn print_plain(snap: &Snapshot, verdict: &health::Verdict, log: &EventLog) {
         // here too, prefixed with the peer it's about, and a query
         // failure prints as one instead of silently nothing.
         if let Some(routes) = &snap.selected_peer_routes {
-            println!(
-                "  {} to/from {} ({}, {}):",
-                routes.direction.word(),
-                routes.peer,
-                routes.afi,
-                routes.vrf
-            );
+            let what = match routes.direction {
+                RouteDirection::Advertised => "we send to",
+                RouteDirection::Received => "they send us (from)",
+            };
+            let afi = match routes.afi.as_str() {
+                "ipv4Unicast" => "IPv4",
+                "ipv6Unicast" => "IPv6",
+                other => other,
+            };
+            println!("  {what} {} ({afi}, {}):", routes.peer, routes.vrf);
             if let Some(error) = &routes.error {
                 println!("    query failed: {error}");
             } else if routes.prefixes.is_empty() {
