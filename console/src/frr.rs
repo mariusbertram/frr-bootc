@@ -95,6 +95,290 @@ pub struct BfdPeerDetail {
     pub uptime: Option<String>,
 }
 
+/// Which direction of a peer's prefix tables a query/popups is about.
+/// `Advertised` is the Adj-RIB-Out (what this router sends the peer),
+/// `Received` the Adj-RIB-In (what the peer sends this router) - the
+/// pair that separates "we suppress it" from "it never arrived".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Default)]
+pub enum RouteDirection {
+    #[default]
+    Advertised,
+    Received,
+}
+
+impl RouteDirection {
+    pub fn word(self) -> &'static str {
+        match self {
+            RouteDirection::Advertised => "advertised",
+            RouteDirection::Received => "received",
+        }
+    }
+}
+
+/// Which peer's which prefix table a query/popup is about - the full
+/// identity a gathered `PeerRoutes` answer must match, so a stale answer
+/// (one selection behind, arriving over a different tick) can never
+/// render as an answer about a different peering/direction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PeerQueryKey {
+    pub direction: RouteDirection,
+    pub vrf: String,
+    pub peer: String,
+    pub afi: String,
+}
+
+impl PeerQueryKey {
+    pub fn matches(&self, routes: &PeerRoutes) -> bool {
+        routes.direction == self.direction
+            && routes.vrf == self.vrf
+            && routes.peer == self.peer
+            && routes.afi == self.afi
+    }
+}
+
+/// One prefix in a peer's Adj-RIB-In/Out. `pfxRcd`/`pfxSnt` in the BGP
+/// summary are only counts; this is the list behind them, which is what
+/// answering "warum sieht der Upstream die BPATG-Präfixe nicht" actually
+/// needs (an empty Adj-RIB-Out with an established session points at a
+/// route-map/prefix-list suppressing the export; an empty Adj-RIB-In
+/// points at the peer's side - it never sent the route in the first
+/// place, e.g. a MetalLB pool with no service holding the prefix).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BgpPeerPrefix {
+    pub prefix: String,
+    /// AS path as FRR prints it (`aspath.string`), e.g. "65001 65100" -
+    /// an empty path (locally originated) is `None`.
+    pub aspath: Option<String>,
+    /// Origin attribute (`IGP`/`EGP`/`incomplete").
+    pub origin: Option<String>,
+    /// Whether this path is the best one for the prefix (FRR only
+    /// advertises best paths, so this is expected to be true for every
+    /// entry here - carried through anyway so a future filter change
+    /// in FRR becomes visible rather than silently re-normalized).
+    pub best: bool,
+}
+
+/// The answer to one advertised-/received-routes query, gathered on
+/// demand for the single peer being looked at (see `Selection::routes`
+/// and `snapshot::gather` - never for every peer on every tick, for the
+/// same 150-tenant round-trip-budget reasoning as `gather_vrf_routes`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerRoutes {
+    pub direction: RouteDirection,
+    pub vrf: String,
+    pub peer: String,
+    pub afi: String,
+    pub prefixes: Vec<BgpPeerPrefix>,
+    /// Transport/parse failure for this query, if any - "no routes"
+    /// (empty list, no error) and "couldn't ask" are different
+    /// findings, same distinction `FrrStatus::query_errors` makes for
+    /// the periodic queries.
+    pub error: Option<String>,
+}
+
+/// The AFI/SAFI names `show bgp vrf all summary json` reports (the JSON
+/// spelling, e.g. `ipv4Unicast`) translated into the two-token vty
+/// command form `show bgp <afi> neighbors ...` expects. A fixed mapping
+/// rather than string surgery: anything unrecognized returns `None`
+/// and the caller surfaces it as a query error instead of sending a
+/// malformed command to bgpd.
+fn afi_to_cli(afi: &str) -> Option<&'static str> {
+    match afi {
+        "ipv4Unicast" => Some("ipv4 unicast"),
+        "ipv6Unicast" => Some("ipv6 unicast"),
+        "ipv4LabeledUnicast" => Some("ipv4 labeled-unicast"),
+        "ipv6LabeledUnicast" => Some("ipv6 labeled-unicast"),
+        "l2vpnEvpn" => Some("l2vpn evpn"),
+        "ipv4Vpn" => Some("ipv4 vpn"),
+        "ipv6Vpn" => Some("ipv6 vpn"),
+        "ipv4Flowspec" => Some("ipv4 flowspec"),
+        "ipv6Flowspec" => Some("ipv6 flowspec"),
+        _ => None,
+    }
+}
+
+/// Same reasoning as `is_safe_vrf_name`, for the neighbor address that
+/// gets interpolated into `show bgp ... neighbors <peer>
+/// advertised-routes json` - IPv6 addresses need `:` in their charset.
+fn is_safe_peer_addr(peer: &str) -> bool {
+    !peer.is_empty()
+        && peer.len() <= 45
+        && peer
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.'))
+}
+
+/// Asks bgpd for one peer's Adj-RIB-Out or Adj-RIB-In (`show bgp
+/// [vrf <vrf>] <afi> neighbors <peer> advertised-routes json` or the
+/// `received-routes` form) - the per-peer, per-prefix breakdown behind
+/// the summary's `pfxSnt`/`pfxRcd` counts. The default VRF uses the
+/// command form without a `vrf` clause (the form every FRR version this
+/// image runs accepts); named VRFs use `vrf <name>`. Failures are
+/// carried in `error` rather than treated as "nothing": an established
+/// session with an empty result list is itself the finding (for
+/// advertised: a route-map/prefix-list is suppressing the export; for
+/// received: the peer never sent the route), and it must not be
+/// conflated with a query that never got answered.
+pub fn peer_prefixes(direction: RouteDirection, vrf: &str, peer: &str, afi: &str) -> PeerRoutes {
+    let mut result = PeerRoutes {
+        direction,
+        vrf: vrf.to_string(),
+        peer: peer.to_string(),
+        afi: afi.to_string(),
+        prefixes: Vec::new(),
+        error: None,
+    };
+    let what = direction.word();
+    let Some(cli_afi) = afi_to_cli(afi) else {
+        result.error = Some(format!("{what}-routes: unsupported AFI \"{afi}\""));
+        return result;
+    };
+    if !is_safe_vrf_name(vrf) {
+        result.error = Some(format!(
+            "{what}-routes: skipping VRF with unexpected name ({vrf})"
+        ));
+        return result;
+    }
+    if !is_safe_peer_addr(peer) {
+        result.error = Some(format!(
+            "{what}-routes: skipping peer with unexpected address ({peer})"
+        ));
+        return result;
+    }
+
+    let cmd = if vrf == "default" {
+        format!("show bgp {cli_afi} neighbors {peer} {what}-routes json")
+    } else {
+        format!("show bgp vrf {vrf} {cli_afi} neighbors {peer} {what}-routes json")
+    };
+    let query = query(Path::new(BGPD_SOCKET), &cmd);
+    let (prefixes, parse_error) = parse_peer_routes(&query.output);
+    result.prefixes = prefixes;
+    result.error = query.error.or(parse_error);
+    result
+}
+
+/// Parses the advertised-/received-routes JSON into a prefix-sorted
+/// list.
+/// Expected shape is `{"routes": {"<prefix>": {"paths": [...]}}}`
+/// (plus whatever top-level metadata this FRR version adds, ignored);
+/// a bare routes object without the `routes` wrapper is tolerated the
+/// same way `parse_bfd_peers` tolerates field-spelling drift. Empty is
+/// a valid answer - `"routes": {}` means the peer is genuinely being
+/// advertised nothing, which is exactly the situation this view exists
+/// to make visible, so it parses to `(empty, no error)` rather than to
+/// a schema-drift note. Anything non-JSON (a `% ...` vty error line for
+/// a peer with no session in this AFI, an unknown-command rejection on
+/// an older FRR build) surfaces as an error carrying bgpd's own first
+/// line - that text is the diagnosis.
+type PeerRoutesParsed = (Vec<BgpPeerPrefix>, Option<String>);
+
+fn parse_peer_routes(json: &str) -> PeerRoutesParsed {
+    if json.trim().is_empty() {
+        return (Vec::new(), None);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return (
+            Vec::new(),
+            Some(format!("peer-routes: {}", first_line(json))),
+        );
+    };
+    let routes = match value.get("routes") {
+        Some(serde_json::Value::Null) => return (Vec::new(), None),
+        Some(v) if v.is_object() => v.as_object().unwrap(),
+        Some(_) => {
+            return (
+                Vec::new(),
+                Some("peer-routes: routes is not an object - schema drift?".to_string()),
+            )
+        }
+        // No "routes" wrapper: accept the object itself if it looks like
+        // a prefix-keyed map of path entries; anything else is drift.
+        None => match value
+            .as_object()
+            .filter(|m| m.values().any(|e| e.get("paths").is_some()))
+        {
+            Some(map) => map,
+            None => {
+                return (
+                    Vec::new(),
+                    Some("peer-routes: response has no routes object - schema drift?".to_string()),
+                )
+            }
+        },
+    };
+
+    let mut out = Vec::new();
+    for (prefix, entry) in routes {
+        let path = entry
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .or_else(|| entry.get("path"));
+        let aspath = path
+            .and_then(|p| p.get("aspath"))
+            .and_then(|a| a.get("string"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let origin = path
+            .and_then(|p| p.get("origin"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let best = path
+            .and_then(|p| p.get("bestpath"))
+            .and_then(|b| b.get("overall"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        out.push(BgpPeerPrefix {
+            prefix: prefix.clone(),
+            aspath,
+            origin,
+            best,
+        });
+    }
+    // Numeric-aware order ("10.32.0.0" after "10.128.0.0", not between
+    // "10.1" and "10.2" the way a plain string sort would put it), so
+    // scanning for one prefix in a long list stays intuitive.
+    out.sort_by(|a, b| cmp_prefix(&a.prefix, &b.prefix));
+    (out, None)
+}
+
+/// Compares prefix strings by their numeric runs rather than
+/// byte-by-byte - dotted quads and IPv6 hextets compare as numbers,
+/// separators as text. A parse failure inside a run can't happen (only
+/// ascii digits accumulate), the `unwrap_or` keeps it total anyway.
+fn cmp_prefix(a: &str, b: &str) -> std::cmp::Ordering {
+    let key = |s: &str| -> Vec<(u64, String)> {
+        let mut parts = Vec::new();
+        let mut num = String::new();
+        let mut other = String::new();
+        for c in s.chars() {
+            if c.is_ascii_digit() {
+                if !other.is_empty() {
+                    parts.push((u64::MAX, other.clone()));
+                    other.clear();
+                }
+                num.push(c);
+            } else {
+                if !num.is_empty() {
+                    parts.push((num.parse().unwrap_or(u64::MAX), String::new()));
+                    num.clear();
+                }
+                other.push(c);
+            }
+        }
+        if !num.is_empty() {
+            parts.push((num.parse().unwrap_or(u64::MAX), String::new()));
+        }
+        if !other.is_empty() {
+            parts.push((u64::MAX, other));
+        }
+        parts
+    };
+    key(a).cmp(&key(b))
+}
+
 /// `frr.service`'s own active/inactive state lives on `Snapshot` directly
 /// (it's read once up front, before deciding whether it's even worth
 /// querying any daemon socket) - this only covers what's queried below,
@@ -791,6 +1075,126 @@ mod tests {
             parse_vrf_all_route_summary(r#"{"routesTotal": 30, "routesTotalFib": 28}"#).is_empty()
         );
         assert!(parse_vrf_all_route_summary("% Unknown command").is_empty());
+    }
+
+    #[test]
+    fn peer_routes_parse_paths_aspath_origin_and_bestpath() {
+        let json = r#"{
+            "neighborAddress": "198.51.100.10",
+            "routes": {
+                "10.0.0.0/24": {"destinations": 1, "paths": [
+                    {"aspath": {"string": "65001"}, "origin": "IGP",
+                     "bestpath": {"overall": true}}
+                ]},
+                "10.128.0.0/16": {"paths": [
+                    {"aspath": {"string": "65001 65100"}, "origin": "IGP"}
+                ]}
+            }
+        }"#;
+        let (prefixes, error) = parse_peer_routes(json);
+        assert!(error.is_none());
+        assert_eq!(prefixes.len(), 2);
+        // Numeric run comparison: 10.128 sorts after 10.0, not before.
+        assert_eq!(prefixes[0].prefix, "10.0.0.0/24");
+        assert_eq!(prefixes[1].prefix, "10.128.0.0/16");
+        assert!(prefixes[0].best);
+        assert_eq!(prefixes[0].aspath.as_deref(), Some("65001"));
+        assert_eq!(prefixes[1].aspath.as_deref(), Some("65001 65100"));
+        assert!(!prefixes[1].best);
+        assert_eq!(prefixes[0].origin.as_deref(), Some("IGP"));
+    }
+
+    #[test]
+    fn peer_routes_empty_is_a_valid_answer() {
+        // The case this whole view exists for: session up, nothing being
+        // advertised - an empty Adj-RIB-Out, not an error.
+        let (prefixes, error) = parse_peer_routes(r#"{"routes": {}}"#);
+        assert!(prefixes.is_empty() && error.is_none());
+
+        let (prefixes, error) = parse_peer_routes(r#"{"routes": null}"#);
+        assert!(prefixes.is_empty() && error.is_none());
+
+        let (prefixes, error) = parse_peer_routes("");
+        assert!(prefixes.is_empty() && error.is_none());
+    }
+
+    #[test]
+    fn peer_routes_vty_errors_surface_as_errors() {
+        // A peer with no session in this AFI (or an older FRR without
+        // the command) answers with a `% ...` line, not JSON - bgpd's
+        // own words become the diagnosis.
+        let (prefixes, error) =
+            parse_peer_routes("% Neighbor 198.51.100.10 has no session in this AFI\n");
+        assert!(prefixes.is_empty());
+        assert!(error.is_some());
+        assert!(error.unwrap().contains("no session"));
+    }
+
+    #[test]
+    fn peer_routes_schema_drift_is_reported() {
+        let (prefixes, error) = parse_peer_routes(r#"{"unexpected": 1}"#);
+        assert!(prefixes.is_empty());
+        assert_eq!(
+            error.as_deref(),
+            Some("peer-routes: response has no routes object - schema drift?")
+        );
+
+        let (prefixes, error) = parse_peer_routes(r#"{"routes": [1, 2]}"#);
+        assert!(prefixes.is_empty());
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn peer_routes_tolerate_a_bare_routes_object() {
+        let json = r#"{"10.0.0.0/24": {"paths": [{"aspath": {"string": "65001"}}]}}"#;
+        let (prefixes, error) = parse_peer_routes(json);
+        assert!(error.is_none());
+        assert_eq!(prefixes.len(), 1);
+        assert_eq!(prefixes[0].prefix, "10.0.0.0/24");
+        assert_eq!(prefixes[0].aspath.as_deref(), Some("65001"));
+        // No origin/bestpath fields at all: degrades to None/false.
+        assert_eq!(prefixes[0].origin, None);
+        assert!(!prefixes[0].best);
+    }
+
+    #[test]
+    fn prefix_sorting_is_numeric_not_lexicographic() {
+        let mut v = vec![
+            "10.32.0.0/16",
+            "10.128.0.0/16",
+            "10.0.0.0/24",
+            "192.168.0.0/16",
+        ];
+        v.sort_by(|a, b| cmp_prefix(a, b));
+        assert_eq!(
+            v,
+            vec![
+                "10.0.0.0/24",
+                "10.32.0.0/16",
+                "10.128.0.0/16",
+                "192.168.0.0/16"
+            ]
+        );
+    }
+
+    #[test]
+    fn afi_names_map_to_vty_command_tokens() {
+        assert_eq!(afi_to_cli("ipv4Unicast"), Some("ipv4 unicast"));
+        assert_eq!(afi_to_cli("ipv6Unicast"), Some("ipv6 unicast"));
+        assert_eq!(afi_to_cli("l2vpnEvpn"), Some("l2vpn evpn"));
+        assert_eq!(afi_to_cli("nonsense"), None);
+    }
+
+    #[test]
+    fn peer_addresses_are_validated_before_interpolation_into_queries() {
+        assert!(is_safe_peer_addr("198.51.100.10"));
+        assert!(is_safe_peer_addr("2001:db8:100::1"));
+
+        assert!(!is_safe_peer_addr(""));
+        assert!(!is_safe_peer_addr(&"x".repeat(46)));
+        assert!(!is_safe_peer_addr("198.51.100.10 password x"));
+        assert!(!is_safe_peer_addr("10.0.0.1;shutdown"));
+        assert!(!is_safe_peer_addr("10.0.0.1\nshutdown"));
     }
 
     #[test]

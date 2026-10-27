@@ -7,7 +7,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use crate::frr::{self, FrrStatus};
+use crate::frr::{self, FrrStatus, PeerQueryKey, PeerRoutes};
 use crate::net::{Interface, InterfaceDetail, ThroughputSampler};
 use crate::system::{self, DiskInfo, MemInfo};
 use crate::systemd::{self, SyncHealth, SyncKind};
@@ -76,6 +76,11 @@ pub struct Snapshot {
     /// failed) - gathered on demand for this one unit only, same shape
     /// as `selected_interface_detail`.
     pub selected_sync_journal: Option<String>,
+    /// The advertised- or received-routes (Adj-RIB-Out/-In) of the
+    /// single peer whose routes popup is open (`None` when none is
+    /// open). Gathered on demand for this one peer only, like the other
+    /// on-demand fields above - never for every peer on every tick.
+    pub selected_peer_routes: Option<PeerRoutes>,
 }
 
 /// frr-config-sync/network-config-sync are persistent daemons now (no
@@ -113,6 +118,12 @@ const SYNC_UNITS: &[(&str, &str, SyncKind)] = &[
 pub struct Selection {
     pub interface: Option<String>,
     pub sync_service: Option<String>,
+    /// The identity of the peer whose routes popup is open - the key
+    /// the gathered `selected_peer_routes` data must match, carried
+    /// through the snapshot boundary so the UI can tell "this popup's
+    /// data" from "the previous popup's data that hasn't been replaced
+    /// yet".
+    pub routes: Option<PeerQueryKey>,
 }
 
 /// `selection`: whatever popups are currently open (see `Selection`) -
@@ -133,6 +144,10 @@ pub fn gather(
         .sync_service
         .as_deref()
         .and_then(|service| systemd::recent_journal(service, 40));
+    let selected_peer_routes = selection
+        .routes
+        .as_ref()
+        .map(|key| frr::peer_prefixes(key.direction, &key.vrf, &key.peer, &key.afi));
 
     Snapshot {
         hostname: system::hostname(),
@@ -161,6 +176,7 @@ pub fn gather(
         bootc,
         traffic: net.traffic(),
         selected_sync_journal,
+        selected_peer_routes,
     }
 }
 
