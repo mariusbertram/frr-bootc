@@ -304,6 +304,28 @@ enum KeyResult {
 }
 
 fn handle_key(code: KeyCode, state: &mut AppState, terminal: &mut Term) -> KeyResult {
+    // While `/`-filter input is active, key presses build the filter
+    // string - navigation must not move underneath the typing hand.
+    // Enter keeps the filter, Esc clears it (then, in popups, the next
+    // Esc steps back out as usual - clearing what you typed before
+    // leaving is the less destructive reading of "I'm done here").
+    if state.filter_input() {
+        match code {
+            KeyCode::Enter => state.end_filter_input(),
+            KeyCode::Esc => {
+                state.end_filter_input();
+                // Esc during input means "discard" - clear, not keep.
+                while state.filter() != "" {
+                    state.pop_filter_char();
+                }
+            }
+            KeyCode::Backspace => state.pop_filter_char(),
+            KeyCode::Char(c) => state.push_filter_char(c),
+            _ => {}
+        }
+        return KeyResult::Handled;
+    }
+
     // While a detail popup is open it owns the scroll keys - moving the
     // underlying selection instead would silently swap the popup to a
     // different item (its content is looked up from the selection), the
@@ -376,6 +398,13 @@ fn handle_key(code: KeyCode, state: &mut AppState, terminal: &mut Term) -> KeyRe
 
     match code {
         KeyCode::Char('b') | KeyCode::Char('B') => return login(terminal),
+        // `/` filters whichever listing is on screen - the FRR tab's
+        // VRF list (30+ tenants) or, inside the popups, the prefix
+        // list (per-/32 worker routes make those long). Works with the
+        // VRF popup open or closed; the routes popups inherit it.
+        KeyCode::Char('/') if state.tab == Tab::Frr => {
+            state.start_filter_input();
+        }
         // Number keys jump straight to a tab (btop's own way
         // of switching its boxes) - Tab/Shift+Tab and Left/
         // Right cycle, for anyone who'd rather not look down

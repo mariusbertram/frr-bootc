@@ -341,6 +341,50 @@ fn scenes() -> Vec<Scene> {
         log: EventLog::new(100, None),
     };
 
+    // The scaling reality: 30+ VRFs and per-/32 worker routes. A demo
+    // snapshot with 37 tenants (one downed, one flapping-BFD) and a
+    // 200-entry /32 received list, captured both unfiltered and with
+    // `/` filters active - the views an SRE at that scale actually
+    // works in.
+    let big = big_snapshot();
+    let mut big_state = AppState::default();
+    big_state.set_tab(Tab::Frr);
+    let big_list = Scene {
+        name: "07-frr-37-vrfs",
+        width: 100,
+        height: 34,
+        snap: big.clone(),
+        state: big_state,
+        log: EventLog::new(100, None),
+    };
+
+    let mut filtered_state = AppState::default();
+    filtered_state.set_tab(Tab::Frr);
+    for c in "bpatg".chars() {
+        filtered_state.push_filter_char(c);
+    }
+    let big_filtered = Scene {
+        name: "08-frr-filtered",
+        width: 100,
+        height: 34,
+        snap: big.clone(),
+        state: filtered_state,
+        log: EventLog::new(100, None),
+    };
+
+    let mut routes_state = AppState::default();
+    routes_state.set_tab(Tab::Frr);
+    routes_state.toggle_detail();
+    routes_state.open_routes(RouteDirection::Received);
+    let big_routes = Scene {
+        name: "09-received-200-slashes32",
+        width: 100,
+        height: 34,
+        snap: big,
+        state: routes_state,
+        log: EventLog::new(100, None),
+    };
+
     vec![
         overview,
         frr_popup,
@@ -348,7 +392,76 @@ fn scenes() -> Vec<Scene> {
         events,
         narrow_overview,
         narrow_frr,
+        big_list,
+        big_filtered,
+        big_routes,
     ]
+}
+
+/// The 30+-tenant scale: 37 VRFs, per-/32 routes from the worker side -
+/// shaped so the scenes exercise what actually breaks at that size (the
+/// VRF list's usefulness without a filter, the popup's scrollbar and
+/// count line, the filter's match count in the title).
+fn big_snapshot() -> Snapshot {
+    let mut snap = demo_snapshot();
+    snap.frr.bgp_vrf_peers = (0..37)
+        .map(|i| {
+            let name = if i == 18 {
+                "vrf-bpatg".to_string()
+            } else {
+                format!("vrf-tenant{i:02}")
+            };
+            let (estab, total) = if i == 11 { (0, 2) } else { (2, 2) };
+            (name, estab, total)
+        })
+        .collect();
+    snap.frr.bgp_vrf_peer_detail.clear();
+    for (vrf, estab, total) in &snap.frr.bgp_vrf_peers {
+        snap.frr.bgp_vrf_peer_detail.insert(
+            vrf.clone(),
+            if *estab == 0 {
+                vec![BgpPeerDetail {
+                    peer: format!("28.38.{}.1", 96 + *total),
+                    afi: "ipv4Unicast".to_string(),
+                    state: "Idle".to_string(),
+                    remote_as: Some(65002),
+                    uptime: None,
+                    pfx_rcd: "N/A".to_string(),
+                    pfx_snt: "N/A".to_string(),
+                }]
+            } else {
+                vec![BgpPeerDetail {
+                    peer: format!("28.38.{}.177", 96 + *total),
+                    afi: "ipv4Unicast".to_string(),
+                    state: "Established".to_string(),
+                    remote_as: Some(65002),
+                    uptime: Some("03:22:41".to_string()),
+                    pfx_rcd: "200".to_string(),
+                    pfx_snt: "14".to_string(),
+                }]
+            },
+        );
+    }
+    // The received-routes view of the first (sorted-first) peer: the
+    // worker-side per-/32 reality, 200 entries.
+    let (first_vrf, _, _) = &snap.frr.bgp_vrf_peers[0];
+    let first_peer = &snap.frr.bgp_vrf_peer_detail[first_vrf][0];
+    snap.selected_peer_routes = Some(PeerRoutes {
+        direction: RouteDirection::Received,
+        vrf: first_vrf.clone(),
+        peer: first_peer.peer.clone(),
+        afi: first_peer.afi.clone(),
+        prefixes: (0..200)
+            .map(|i| crate::frr::BgpPeerPrefix {
+                prefix: format!("28.38.{}.{}{}/32", 97 + i / 100, i % 100 / 10, i % 10),
+                aspath: Some("4200113170".to_string()),
+                origin: Some("IGP".to_string()),
+                best: true,
+            })
+            .collect(),
+        error: None,
+    });
+    snap
 }
 
 /// Renders every scene and writes one SVG per scene into `dir`.

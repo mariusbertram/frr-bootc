@@ -101,6 +101,18 @@ pub struct AppState {
     /// Which direction the open routes popup is about - re-openable
     /// with the other key without closing it first.
     routes_direction: RouteDirection,
+    /// Incremental filter text, typed with `/` (see push_filter_char/
+    /// pop_filter_char) - applies to whichever listing the active view
+    /// shows: the FRR tab's VRF list, or the open routes popup's prefix
+    /// list. Empty means no filtering. Deliberately one shared string,
+    /// not one per view: a search session is a single train of thought,
+    // and keeping it across the VRF list and the popups inside it is the
+    /// point - "filter to 28.38, drill in, open routes" should not
+    // re-type anything.
+    filter: String,
+    /// `/` was pressed: key presses append to the filter instead of
+    /// driving navigation (Esc or Enter ends the input).
+    filter_input: bool,
 }
 
 impl AppState {
@@ -117,6 +129,45 @@ impl AppState {
     pub fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
         self.close_detail();
+        // A filter typed on one tab must not silently hide rows on the
+        // tab just switched to - the filter was a question about what
+        // was on screen, not a global preference.
+        self.filter.clear();
+        self.filter_input = false;
+    }
+
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    pub fn filter_input(&self) -> bool {
+        self.filter_input
+    }
+
+    pub fn start_filter_input(&mut self) {
+        self.filter_input = true;
+    }
+
+    /// Ends filter input keeping what was typed (Esc) - an empty
+    /// filter left over from a cleared input is indistinguishable
+    /// from no filter, which is exactly right.
+    pub fn end_filter_input(&mut self) {
+        self.filter_input = false;
+    }
+
+    pub fn push_filter_char(&mut self, c: char) {
+        self.filter.push(c);
+    }
+
+    pub fn pop_filter_char(&mut self) {
+        self.filter.pop();
+    }
+
+    /// Substring match on the active filter - case-insensitive, so
+    /// "bpatg" finds "vrf-bpatg" and "28.38" finds "28.38.97.224/27".
+    pub fn filter_matches(&self, hay: &str) -> bool {
+        let needle = self.filter.to_lowercase();
+        needle.is_empty() || hay.to_lowercase().contains(&needle)
     }
 
     /// Which list the selection keys drive on the active tab - Overview
@@ -253,7 +304,13 @@ impl AppState {
         if !self.detail_open || !self.routes_open || self.tab != Tab::Frr {
             return None;
         }
-        let vrfs = sorted_vrfs(snap);
+        // The same filtered-and-sorted list frr_detail renders - the
+        // highlighted row and the queried peer must agree even while a
+        // filter is active.
+        let vrfs: Vec<(&str, u32, u32)> = sorted_vrfs(snap)
+            .into_iter()
+            .filter(|(vrf, _, _)| self.filter_matches(vrf))
+            .collect();
         let vrf = vrfs.get(self.frr_selected)?.0;
         let peers = snap.frr.bgp_vrf_peer_detail.get(vrf)?;
         let sorted = sorted_peer_list(peers);
@@ -1262,7 +1319,35 @@ fn interface_detail_popup(
 /// (see sorted_vrfs), so the one problem tenant is the first row, not
 /// row 137 of 150.
 fn frr_detail(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &mut AppState) {
-    let block = panel("FRR / BGP (all VRFs)");
+    // Title built before the block is drawn (single render pass): VRF
+    // count plus, while a filter is active, what it is and how many rows
+    // it leaves - "(37 VRFs) [filter: bpatg, 2 shown]" answers "is my
+    // list short because of the filter or because that's all there is".
+    let matching_vrfs = snap
+        .frr
+        .bgp_vrf_peers
+        .iter()
+        .filter(|(vrf, _, _)| state.filter_matches(vrf))
+        .count();
+    let filter_note = if state.filter().is_empty() {
+        String::new()
+    } else {
+        format!(
+            " [filter: {}, {}/{} shown]",
+            state.filter(),
+            matching_vrfs,
+            snap.frr.bgp_vrf_peers.len()
+        )
+    };
+    let title = if state.filter_input() {
+        format!("FRR / BGP - filter: {}\u{2588}", state.filter())
+    } else {
+        format!(
+            "FRR / BGP ({} VRFs){filter_note}",
+            snap.frr.bgp_vrf_peers.len()
+        )
+    };
+    let block = panel(&title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1309,7 +1394,15 @@ fn frr_detail(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &mut AppSta
     }
     frame.render_widget(Paragraph::new(summary), summary_area);
 
-    let vrfs = sorted_vrfs(snap);
+    // With 30+ VRFs, finding the one tenant you came for needs a filter:
+    // `/` types a substring (see AppState::filter), matching rows stay,
+    // the selection clamps to the filtered list so it can never point
+    // at a hidden row. Problem VRFs still sort first within what's
+    // shown.
+    let vrfs: Vec<(&str, u32, u32)> = sorted_vrfs(snap)
+        .into_iter()
+        .filter(|(vrf, _, _)| state.filter_matches(vrf))
+        .collect();
     if !vrfs.is_empty() {
         state.frr_selected = state.frr_selected.min(vrfs.len() - 1);
     } else {
@@ -1319,7 +1412,11 @@ fn frr_detail(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &mut AppSta
     let rows: Vec<Row> = if !snap.frr_service_active {
         Vec::new()
     } else if vrfs.is_empty() {
-        vec![Row::new(vec![Cell::from("(no BGP peers)")])]
+        if snap.frr.bgp_vrf_peers.is_empty() {
+            vec![Row::new(vec![Cell::from("(no BGP peers)")])]
+        } else {
+            vec![Row::new(vec![Cell::from("(no match - clear filter)")])]
+        }
     } else {
         vrfs.iter()
             .enumerate()
@@ -1407,11 +1504,23 @@ fn frr_detail(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &mut AppSta
             );
             if state.routes_open() {
                 if let Some(key) = state.selected_peer(snap) {
+                    // The filter applies to the prefix list inside the
+                    // popup - same string as the VRF list's, so "type
+                    // once, drill in" works across views.
+                    let needle = state.filter().to_lowercase();
+                    let filter_fn: Option<PrefixFilter> = if needle.is_empty() {
+                        None
+                    } else {
+                        Some(Box::new(move |p: &crate::frr::BgpPeerPrefix| {
+                            p.prefix.to_lowercase().contains(&needle)
+                        }))
+                    };
                     routes_popup(
                         frame,
                         area,
                         &key,
                         snap.selected_peer_routes.as_ref(),
+                        filter_fn,
                         &mut state.detail_scroll,
                     );
                 }
@@ -1556,11 +1665,16 @@ fn sorted_peer_list(peers: &[BgpPeerDetail]) -> Vec<&BgpPeerDetail> {
 /// failure renders the failure, not an empty success. Until the gather
 /// tick that carries the data lands, a muted "collecting" line says
 /// so - an empty answer that was never asked would be a lie.
+/// A prefix-list filter handed to `routes_popup` - a boxed closure over
+/// the lowercased filter string, `None` when no filter is set.
+type PrefixFilter = Box<dyn Fn(&crate::frr::BgpPeerPrefix) -> bool>;
+
 fn routes_popup(
     frame: &mut Frame,
     area: Rect,
     key: &PeerQueryKey,
     routes: Option<&PeerRoutes>,
+    filter: Option<PrefixFilter>,
     scroll: &mut u16,
 ) {
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1569,6 +1683,9 @@ fn routes_popup(
     // data that isn't about the peer/direction in the title renders as
     // "collecting", never as an answer about a different peering.
     let routes = routes.filter(|r| key.matches(r));
+    // Long lists are the norm here (per-/32 worker advertisements), so
+    // the same `/` filter applies to the prefix list - and the title
+    // always shows how many prefixes the view holds, filtered or not.
     match routes {
         None => lines.push(Line::styled(
             " (collecting - ready on the next refresh tick)",
@@ -1605,7 +1722,18 @@ fn routes_popup(
                     lines.push(Line::styled(line.to_string(), Style::default().fg(MUTED)));
                 }
             } else {
-                for p in &adv.prefixes {
+                let shown: Vec<&crate::frr::BgpPeerPrefix> = adv
+                    .prefixes
+                    .iter()
+                    .filter(|p| filter.as_ref().is_none_or(|f| f(p)))
+                    .collect();
+                if shown.is_empty() {
+                    lines.push(Line::styled(
+                        " (no prefix matches the filter - Esc clears)",
+                        Style::default().fg(MUTED),
+                    ));
+                }
+                for p in shown {
                     let aspath = p.aspath.as_deref().unwrap_or("(locally originated)");
                     lines.push(Line::from(vec![
                         Span::styled(
@@ -1618,14 +1746,31 @@ fn routes_popup(
             }
         }
     }
+    let count = routes.map_or(0, |r| r.prefixes.len());
     let title = match key.direction {
         RouteDirection::Advertised => {
-            format!(" we send to {} ({}) ", key.peer, afi_plain(&key.afi))
+            format!(" we send: {} [{}] ", afi_plain(&key.afi), key.peer)
         }
         RouteDirection::Received => {
-            format!(" they send us: {} ({}) ", key.peer, afi_plain(&key.afi))
+            format!(" they send: {} [{}] ", afi_plain(&key.afi), key.peer)
         }
     };
+    // The count rides as the popup's first content line instead of the
+    // title - titles get clipped when content is narrow, content lines
+    // define the width, so the count can never be lost to clipping.
+    if let Some(routes) = routes {
+        if !routes.prefixes.is_empty() {
+            lines.insert(
+                0,
+                Line::styled(
+                    format!("  {} routes total", routes.prefixes.len()),
+                    Style::default().fg(MUTED),
+                ),
+            );
+            lines.insert(1, Line::from(""));
+        }
+    }
+    let _ = count;
     render_popup(frame, area, &title, lines, scroll, None);
 }
 
@@ -1777,6 +1922,12 @@ fn footer(frame: &mut Frame, area: Rect, tab: Tab, detail_open: bool, refresh_se
             hint_tier("\u{2191}\u{2193}", "Select", 1),
             hint_tier("Enter", "Journal", 1),
             hint_tier("PgUp/PgDn", "Page", 1),
+        ]),
+        Tab::Frr => hints.extend([
+            hint_tier("\u{2191}\u{2193}", "Select", 1),
+            hint_tier("PgUp/PgDn", "Page", 1),
+            hint_tier("Enter", "Detail", 0),
+            hint_tier("/", "Filter", 1),
         ]),
         _ => hints.extend([
             hint_tier("\u{2191}\u{2193}", "Select", 1),
@@ -2187,7 +2338,7 @@ mod tests {
         state.open_routes(crate::frr::RouteDirection::Advertised);
         let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(
-            text.contains("we send to 198.51.100.10 (IPv4)"),
+            text.contains("we send: IPv4 [198.51.100.10]"),
             "popup titled after the selected peer and its AFI"
         );
         assert!(text.contains("10.0.0.0/24"));
@@ -2207,7 +2358,7 @@ mod tests {
         state.close_routes();
         let text = draw(&mut terminal, &snap, &log, &mut state);
         assert!(text.contains("they teach us 12 / we offer 2"));
-        assert!(!text.contains("we send to 198.51.100.10"));
+        assert!(!text.contains("we send: IPv4 [198.51.100.10]"));
     }
 
     // `r` is the inverse view: what the peer sent *us*. An empty
@@ -2268,7 +2419,7 @@ mod tests {
         // can clip the title's AFI suffix - the peer and the direction
         // are what must be unambiguous.
         assert!(
-            text.contains("they send us: 25.120.26.129"),
+            text.contains("they send: IPv4 [25.120.26.129]"),
             "popup titled after the peer with the received direction"
         );
         assert!(text.contains("28.38.97.224/27"));
@@ -2695,6 +2846,121 @@ mod tests {
             text.contains("BFD: 1/2 up"),
             "BFD summary line with a red count"
         );
+    }
+
+    // The 30+-VRF / long-/32-list reality: `/` filters the VRF list,
+    // the title carries the match count, and the selection clamps to
+    // the filtered rows (never pointing at a hidden VRF).
+    #[test]
+    fn slash_filters_the_vrf_list_and_clamps_the_selection() {
+        let mut snap = fake_snapshot(0);
+        snap.frr_service_active = true;
+        snap.frr.bgp_vrf_peers = (0..40)
+            .map(|i| (format!("vrf-tenant{i:02}").to_string(), 2, 2))
+            .collect();
+        for vrf in &snap.frr.bgp_vrf_peers {
+            snap.frr
+                .bgp_vrf_peer_detail
+                .insert(vrf.0.clone(), Vec::new());
+        }
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            tab: Tab::Frr,
+            ..Default::default()
+        };
+        let log = EventLog::new(100, None);
+
+        // Unfiltered: all 40 counted.
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(text.contains("(40 VRFs)"));
+
+        // Type "tenant1" - matches tenant1x but not tenant2x/3x.
+        state.start_filter_input();
+        for c in "tenant1".chars() {
+            state.push_filter_char(c);
+        }
+        state.end_filter_input();
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(
+            text.contains("[filter: tenant1, 10/40 shown]"),
+            "the title must carry the filter and its match count"
+        );
+        assert!(text.contains("vrf-tenant10"));
+        assert!(!text.contains("vrf-tenant2"));
+
+        // Selection clamps into the filtered list.
+        state.select_last();
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(text.contains("vrf-tenant19"));
+
+        // A filter matching nothing says so instead of an empty table.
+        state.push_filter_char('z');
+        state.push_filter_char('z');
+        state.push_filter_char('z');
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(text.contains("no match - clear filter"));
+    }
+
+    #[test]
+    fn routes_popup_filters_prefixes_and_counts_them() {
+        let mut snap = fake_snapshot(0);
+        snap.frr_service_active = true;
+        snap.frr.bgp_vrf_peers = vec![("vrf-tenant1".to_string(), 1, 1)];
+        snap.frr.bgp_vrf_peer_detail.insert(
+            "vrf-tenant1".to_string(),
+            vec![BgpPeerDetail {
+                peer: "25.120.26.129".to_string(),
+                afi: "ipv4Unicast".to_string(),
+                state: "Established".to_string(),
+                remote_as: Some(4200113170),
+                uptime: None,
+                pfx_rcd: "300".to_string(),
+                pfx_snt: "300".to_string(),
+            }],
+        );
+        // 300 per-/32 routes, the OpenShift-worker reality.
+        snap.selected_peer_routes = Some(crate::frr::PeerRoutes {
+            direction: crate::frr::RouteDirection::Received,
+            vrf: "vrf-tenant1".to_string(),
+            peer: "25.120.26.129".to_string(),
+            afi: "ipv4Unicast".to_string(),
+            prefixes: (0..300)
+                .map(|i| crate::frr::BgpPeerPrefix {
+                    prefix: format!("28.38.{}.{}/32", 97 + i / 200, i % 200),
+                    aspath: Some("4200113170".to_string()),
+                    origin: Some("IGP".to_string()),
+                    best: true,
+                })
+                .collect(),
+            error: None,
+        });
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            tab: Tab::Frr,
+            ..Default::default()
+        };
+        let log = EventLog::new(100, None);
+        state.toggle_detail();
+        state.open_routes(crate::frr::RouteDirection::Received);
+
+        // Unfiltered title carries the total count.
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(text.contains("300 routes total"));
+
+        // Filter to one /32 - it's found and shown.
+        state.start_filter_input();
+        for c in "28.38.97.5".chars() {
+            state.push_filter_char(c);
+        }
+        state.end_filter_input();
+        let text = draw(&mut terminal, &snap, &log, &mut state);
+        assert!(
+            text.contains("28.38.97.5"),
+            "the filtered-for /32 must be visible"
+        );
+        assert!(!text.contains("28.38.97.6"));
     }
 
     #[test]
