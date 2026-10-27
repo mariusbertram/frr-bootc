@@ -47,6 +47,7 @@ mod events;
 mod frr;
 mod health;
 mod net;
+mod screenshots;
 mod snapshot;
 mod system;
 mod systemd;
@@ -91,11 +92,16 @@ struct Config {
     json: bool,
     refresh: Duration,
     refresh_secs: u64,
+    /// `--screenshots <dir>`: render the TUI as SVG files into <dir>
+    /// and exit - a build-pipeline artifact mode (see screenshots.rs),
+    /// not something anyone runs interactively.
+    screenshots: Option<std::path::PathBuf>,
 }
 
 fn parse_config() -> Config {
     let mut json = false;
     let mut refresh_secs = None;
+    let mut screenshots = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -103,9 +109,16 @@ fn parse_config() -> Config {
             "--refresh" => {
                 refresh_secs = args.next().and_then(|v| v.parse().ok());
             }
+            "--screenshots" => {
+                screenshots = args.next().map(std::path::PathBuf::from);
+                if screenshots.is_none() {
+                    eprintln!("--screenshots requires a directory argument");
+                    std::process::exit(64);
+                }
+            }
             other => {
                 eprintln!(
-                    "unknown argument: {other} (usage: frr-console [--json] [--refresh <secs>])"
+                    "unknown argument: {other} (usage: frr-console [--json] [--refresh <secs>] [--screenshots <dir>])"
                 );
                 std::process::exit(64);
             }
@@ -123,11 +136,18 @@ fn parse_config() -> Config {
         json,
         refresh: Duration::from_secs(refresh_secs),
         refresh_secs,
+        screenshots,
     }
 }
 
 fn main() {
     let config = parse_config();
+
+    if let Some(dir) = &config.screenshots {
+        let written = screenshots::render_all(dir);
+        println!("wrote {written} screenshot(s) to {}", dir.display());
+        return;
+    }
 
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         run_once(&config);
