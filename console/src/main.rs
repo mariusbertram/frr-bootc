@@ -647,18 +647,14 @@ fn print_plain(snap: &Snapshot, verdict: &health::Verdict, log: &EventLog) {
         // prints here too, prefixed with the peer it's about, and a
         // query failure prints as one instead of silently nothing.
         if let Some(adv) = &snap.selected_advertised {
-            println!(
-                "  advertised to {} ({}, {}):",
-                adv.peer, adv.afi, adv.vrf
-            );
+            println!("  advertised to {} ({}, {}):", adv.peer, adv.afi, adv.vrf);
             if let Some(error) = &adv.error {
                 println!("    query failed: {error}");
             } else if adv.prefixes.is_empty() {
                 println!("    (nothing advertised)");
             } else {
                 for p in &adv.prefixes {
-                    let aspath =
-                        p.aspath.as_deref().unwrap_or("(locally originated)");
+                    let aspath = p.aspath.as_deref().unwrap_or("(locally originated)");
                     println!("    {:<20} via {aspath}", p.prefix);
                 }
             }

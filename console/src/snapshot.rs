@@ -144,9 +144,10 @@ pub fn gather(
         .sync_service
         .as_deref()
         .and_then(|service| systemd::recent_journal(service, 40));
-    let selected_advertised = selection.advertised.as_ref().map(|(vrf, peer, afi)| {
-        frr::advertised_prefixes(vrf, peer, afi)
-    });
+    let selected_advertised = selection
+        .advertised
+        .as_ref()
+        .map(|(vrf, peer, afi)| frr::advertised_prefixes(vrf, peer, afi));
 
     Snapshot {
         hostname: system::hostname(),

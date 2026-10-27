@@ -233,10 +233,7 @@ fn parse_advertised_routes(json: &str) -> AdvParsed {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
         return (
             Vec::new(),
-            Some(format!(
-                "advertised-routes: {}",
-                first_line(json)
-            )),
+            Some(format!("advertised-routes: {}", first_line(json))),
         );
     };
     let routes = match value.get("routes") {
@@ -245,10 +242,7 @@ fn parse_advertised_routes(json: &str) -> AdvParsed {
         Some(_) => {
             return (
                 Vec::new(),
-                Some(
-                    "advertised-routes: routes is not an object - schema drift?"
-                        .to_string(),
-                ),
+                Some("advertised-routes: routes is not an object - schema drift?".to_string()),
             )
         }
         // No "routes" wrapper: accept the object itself if it looks like
@@ -1121,11 +1115,21 @@ mod tests {
 
     #[test]
     fn prefix_sorting_is_numeric_not_lexicographic() {
-        let mut v = vec!["10.32.0.0/16", "10.128.0.0/16", "10.0.0.0/24", "192.168.0.0/16"];
+        let mut v = vec![
+            "10.32.0.0/16",
+            "10.128.0.0/16",
+            "10.0.0.0/24",
+            "192.168.0.0/16",
+        ];
         v.sort_by(|a, b| cmp_prefix(a, b));
         assert_eq!(
             v,
-            vec!["10.0.0.0/24", "10.32.0.0/16", "10.128.0.0/16", "192.168.0.0/16"]
+            vec![
+                "10.0.0.0/24",
+                "10.32.0.0/16",
+                "10.128.0.0/16",
+                "192.168.0.0/16"
+            ]
         );
     }
 

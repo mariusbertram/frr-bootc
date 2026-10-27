@@ -203,7 +203,8 @@ impl AppState {
         self.peer_selected = if delta >= 0 {
             self.peer_selected.saturating_add(delta as usize)
         } else {
-            self.peer_selected.saturating_sub(delta.unsigned_abs() as usize)
+            self.peer_selected
+                .saturating_sub(delta.unsigned_abs() as usize)
         };
     }
 
@@ -1234,7 +1235,14 @@ fn interface_detail_popup(
         )),
     }
 
-    render_popup(frame, area, &format!(" {} ", iface.name), lines, scroll, None);
+    render_popup(
+        frame,
+        area,
+        &format!(" {} ", iface.name),
+        lines,
+        scroll,
+        None,
+    );
 }
 
 /// Every VRF's BGP peer count, no truncation - `frr_panel` above is
@@ -1539,9 +1547,7 @@ fn advertised_popup(
     // arrives over the Selection mutex, the answer over the next tick) -
     // data that isn't about the peer in the title renders as
     // "collecting", never as an answer about a different peering.
-    let advertised = advertised.filter(|adv| {
-        adv.vrf == vrf && adv.peer == peer && adv.afi == afi
-    });
+    let advertised = advertised.filter(|adv| adv.vrf == vrf && adv.peer == peer && adv.afi == afi);
     match advertised {
         None => lines.push(Line::styled(
             " (collecting - ready on the next refresh tick)",
@@ -2155,8 +2161,7 @@ mod tests {
         // selection behind - renders as collecting, never as a wrong
         // answer about a different peering.
         let mut other = snap.clone();
-        other.selected_advertised.as_mut().unwrap().peer =
-            "2001:db8:100::1".to_string();
+        other.selected_advertised.as_mut().unwrap().peer = "2001:db8:100::1".to_string();
         let text = draw(&mut terminal, &other, &log, &mut state);
         assert!(text.contains("collecting"));
 
