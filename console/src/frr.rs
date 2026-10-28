@@ -168,6 +168,11 @@ pub struct PeerRoutes {
     pub vrf: String,
     pub peer: String,
     pub afi: String,
+    /// True when `received-routes` was rejected (the neighbor has no
+    /// `soft-reconfiguration inbound`, so the pre-policy Adj-RIB-In
+    /// isn't kept) and the query fell back to the post-policy `routes`
+    /// form - the popup notes which of the two views it is showing.
+    pub post_policy_fallback: bool,
     pub prefixes: Vec<BgpPeerPrefix>,
     /// Transport/parse failure for this query, if any - "no routes"
     /// (empty list, no error) and "couldn't ask" are different
@@ -225,6 +230,7 @@ pub fn peer_prefixes(direction: RouteDirection, vrf: &str, peer: &str, afi: &str
         vrf: vrf.to_string(),
         peer: peer.to_string(),
         afi: afi.to_string(),
+        post_policy_fallback: false,
         prefixes: Vec::new(),
         error: None,
     };
@@ -251,10 +257,37 @@ pub fn peer_prefixes(direction: RouteDirection, vrf: &str, peer: &str, afi: &str
     } else {
         format!("show bgp vrf {vrf} {cli_afi} neighbors {peer} {what}-routes json")
     };
-    let query = query(Path::new(BGPD_SOCKET), &cmd);
-    let (prefixes, parse_error) = parse_peer_routes(&query.output);
+    let query_result = query(Path::new(BGPD_SOCKET), &cmd);
+    let (prefixes, parse_error) = parse_peer_routes(&query_result.output);
     result.prefixes = prefixes;
-    result.error = query.error.or(parse_error);
+    result.error = query_result.error.or(parse_error);
+
+    // `received-routes` (pre-policy Adj-RIB-In) requires the neighbor to
+    // be configured with `soft-reconfiguration inbound` - bgpd rejects
+    // the command otherwise ("% Inbound soft reconfig for X not
+    // possible as it has neither refresh capability, nor inbound soft
+    // reconfig"), which is exactly the "Command rejected" the live VM
+    // showed. Fall back to the plain `routes` form: what the peer sent
+    // *after* our import filters, which for the question this view
+    // answers ("did the route we expect ever arrive from the peer") is
+    // the operative table anyway - and note the substitution so the
+    // popup says which view it is showing, not silently the other one.
+    if result.error.is_some() && direction == RouteDirection::Received {
+        let fallback_cmd = if vrf == "default" {
+            format!("show bgp {cli_afi} neighbors {peer} routes json")
+        } else {
+            format!("show bgp vrf {vrf} {cli_afi} neighbors {peer} routes json")
+        };
+        let fallback = query(Path::new(BGPD_SOCKET), &fallback_cmd);
+        let (prefixes, parse_error) = parse_peer_routes(&fallback.output);
+        if fallback.error.is_none() && parse_error.is_none() {
+            result.prefixes = prefixes;
+            // Not an error anymore - but carry the note so the UI can
+            // render which view it actually shows.
+            result.error = None;
+            result.post_policy_fallback = true;
+        }
+    }
     result
 }
 
@@ -283,7 +316,16 @@ fn parse_peer_routes(json: &str) -> PeerRoutesParsed {
             Some(format!("peer-routes: {}", first_line(json))),
         );
     };
-    let routes = match value.get("routes") {
+    // FRR wraps these per-direction: `show bgp ... advertised-routes
+    // json` nests the prefix map under "advertisedRoutes",
+    // received-routes under "receivedRoutes", the plain `routes` form
+    // under "routes". All three accepted; also a direct prefix-keyed
+    // object (older builds / alternate shapes) as before.
+    let routes = match value
+        .get("routes")
+        .or_else(|| value.get("advertisedRoutes"))
+        .or_else(|| value.get("receivedRoutes"))
+    {
         Some(serde_json::Value::Null) => return (Vec::new(), None),
         Some(v) if v.is_object() => v.as_object().unwrap(),
         Some(_) => {
@@ -292,7 +334,7 @@ fn parse_peer_routes(json: &str) -> PeerRoutesParsed {
                 Some("peer-routes: routes is not an object - schema drift?".to_string()),
             )
         }
-        // No "routes" wrapper: accept the object itself if it looks like
+        // No wrapper at all: accept the object itself if it looks like
         // a prefix-keyed map of path entries; anything else is drift.
         None => match value
             .as_object()
@@ -1195,6 +1237,29 @@ mod tests {
         assert!(!is_safe_peer_addr("198.51.100.10 password x"));
         assert!(!is_safe_peer_addr("10.0.0.1;shutdown"));
         assert!(!is_safe_peer_addr("10.0.0.1\nshutdown"));
+    }
+
+    // FRR wraps the per-direction JSON under "advertisedRoutes"/
+    // "receivedRoutes" (not "routes") - the live VM's "response has no
+    // routes object - schema drift?" came from exactly this.
+    #[test]
+    fn peer_routes_parse_the_frr_direction_wrapper_keys() {
+        let adv = r#"{"advertisedRoutes": {"10.0.0.0/24": {"paths": [
+            {"aspath": {"string": "65001"}, "origin": "IGP",
+             "bestpath": {"overall": true}}]}}}"#;
+        let (prefixes, error) = parse_peer_routes(adv);
+        assert!(error.is_none());
+        assert_eq!(prefixes.len(), 1);
+        assert_eq!(prefixes[0].prefix, "10.0.0.0/24");
+        assert_eq!(prefixes[0].aspath.as_deref(), Some("65001"));
+
+        let rcvd = r#"{"receivedRoutes": {"2001:db8::/64": {"paths": [
+            {"aspath": {"string": "4200113170 65002"}}]}}}"#;
+        let (prefixes, error) = parse_peer_routes(rcvd);
+        assert!(error.is_none());
+        assert_eq!(prefixes.len(), 1);
+        assert_eq!(prefixes[0].prefix, "2001:db8::/64");
+        assert_eq!(prefixes[0].aspath.as_deref(), Some("4200113170 65002"));
     }
 
     #[test]

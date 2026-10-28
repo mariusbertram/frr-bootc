@@ -1769,6 +1769,27 @@ fn routes_popup(
             );
             lines.insert(1, Line::from(""));
         }
+        // When received-routes was rejected and this is the post-policy
+        // fallback, say so: the two views answer different questions,
+        // and an SRE comparing against a config-side prefix-list needs
+        // to know the import filters have already been applied here.
+        if routes.post_policy_fallback {
+            lines.insert(
+                0,
+                Line::styled(
+                    "  note: after our import filters (pre-filter view",
+                    Style::default().fg(WARN),
+                ),
+            );
+            lines.insert(
+                1,
+                Line::styled(
+                    "  needs 'soft-reconfiguration inbound' on the peer)",
+                    Style::default().fg(WARN),
+                ),
+            );
+            lines.insert(2, Line::from(""));
+        }
     }
     let _ = count;
     render_popup(frame, area, &title, lines, scroll, None);
@@ -2300,6 +2321,7 @@ mod tests {
             vrf: "vrf-tenant1".to_string(),
             peer: "198.51.100.10".to_string(),
             afi: "ipv4Unicast".to_string(),
+            post_policy_fallback: false,
             prefixes: vec![
                 crate::frr::BgpPeerPrefix {
                     prefix: "10.0.0.0/24".to_string(),
@@ -2388,6 +2410,7 @@ mod tests {
             vrf: "vrf-tenant1".to_string(),
             peer: "25.120.26.129".to_string(),
             afi: "ipv4Unicast".to_string(),
+            post_policy_fallback: false,
             prefixes: vec![
                 crate::frr::BgpPeerPrefix {
                     prefix: "28.38.97.224/27".to_string(),
@@ -2445,6 +2468,7 @@ mod tests {
             vrf: "vrf-tenant1".to_string(),
             peer: "25.120.26.129".to_string(),
             afi: "ipv4Unicast".to_string(),
+            post_policy_fallback: false,
             prefixes: Vec::new(),
             error: None,
         });
@@ -2487,6 +2511,7 @@ mod tests {
             vrf: "vrf-tenant1".to_string(),
             peer: "198.51.100.10".to_string(),
             afi: "ipv4Unicast".to_string(),
+            post_policy_fallback: false,
             prefixes: Vec::new(),
             error: None,
         });
@@ -2501,6 +2526,7 @@ mod tests {
             vrf: "vrf-tenant1".to_string(),
             peer: "198.51.100.10".to_string(),
             afi: "ipv4Unicast".to_string(),
+            post_policy_fallback: false,
             prefixes: Vec::new(),
             error: Some("bgpd: query failed (timed out)".to_string()),
         });
@@ -2925,6 +2951,7 @@ mod tests {
             vrf: "vrf-tenant1".to_string(),
             peer: "25.120.26.129".to_string(),
             afi: "ipv4Unicast".to_string(),
+            post_policy_fallback: false,
             prefixes: (0..300)
                 .map(|i| crate::frr::BgpPeerPrefix {
                     prefix: format!("28.38.{}.{}/32", 97 + i / 200, i % 200),
