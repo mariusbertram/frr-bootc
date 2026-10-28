@@ -273,6 +273,7 @@ fn scenes() -> Vec<Scene> {
         vrf: "vrf-tenant2".to_string(),
         peer: "203.0.113.1".to_string(),
         afi: "ipv4Unicast".to_string(),
+        post_policy_fallback: false,
         prefixes: vec![
             crate::frr::BgpPeerPrefix {
                 prefix: "10.0.0.0/24".to_string(),
@@ -451,6 +452,7 @@ fn big_snapshot() -> Snapshot {
         vrf: first_vrf.clone(),
         peer: first_peer.peer.clone(),
         afi: first_peer.afi.clone(),
+        post_policy_fallback: false,
         prefixes: (0..200)
             .map(|i| crate::frr::BgpPeerPrefix {
                 prefix: format!("28.38.{}.{}{}/32", 97 + i / 100, i % 100 / 10, i % 10),
